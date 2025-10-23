@@ -19,9 +19,8 @@ input int      MagicNumber         = 202504;
 input int      MaxConcurrentTrades = 15;
 
 input group "===== Loss Protection (V3) ====="
-input double   PortfolioHealthThreshold = -0.3;
-input double   BasketLossLimit = -0.5;
-input int      CooldownAfterLoss = 60;
+input double   PortfolioHealthThreshold = -0.5;
+input int      MaxBasketDuration = 300;
 
 input group "===== Progressive Profit Exits (V3) ====="
 input double   ProfitLevel1 = 0.5;
@@ -71,8 +70,7 @@ double      accountStartBalance = 0;
 bool        drawdownTriggered = false;
 int         tradesOpenedInBurst = 0;
 
-datetime    lastBasketCloseTime = 0;
-bool        inCooldownPeriod = false;
+datetime    basketOpenTime = 0;
 
 double      basketHighestProfit = 0;
 double      trailingStopLevel = 0;
@@ -101,7 +99,7 @@ int OnInit()
    totalOpenTrades = 0;
    accountStartBalance = AccountBalance();
    tradesOpenedInBurst = 0;
-   inCooldownPeriod = false;
+   basketOpenTime = 0;
    basketHighestProfit = 0;
    trailingStopLevel = 0;
    trailingStopActive = false;
@@ -116,14 +114,15 @@ int OnInit()
    }
 
    Print("========================================");
-   Print("V3 PROTECTIONS:");
-   Print("Loss Limit: ", BasketLossLimit, "% | Health Threshold: ", PortfolioHealthThreshold, "%");
-   Print("Cooldown: ", CooldownAfterLoss, " seconds");
+   Print("V3 PROFIT-ONLY EXITS:");
+   Print("Health Threshold: ", PortfolioHealthThreshold, "% (blocks new entries)");
+   Print("NEVER CLOSES AT LOSS - Waits for profit targets!");
    Print("Progressive Exits: ", (UseProgressiveExits ? "ENABLED" : "DISABLED"));
    Print("  Level 1: ", ProfitLevel1, "% | Level 2: ", ProfitLevel2, "% | Level 3: ", ProfitLevel3, "%");
    Print("Trailing Stop: ", (UseTrailingStop ? "ENABLED" : "DISABLED"));
    Print("  Start: ", TrailingStartPercent, "% | Step: ", TrailingStepPercent, "%");
-   Print("Burst Size: ", EntryBurstCount, " trades (reduced)");
+   Print("Burst Size: ", EntryBurstCount, " trades");
+   Print("Max Basket Duration: ", MaxBasketDuration, " seconds");
    Print("========================================");
 
    return(INIT_SUCCEEDED);
@@ -228,7 +227,14 @@ bool IsSpreadAcceptable()
 
 double GetCurrentSpread()
 {
-   return (Ask - Bid) / Point;
+
+   double spread = (Ask - Bid) / Point;
+   int digits = (int)MarketInfo(Symbol(), MODE_DIGITS);
+
+   if(digits == 5 || digits == 3)
+      spread = spread / 10.0;
+
+   return spread;
 }
 
 bool CheckDrawdownProtection()
@@ -253,6 +259,8 @@ void CheckPortfolioProfitAndClose()
       basketHighestProfit = 0;
       trailingStopLevel = 0;
       trailingStopActive = false;
+      if(totalOpenTrades == 0)
+         basketOpenTime = 0;
       return;
    }
 
@@ -262,13 +270,9 @@ void CheckPortfolioProfitAndClose()
    if(profitPercent > basketHighestProfit)
       basketHighestProfit = profitPercent;
 
-   if(profitPercent <= BasketLossLimit)
+   if(profitPercent <= 0)
    {
-      Print("BASKET LOSS LIMIT: ", DoubleToString(profitPercent, 2), "% (Limit: ", BasketLossLimit, "%)");
-      CloseAllTrades("Loss Limit: " + DoubleToString(profitPercent, 2) + "%");
-      inCooldownPeriod = true;
-      lastBasketCloseTime = TimeCurrent();
-      ResetBasketTracking();
+
       return;
    }
 
@@ -278,19 +282,22 @@ void CheckPortfolioProfitAndClose()
       {
          trailingStopActive = true;
          trailingStopLevel = profitPercent - TrailingStepPercent;
+
+         if(trailingStopLevel < 0.1)
+            trailingStopLevel = 0.1;
          Print("TRAILING STOP ACTIVATED at ", DoubleToString(profitPercent, 2), "% | Stop: ", DoubleToString(trailingStopLevel, 2), "%");
       }
       else
       {
 
          double newStopLevel = basketHighestProfit - TrailingStepPercent;
-         if(newStopLevel > trailingStopLevel)
+         if(newStopLevel > trailingStopLevel && newStopLevel > 0.1)
          {
             trailingStopLevel = newStopLevel;
             Print("TRAILING STOP UPDATED to ", DoubleToString(trailingStopLevel, 2), "% | Peak: ", DoubleToString(basketHighestProfit, 2), "%");
          }
 
-         if(profitPercent <= trailingStopLevel)
+         if(profitPercent <= trailingStopLevel && trailingStopLevel > 0)
          {
             Print("TRAILING STOP HIT: Current ", DoubleToString(profitPercent, 2), "% <= Stop ", DoubleToString(trailingStopLevel, 2), "%");
             CloseAllTrades("Trailing Stop: " + DoubleToString(profitPercent, 2) + "%");
@@ -300,7 +307,7 @@ void CheckPortfolioProfitAndClose()
       }
    }
 
-   if(UseProgressiveExits)
+   if(UseProgressiveExits && profitPercent > 0)
    {
 
       if(profitPercent >= ProfitLevel3)
@@ -314,7 +321,8 @@ void CheckPortfolioProfitAndClose()
       if(basketHighestProfit >= ProfitLevel2)
       {
          double protectionLevel = ProfitLevel2 * 0.75;
-         if(profitPercent < protectionLevel)
+
+         if(profitPercent < protectionLevel && profitPercent > 0.1)
          {
             Print("PROGRESSIVE EXIT L2: Peaked ", DoubleToString(basketHighestProfit, 2), "%, now ", DoubleToString(profitPercent, 2), "%");
             CloseAllTrades("Progressive L2: " + DoubleToString(profitPercent, 2) + "%");
@@ -326,7 +334,8 @@ void CheckPortfolioProfitAndClose()
       if(basketHighestProfit >= ProfitLevel1 && basketHighestProfit < ProfitLevel2)
       {
          double protectionLevel = ProfitLevel1 * 0.70;
-         if(profitPercent < protectionLevel)
+
+         if(profitPercent < protectionLevel && profitPercent > 0.1)
          {
             Print("PROGRESSIVE EXIT L1: Peaked ", DoubleToString(basketHighestProfit, 2), "%, now ", DoubleToString(profitPercent, 2), "%");
             CloseAllTrades("Progressive L1: " + DoubleToString(profitPercent, 2) + "%");
@@ -336,15 +345,6 @@ void CheckPortfolioProfitAndClose()
       }
    }
 
-   if(totalOpenTrades >= MaxBasketSize && profitPercent < -1.0)
-   {
-      Print("EMERGENCY EXIT: Basket full, ", DoubleToString(profitPercent, 2), "% loss");
-      CloseAllTrades("Emergency Exit");
-      inCooldownPeriod = true;
-      lastBasketCloseTime = TimeCurrent();
-      ResetBasketTracking();
-      return;
-   }
 }
 
 void ResetBasketTracking()
@@ -360,6 +360,9 @@ void OpenBurstTrades()
 
    if(direction == -1)
       return;
+
+   if(totalOpenTrades == 0)
+      basketOpenTime = TimeCurrent();
 
    int tradesToOpen = MathMin(EntryBurstCount, MaxConcurrentTrades - totalOpenTrades);
 
@@ -519,19 +522,6 @@ bool CanOpenNewTrade()
    if(iTime(Symbol(), PERIOD_M1, 0) - lastTradeBar < MinBarsBetweenEntry * 60)
       return false;
 
-   if(inCooldownPeriod)
-   {
-      if(TimeCurrent() - lastBasketCloseTime < CooldownAfterLoss)
-      {
-         return false;
-      }
-      else
-      {
-         inCooldownPeriod = false;
-         Print("Cooldown ended. Ready to trade.");
-      }
-   }
-
    if(totalOpenTrades > 0)
    {
       double portfolioProfit = CalculatePortfolioProfit();
@@ -539,7 +529,7 @@ bool CanOpenNewTrade()
 
       if(portfolioProfitPercent < PortfolioHealthThreshold)
       {
-         Print("Health Check FAILED: ", DoubleToString(portfolioProfitPercent, 2), "% < ", PortfolioHealthThreshold, "%");
+         Print("Health Check: Portfolio ", DoubleToString(portfolioProfitPercent, 2), "% - No new entries until recovery");
          return false;
       }
    }
@@ -593,9 +583,9 @@ void UpdateDisplay()
    status += "Portfolio P&L: $" + DoubleToString(portfolioProfit, 2) + " (" + DoubleToString(portfolioProfitPercent, 2) + "%)\n";
    status += "Highest: " + DoubleToString(basketHighestProfit, 2) + "% | Trailing: " + trailingInfo + "\n";
    status += "----------------------------\n";
-   status += "PROTECTIONS:\n";
-   status += "Health: " + DoubleToString(portfolioProfitPercent, 2) + "% (Threshold: " + DoubleToString(PortfolioHealthThreshold, 1) + "%)\n";
-   status += "Loss Limit: " + DoubleToString(BasketLossLimit, 1) + "% | Cooldown: " + (inCooldownPeriod ? "ACTIVE" : "OFF") + "\n";
+   status += "PROFIT-ONLY EXITS:\n";
+   status += "Health: " + DoubleToString(portfolioProfitPercent, 2) + "% (Block threshold: " + DoubleToString(PortfolioHealthThreshold, 1) + "%)\n";
+   status += "NEVER CLOSES AT LOSS - Waits for profit!\n";
    status += "Progressive: L1=" + DoubleToString(ProfitLevel1, 1) + "% | L2=" + DoubleToString(ProfitLevel2, 1) + "% | L3=" + DoubleToString(ProfitLevel3, 1) + "%\n";
    status += "----------------------------\n";
    status += "ACCOUNT:\n";
