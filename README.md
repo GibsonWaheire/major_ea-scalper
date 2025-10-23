@@ -29,3 +29,4 @@ Copyright © 2025. All rights reserved.
 
 Trading forex and CFDs carries a high level of risk. Only trade with money you can afford to lose.
 
+
