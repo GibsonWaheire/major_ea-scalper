@@ -414,7 +414,7 @@ void OpenTrade(int orderType)
 
    double sl = 0, tp = 0;
 
-   string comment = StringConcatenate("BasketV3 #", (totalOpenTrades + 1));
+   string comment = "BasketV3 #" + IntegerToString(totalOpenTrades + 1);
    color arrowColor = (orderType == OP_BUY) ? clrGreen : clrRed;
 
    int ticket = OrderSend(Symbol(), orderType, lotSize, price, 3, sl, tp,
@@ -582,29 +582,27 @@ void UpdateDisplay()
    if(trailingStopActive)
       trailingInfo = "ACTIVE @ " + DoubleToString(trailingStopLevel, 2) + "%";
 
-   string status = StringConcatenate(
-      "==== FastBasketScalper V3.00 (PROTECTED) ====\n",
-      "Status: ", (tradingAllowed && !drawdownTriggered ? "ACTIVE" : "PAUSED"), "\n",
-      "Strategy: Candle + Loss Protection + Trailing\n",
-      "----------------------------\n",
-      "Last Candle: ", DoubleToString(lastClosePos, 1), "% (BUY>=", BuyCloseThreshold, "%, SELL<=", SellCloseThreshold, "%)\n",
-      "----------------------------\n",
-      "BASKET STATUS:\n",
-      "Open Trades: ", totalOpenTrades, " / ", MaxBasketSize, "\n",
-      "Portfolio P&L: $", DoubleToString(portfolioProfit, 2), " (", DoubleToString(portfolioProfitPercent, 2), "%)\n",
-      "Highest: ", DoubleToString(basketHighestProfit, 2), "% | Trailing: ", trailingInfo, "\n",
-      "----------------------------\n",
-      "PROTECTIONS:\n",
-      "Health: ", DoubleToString(portfolioProfitPercent, 2), "% (Threshold: ", PortfolioHealthThreshold, "%)\n",
-      "Loss Limit: ", BasketLossLimit, "% | Cooldown: ", (inCooldownPeriod ? "ACTIVE" : "OFF"), "\n",
-      "Progressive: L1=", ProfitLevel1, "% | L2=", ProfitLevel2, "% | L3=", ProfitLevel3, "%\n",
-      "----------------------------\n",
-      "ACCOUNT:\n",
-      "Daily P&L: $", DoubleToString(dailyProfit, 2), "\n",
-      "Balance: $", DoubleToString(currentBalance, 2), " | Equity: $", DoubleToString(currentEquity, 2), "\n",
-      "Drawdown: ", DoubleToString(drawdownPercent, 1), "% (Max: ", MaxDrawdownPercent, "%)\n",
-      "Spread: ", DoubleToString(GetCurrentSpread(), 1), " | Lot: ", DoubleToString(currentLotSize, 2)
-   );
+   string status = "==== FastBasketScalper V3.00 (PROTECTED) ====\n";
+   status += "Status: " + (tradingAllowed && !drawdownTriggered ? "ACTIVE" : "PAUSED") + "\n";
+   status += "Strategy: Candle + Loss Protection + Trailing\n";
+   status += "----------------------------\n";
+   status += "Last Candle: " + DoubleToString(lastClosePos, 1) + "% (BUY>=" + DoubleToString(BuyCloseThreshold, 0) + "%, SELL<=" + DoubleToString(SellCloseThreshold, 0) + "%)\n";
+   status += "----------------------------\n";
+   status += "BASKET STATUS:\n";
+   status += "Open Trades: " + IntegerToString(totalOpenTrades) + " / " + IntegerToString(MaxBasketSize) + "\n";
+   status += "Portfolio P&L: $" + DoubleToString(portfolioProfit, 2) + " (" + DoubleToString(portfolioProfitPercent, 2) + "%)\n";
+   status += "Highest: " + DoubleToString(basketHighestProfit, 2) + "% | Trailing: " + trailingInfo + "\n";
+   status += "----------------------------\n";
+   status += "PROTECTIONS:\n";
+   status += "Health: " + DoubleToString(portfolioProfitPercent, 2) + "% (Threshold: " + DoubleToString(PortfolioHealthThreshold, 1) + "%)\n";
+   status += "Loss Limit: " + DoubleToString(BasketLossLimit, 1) + "% | Cooldown: " + (inCooldownPeriod ? "ACTIVE" : "OFF") + "\n";
+   status += "Progressive: L1=" + DoubleToString(ProfitLevel1, 1) + "% | L2=" + DoubleToString(ProfitLevel2, 1) + "% | L3=" + DoubleToString(ProfitLevel3, 1) + "%\n";
+   status += "----------------------------\n";
+   status += "ACCOUNT:\n";
+   status += "Daily P&L: $" + DoubleToString(dailyProfit, 2) + "\n";
+   status += "Balance: $" + DoubleToString(currentBalance, 2) + " | Equity: $" + DoubleToString(currentEquity, 2) + "\n";
+   status += "Drawdown: " + DoubleToString(drawdownPercent, 1) + "% (Max: " + DoubleToString(MaxDrawdownPercent, 0) + "%)\n";
+   status += "Spread: " + DoubleToString(GetCurrentSpread(), 1) + " | Lot: " + DoubleToString(currentLotSize, 2);
 
    Comment(status);
 }
