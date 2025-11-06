@@ -1,7 +1,7 @@
 
 
 #property copyright "Copyright 2025, Advanced Trading Systems"
-#property link      "https:
+#property link      "https://www.mcgibsdigitalsolutions.com"
 #property version   "2.00"
 #property strict
 
@@ -278,7 +278,7 @@ int GetScalpingSignal()
    }
 
    bool sellSignal = false;
-   int sellScore = 0;u dont
+   int sellScore = 0;
 
    if(downtrend) sellScore++;
    if(priceBelowEMA) sellScore++;
@@ -366,7 +366,7 @@ void OpenScalpTrade(int orderType)
       {
          activeTrades[totalActiveTrades].ticket = ticket;
          activeTrades[totalActiveTrades].entryPrice = price;
-         activeTrades[totalActiveTrades].openTime = TimeCurrent();
+         activeTrades[totalActiveTrades].openTime = (double)TimeCurrent();
          activeTrades[totalActiveTrades].direction = orderType;
          totalActiveTrades++;
       }
@@ -534,6 +534,14 @@ bool PreFlightChecks()
    }
 
    tradingAllowed = true;
+   return true;
+}
+
+bool IsTradeAllowed()
+{
+   if(!::IsTradeAllowed())
+      return false;
+   
    return true;
 }
 

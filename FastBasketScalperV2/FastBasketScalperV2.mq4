@@ -1,7 +1,7 @@
 
 
 #property copyright "Copyright 2025, Advanced Trading Systems"
-#property link      "https:
+#property link      "https://www.mcgibsdigitalsolutions.com"
 #property version   "2.00"
 #property strict
 

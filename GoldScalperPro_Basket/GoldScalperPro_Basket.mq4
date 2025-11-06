@@ -1,6 +1,7 @@
 
 
 #property copyright "Copyright 2025"
+#property link      "https://www.mcgibsdigitalsolutions.com"
 #property version   "1.00"
 #property strict
 
@@ -12,17 +13,20 @@ input bool     TradeUSDJPY         = true;
 input bool     TradeOil            = true;
 
 input group "===== Ultra-Fast Settings ====="
-input double   FixedLotSize        = 0.02;
+input double   CapitalPercentPerTrade = 5.0;  // % of capital per trade
 input int      MinTrades           = 2;
 input int      MaxTrades           = 5;
-input double   RiskRewardRatio     = 1.2;
-input int      MaxBasketDuration   = 60;
+input double   MinProfitPercent    = 3.0;     // Close basket at 3% profit
+input double   MaxProfitPercent    = 10.0;    // Close basket at 10% profit
+input int      MaxBasketDuration   = 300;     // Increased for profit targets
 input int      TicksBetweenBasket  = 3;
 
 input group "===== Risk Settings ====="
 input double   StopLossPips        = 10.0;
 input double   MaxSpreadPips       = 4.0;
 input int      MaxSlippagePips     = 3;
+input double   MaxDrawdownPercent  = 40.0;    // Maximum drawdown protection
+input double   MaxLossPercent      = 10.0;    // Close basket if loss exceeds 10% of capital
 
 input group "===== Safety Limits ====="
 input double   MaxDailyLossUSD     = 100.0;
@@ -43,6 +47,7 @@ int dailyWins = 0;
 int dailyLosses = 0;
 datetime lastDayReset = 0;
 bool tradingEnabled = true;
+double accountStartBalance = 0;
 
 struct BasketTrade {
    int ticket;
@@ -100,11 +105,13 @@ int OnInit()
 
    Print("Valid Instruments: ", validCount);
    Print("Basket Size: ", MinTrades, "-", MaxTrades, " trades");
-   Print("RRR: 1:", DoubleToString(RiskRewardRatio, 1), " (Close at ", DoubleToString(RiskRewardRatio * 100, 0), "% profit)");
+   Print("Profit Target: ", MinProfitPercent, "% - ", MaxProfitPercent, "% per basket");
    Print("Max Duration: ", MaxBasketDuration, " seconds");
-   Print("Lot Size: ", DoubleToString(FixedLotSize, 2), " (FIXED)");
+   Print("Capital per Trade: ", CapitalPercentPerTrade, "%");
+   Print("Max Drawdown: ", MaxDrawdownPercent, "% | Max Loss per Basket: ", MaxLossPercent, "%");
    Print("========================================");
 
+   accountStartBalance = AccountBalance();
    ArrayResize(activeBasket, 0);
    lastDayReset = iTime(Symbol(), PERIOD_D1, 0);
    basketActive = false;
@@ -117,10 +124,12 @@ void OnTick()
    tickCounter++;
 
    CheckDailyReset();
+   CheckDrawdownProtection();
 
    if(!tradingEnabled) return;
    CheckDailyLimits();
 
+   // PRIORITY: Check profit FIRST if basket is active
    if(basketActive)
    {
       ManageBasket();
@@ -148,72 +157,92 @@ void OpenBasket()
    ArrayResize(activeBasket, 0);
    totalBasketRisk = 0;
 
-   int numTrades = MinTrades + (MathRand() % (MaxTrades - MinTrades + 1));
-
+   // Scan all instruments for calculated signals (not random)
    int opened = 0;
-   int attempts = 0;
-
-   while(opened < numTrades && attempts < totalInstruments * 3)
+   int validSignals = 0;
+   
+   // First pass: count valid signals
+   for(int i = 0; i < totalInstruments; i++)
    {
-      int randomIndex = MathRand() % totalInstruments;
-      string instrument = tradingInstruments[randomIndex];
-
+      string instrument = tradingInstruments[i];
+      
       if(MarketInfo(instrument, MODE_BID) <= 0)
-      {
-         attempts++;
          continue;
-      }
-
+      
       double spread = GetSpreadPips(instrument);
       if(spread > MaxSpreadPips || spread <= 0)
-      {
-         attempts++;
          continue;
-      }
-
+      
+      int direction = GetFastSignal(instrument);
+      if(direction >= 0)
+         validSignals++;
+   }
+   
+   // Only open basket if we have enough valid calculated signals
+   if(validSignals < MinTrades)
+   {
+      return; // Wait for better signals
+   }
+   
+   // Second pass: open trades based on calculated signals
+   // Prioritize strongest signals first
+   for(int i = 0; i < totalInstruments && opened < MaxTrades; i++)
+   {
+      string instrument = tradingInstruments[i];
+      
+      if(MarketInfo(instrument, MODE_BID) <= 0)
+         continue;
+      
+      double spread = GetSpreadPips(instrument);
+      if(spread > MaxSpreadPips || spread <= 0)
+         continue;
+      
+      // Check if already in basket
       bool alreadySelected = false;
-      for(int i = 0; i < opened; i++)
+      for(int j = 0; j < opened; j++)
       {
-         if(activeBasket[i].symbol == instrument)
+         if(activeBasket[j].symbol == instrument)
          {
             alreadySelected = true;
             break;
          }
       }
-
+      
       if(alreadySelected)
-      {
-         attempts++;
          continue;
-      }
-
+      
+      // Get calculated signal (not random)
       int direction = GetFastSignal(instrument);
       if(direction < 0)
-      {
-         attempts++;
-         continue;
-      }
-
+         continue; // No valid signal for this instrument
+      
+      // Open trade with calculated direction
       if(OpenInstantTrade(instrument, direction, opened))
       {
          opened++;
       }
-
-      attempts++;
    }
 
    if(opened >= MinTrades)
    {
-
-      basketProfitTarget = totalBasketRisk * RiskRewardRatio;
+      // Calculate profit targets based on capital percentage (3-10%)
+      double currentBalance = AccountBalance();
+      double minProfitTarget = currentBalance * (MinProfitPercent / 100.0);
+      double maxProfitTarget = currentBalance * (MaxProfitPercent / 100.0);
+      
+      // Use minimum profit target as initial target, will close anywhere in 3-10% range
+      basketProfitTarget = minProfitTarget;
       basketActive = true;
       basketOpenTime = TimeCurrent();
+      
+      Print("BASKET OPENED: ", opened, " calculated trades | Profit Target: ", MinProfitPercent, "-", MaxProfitPercent, "% (", 
+            DoubleToString(minProfitTarget, 2), "-", DoubleToString(maxProfitTarget, 2), " USD)");
 
    }
    else
    {
-
-      CloseBasket("Insufficient trades");
+      // Not enough valid signals - don't open basket
+      ArrayResize(activeBasket, 0);
    }
 }
 
@@ -234,14 +263,44 @@ bool OpenInstantTrade(string symbol, int direction, int index)
 
    sl = NormalizeDouble(sl, digits);
 
+   // Calculate lot size based on 5% of capital
+   double currentBalance = AccountBalance();
+   double capitalPerTrade = currentBalance * (CapitalPercentPerTrade / 100.0);
+   
+   // Calculate lot size based on risk
    double tickValue = MarketInfo(symbol, MODE_TICKVALUE);
    double slPoints = StopLossPips * (digits == 5 || digits == 3 ? 10.0 : 1.0);
-   double risk = FixedLotSize * slPoints * tickValue;
+   
+   // Calculate lot size: capital / (SL pips * tick value per lot)
+   double lotSize = 0;
+   if(slPoints > 0 && tickValue > 0)
+   {
+      lotSize = capitalPerTrade / (slPoints * tickValue);
+   }
+   else
+   {
+      // Fallback calculation
+      double contractSize = MarketInfo(symbol, MODE_LOTSIZE);
+      if(contractSize <= 0) contractSize = 100000;
+      lotSize = capitalPerTrade / (slPoints * (contractSize * point));
+   }
+   
+   // Normalize lot size
+   double minLot = MarketInfo(symbol, MODE_MINLOT);
+   double maxLot = MarketInfo(symbol, MODE_MAXLOT);
+   double lotStep = MarketInfo(symbol, MODE_LOTSTEP);
+   if(lotStep <= 0) lotStep = 0.01;
+   
+   lotSize = MathFloor(lotSize / lotStep) * lotStep;
+   if(minLot > 0) lotSize = MathMax(lotSize, minLot);
+   if(maxLot > 0) lotSize = MathMin(lotSize, maxLot);
+   
+   double risk = lotSize * slPoints * tickValue;
 
    int magic = BaseMagicNumber + index;
 
    color arrowColor = (direction == OP_BUY) ? clrLime : clrRed;
-   int ticket = OrderSend(symbol, direction, FixedLotSize, price, MaxSlippagePips,
+   int ticket = OrderSend(symbol, direction, lotSize, price, MaxSlippagePips,
                           sl, 0, "Basket", magic, 0, arrowColor);
 
    if(ticket > 0)
@@ -268,16 +327,62 @@ bool OpenInstantTrade(string symbol, int direction, int index)
 
 int GetFastSignal(string symbol)
 {
-
-   double price1 = iClose(symbol, PERIOD_M1, 0);
-   double price2 = iClose(symbol, PERIOD_M1, 1);
-
-   if(price1 > price2)
-      return OP_BUY;
-   else if(price1 < price2)
-      return OP_SELL;
-
-   return (MathRand() % 2 == 0) ? OP_BUY : OP_SELL;
+   // Calculate tick-based momentum using current bid/ask and recent ticks
+   double currentBid = MarketInfo(symbol, MODE_BID);
+   double currentAsk = MarketInfo(symbol, MODE_ASK);
+   
+   if(currentBid <= 0 || currentAsk <= 0)
+      return -1;
+   
+   double spread = currentAsk - currentBid;
+   double point = MarketInfo(symbol, MODE_POINT);
+   int digits = (int)MarketInfo(symbol, MODE_DIGITS);
+   
+   if(digits == 5 || digits == 3)
+      point *= 10;
+   
+   // Get tick data from M1 chart (most recent candles)
+   double close0 = iClose(symbol, PERIOD_M1, 0);
+   double close1 = iClose(symbol, PERIOD_M1, 1);
+   double close2 = iClose(symbol, PERIOD_M1, 2);
+   double close3 = iClose(symbol, PERIOD_M1, 3);
+   
+   if(close0 <= 0 || close1 <= 0 || close2 <= 0)
+      return -1;
+   
+   // Calculate momentum from last 3-4 candles
+   double momentum1 = close0 - close1;  // Latest momentum
+   double momentum2 = close1 - close2;  // Previous momentum
+   double momentum3 = (close2 - close3); // Earlier momentum (if available)
+   
+   // Calculate average price movement
+   double avgMovement = (MathAbs(momentum1) + MathAbs(momentum2)) / 2.0;
+   
+   // Minimum movement threshold: must be at least 2x the spread to be significant
+   double minMovement = spread * 2.0;
+   
+   // STRONG BUY: Clear upward momentum with acceleration
+   if(momentum1 > 0 && momentum2 > 0 && momentum1 >= minMovement)
+   {
+      // Additional confirmation: momentum is increasing
+      if(momentum1 > momentum2 || avgMovement >= minMovement)
+      {
+         return OP_BUY;
+      }
+   }
+   
+   // STRONG SELL: Clear downward momentum with acceleration
+   if(momentum1 < 0 && momentum2 < 0 && MathAbs(momentum1) >= minMovement)
+   {
+      // Additional confirmation: momentum is increasing
+      if(MathAbs(momentum1) > MathAbs(momentum2) || avgMovement >= minMovement)
+      {
+         return OP_SELL;
+      }
+   }
+   
+   // No clear calculated signal - don't trade (no random fallback)
+   return -1;
 }
 
 void ManageBasket()
@@ -287,6 +392,7 @@ void ManageBasket()
    double totalPL = 0;
    int stillOpen = 0;
 
+   // Calculate current P&L
    for(int i = 0; i < ArraySize(activeBasket); i++)
    {
       if(OrderSelect(activeBasket[i].ticket, SELECT_BY_TICKET))
@@ -301,21 +407,51 @@ void ManageBasket()
 
    if(stillOpen == 0)
    {
-      CloseBasket("All trades hit SL");
+      CloseBasket("All trades closed");
       return;
    }
 
-   if(totalPL >= basketProfitTarget)
+   double currentBalance = AccountBalance();
+   double profitPercent = (totalPL / accountStartBalance) * 100.0;
+   double lossPercent = (totalPL < 0) ? MathAbs(profitPercent) : 0;
+
+   // PRIORITY 1: Close on PROFIT (3-10% range) - FAST EXIT
+   if(totalPL > 0)
    {
-      CloseBasket("Profit Target 1.2R");
+      double minProfitUSD = accountStartBalance * (MinProfitPercent / 100.0);
+      double maxProfitUSD = accountStartBalance * (MaxProfitPercent / 100.0);
+      
+      // Close immediately if profit is in 3-10% range
+      if(totalPL >= minProfitUSD && totalPL <= maxProfitUSD)
+      {
+         CloseBasket("Profit Target " + DoubleToString(profitPercent, 2) + "%");
+         return;
+      }
+      
+      // Close if profit exceeds 10% (take profit quickly)
+      if(totalPL > maxProfitUSD)
+      {
+         CloseBasket("Max Profit " + DoubleToString(profitPercent, 2) + "%");
+         return;
+      }
+   }
+
+   // PRIORITY 2: Only close on loss if it exceeds 10% of capital
+   if(totalPL < 0 && lossPercent >= MaxLossPercent)
+   {
+      CloseBasket("Loss Limit " + DoubleToString(lossPercent, 2) + "%");
       return;
    }
 
+   // Time limit - only close if still in profit or small loss
    int duration = (int)(TimeCurrent() - basketOpenTime);
    if(duration >= MaxBasketDuration)
    {
-      CloseBasket("Time Limit");
-      return;
+      if(totalPL > 0)
+      {
+         CloseBasket("Time Limit (Profit: " + DoubleToString(profitPercent, 2) + "%)");
+      }
+      // Don't close on time limit if in loss (let it recover)
    }
 
    UpdateDisplay(totalPL, stillOpen);
@@ -402,6 +538,19 @@ void CheckDailyReset()
    }
 }
 
+void CheckDrawdownProtection()
+{
+   double currentEquity = AccountEquity();
+   double maxDrawdown = accountStartBalance * (MaxDrawdownPercent / 100.0);
+
+   if(accountStartBalance > 0 && currentEquity < (accountStartBalance - maxDrawdown))
+   {
+      tradingEnabled = false;
+      Alert("MAX DRAWDOWN LIMIT: ", MaxDrawdownPercent, "% reached!");
+      if(basketActive) CloseBasket("Max Drawdown " + DoubleToString(MaxDrawdownPercent, 1) + "%");
+   }
+}
+
 void CheckDailyLimits()
 {
    if(!tradingEnabled) return;
@@ -432,11 +581,14 @@ void UpdateDisplay(double currentPL, int openTrades)
    if(basketActive)
    {
       int duration = (int)(TimeCurrent() - basketOpenTime);
-      double progress = (basketProfitTarget > 0) ? (currentPL / basketProfitTarget * 100.0) : 0;
+      double profitPercent = (accountStartBalance > 0) ? (currentPL / accountStartBalance * 100.0) : 0;
+      double minProfitUSD = accountStartBalance * (MinProfitPercent / 100.0);
+      double maxProfitUSD = accountStartBalance * (MaxProfitPercent / 100.0);
 
       status += "Basket: " + IntegerToString(openTrades) + " trades | " + IntegerToString(duration) + "s\n";
-      status += "P&L: " + DoubleToString(currentPL, 2) + " / " + DoubleToString(basketProfitTarget, 2) + " USD\n";
-      status += "Progress: " + DoubleToString(progress, 1) + "% → 120% (1.2R)\n";
+      status += "P&L: " + DoubleToString(currentPL, 2) + " USD (" + DoubleToString(profitPercent, 2) + "%)\n";
+      status += "Target: " + DoubleToString(MinProfitPercent, 1) + "-" + DoubleToString(MaxProfitPercent, 1) + "% (" + 
+                DoubleToString(minProfitUSD, 2) + "-" + DoubleToString(maxProfitUSD, 2) + " USD)\n";
    }
    else
    {
@@ -447,7 +599,7 @@ void UpdateDisplay(double currentPL, int openTrades)
    status += "TODAY: " + IntegerToString(dailyTradeCount) + " trades | " + IntegerToString(dailyWins) + "W/" + IntegerToString(dailyLosses) + "L\n";
    status += "Daily P&L: " + DoubleToString(dailyProfit, 2) + " USD\n";
    status += "========================================\n";
-   status += "RRR: 1:" + DoubleToString(RiskRewardRatio, 1) + " | Lot: " + DoubleToString(FixedLotSize, 2) + " | SL: " + IntegerToString((int)StopLossPips) + " pips";
+   status += "Capital/Trade: " + DoubleToString(CapitalPercentPerTrade, 1) + "% | Profit Target: " + DoubleToString(MinProfitPercent, 1) + "-" + DoubleToString(MaxProfitPercent, 1) + "% | SL: " + IntegerToString((int)StopLossPips) + " pips";
 
    Comment(status);
 }

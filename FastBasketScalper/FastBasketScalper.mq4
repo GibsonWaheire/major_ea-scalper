@@ -1,7 +1,7 @@
 
 
 #property copyright "Copyright 2025, Advanced Trading Systems"
-#property link      "https:
+#property link      "https://www.mcgibsdigitalsolutions.com"
 #property version   "1.00"
 #property strict
 
@@ -12,11 +12,6 @@ input double   AccountBalance_1500 = 1500.0;
 input double   MinLotSize          = 0.01;
 input double   MaxLotSizeLimit     = 1.0;
 
-input group "===== Portfolio Profit Targets (%) ====="
-input double   PortfolioProfitTarget = 2.0;
-input double   QuickExitPercent      = 1.0;
-input double   MaxProfitPercent      = 5.0;
-
 input group "===== Core Trading Settings ====="
 input int      MaxBasketSize       = 10;
 input int      MinBasketSize       = 3;
@@ -26,15 +21,25 @@ input int      MaxConcurrentTrades = 15;
 input group "===== Risk Management ====="
 input double   MaxDrawdownPercent  = 25.0;
 input double   DailyLossLimitPercent = 10.0;
-input double   MaxSpreadPips       = 5.0;
-input bool     UseQuickExit        = true;
+input double   MaxSpreadPips       = 50.0;
 
 input group "===== Trading Controls ====="
 input bool     TradeEnabled        = true;
-input int      MinBarsBetweenEntry = 1;
+input int      MinBarsBetweenEntry = 0;
 input int      EntryBurstCount     = 5;
 input bool     AllowIndices        = true;
 input bool     BuyBiased           = true;
+input bool     RequireOverallProfit = false;
+
+input group "===== Portfolio Profit Targets (%) ====="
+input double   PortfolioMinProfitPercent = 3.0;
+input double   PortfolioMaxProfitPercent = 50.0;
+
+input group "===== Individual Trade Exit Rules ====="
+input double   IndividualLossLimitPercent = 30.0;
+input double   IndividualProfitTargetPercent = 10.0;
+input double   IndividualProfitHoldPercent = 5.0;
+input int      ProfitHoldTimeMinutes = 5;
 
 struct TradeInfo {
    int      ticket;
@@ -88,8 +93,8 @@ int OnInit()
       openTrades[i].orderType = -1;
    }
 
-   Print("Portfolio Profit Target: ", PortfolioProfitTarget, "%");
-   Print("Quick Exit: ", QuickExitPercent, "% | Max Profit: ", MaxProfitPercent, "%");
+   Print("Portfolio Profit Range: ", PortfolioMinProfitPercent, "% - ", PortfolioMaxProfitPercent, "%");
+   Print("Individual Trade Rules: -", IndividualLossLimitPercent, "% loss | +", IndividualProfitTargetPercent, "% profit | +", IndividualProfitHoldPercent, "% hold for ", ProfitHoldTimeMinutes, " min");
    Print("Max Basket Size: ", MaxBasketSize, " trades");
    Print("========================================");
 
@@ -123,8 +128,12 @@ void OnTick()
 
    CleanupClosedTrades();
 
+   // Check for instant profit exits FIRST (highest priority)
+   CheckIndividualTradeExitRules();
+   
    CheckPortfolioProfitAndClose();
 
+   // Open new trades continuously based on available capital
    if(CanOpenNewTrade())
    {
       OpenBurstTrades();
@@ -161,24 +170,66 @@ bool PreFlightChecks()
 
 double CalculateDynamicLotSize()
 {
+   // Calculate MAXIMUM lot size based on available free margin
+   double freeMargin = AccountFreeMargin();
    double currentBalance = AccountBalance();
-
-   if(currentBalance >= AccountBalance_10K)
+   
+   // Get margin requirement per lot
+   double marginPerLot = MarketInfo(Symbol(), MODE_MARGINREQUIRED);
+   
+   if(marginPerLot <= 0)
    {
-      return MathMin(MaxLotSizeLimit, 1.0);
+      // Fallback calculation if margin info not available
+      // Use leverage to estimate (assuming 1:100 leverage = 1% margin)
+      double leverage = AccountLeverage();
+      if(leverage <= 0) leverage = 100;
+      double contractSize = MarketInfo(Symbol(), MODE_LOTSIZE);
+      if(contractSize <= 0) contractSize = 100000;
+      double tickValue = MarketInfo(Symbol(), MODE_TICKVALUE);
+      if(tickValue <= 0) tickValue = 1;
+      
+      double currentPrice = (Ask + Bid) / 2;
+      marginPerLot = (contractSize / leverage) * (currentPrice / tickValue);
    }
-   else if(currentBalance >= AccountBalance_1500)
+   
+   // Calculate maximum lots we can open with available free margin
+   // Use 90% of free margin to leave some buffer
+   double usableMargin = freeMargin * 0.90;
+   double maxLots = usableMargin / marginPerLot;
+   
+   // Round down to nearest lot step
+   double lotStep = MarketInfo(Symbol(), MODE_LOTSTEP);
+   if(lotStep <= 0) lotStep = 0.01;
+   
+   maxLots = MathFloor(maxLots / lotStep) * lotStep;
+   
+   // Ensure within broker limits
+   double maxLotAllowed = MarketInfo(Symbol(), MODE_MAXLOT);
+   double minLotAllowed = MarketInfo(Symbol(), MODE_MINLOT);
+   
+   if(maxLotAllowed > 0)
+      maxLots = MathMin(maxLots, maxLotAllowed);
+   if(minLotAllowed > 0)
+      maxLots = MathMax(maxLots, minLotAllowed);
+   
+   // Apply user-defined limits
+   maxLots = MathMin(maxLots, MaxLotSizeLimit);
+   maxLots = MathMax(maxLots, MinLotSize);
+   
+   // If calculation fails, use balance-based fallback
+   if(maxLots < MinLotSize)
    {
-      return MathMin(MaxLotSizeLimit, 0.5);
+      if(currentBalance >= AccountBalance_10K)
+         return MathMin(MaxLotSizeLimit, 1.0);
+      else if(currentBalance >= AccountBalance_1500)
+         return MathMin(MaxLotSizeLimit, 0.5);
+      else if(currentBalance >= AccountBalance_100)
+         return MathMin(MaxLotSizeLimit, 0.2);
+      else
+         return MinLotSize;
    }
-   else if(currentBalance >= AccountBalance_100)
-   {
-      return MathMin(MaxLotSizeLimit, 0.2);
-   }
-   else
-   {
-      return MinLotSize;
-   }
+   
+   return maxLots;
 }
 
 bool IsSpreadAcceptable()
@@ -210,7 +261,7 @@ bool CheckDrawdownProtection()
 
 void CheckPortfolioProfitAndClose()
 {
-   if(totalOpenTrades < MinBasketSize)
+   if(totalOpenTrades == 0)
       return;
 
    double totalProfit = 0;
@@ -227,53 +278,61 @@ void CheckPortfolioProfitAndClose()
 
    double profitPercent = (totalProfit / accountStartBalance) * 100.0;
 
-   if(UseQuickExit && profitPercent >= QuickExitPercent)
+   if(profitPercent >= PortfolioMinProfitPercent && profitPercent <= PortfolioMaxProfitPercent)
    {
-      Print("QUICK EXIT TRIGGERED: Portfolio profit ", DoubleToString(profitPercent, 2), "% ($", DoubleToString(totalProfit, 2), ")");
-      CloseAllTrades("Quick Exit: " + DoubleToString(profitPercent, 2) + "% Profit");
+      Print("PORTFOLIO PROFIT TARGET: Closing all trades at ", DoubleToString(profitPercent, 2), "% profit ($", DoubleToString(totalProfit, 2), ")");
+      CloseAllTrades("Portfolio Profit: " + DoubleToString(profitPercent, 2) + "%");
       return;
    }
-
-   if(profitPercent >= PortfolioProfitTarget)
+   else if(profitPercent > PortfolioMaxProfitPercent)
    {
-      Print("PROFIT TARGET HIT: Portfolio profit ", DoubleToString(profitPercent, 2), "% ($", DoubleToString(totalProfit, 2), ")");
-      CloseAllTrades("Target: " + DoubleToString(profitPercent, 2) + "% Profit");
+      Print("PORTFOLIO MAX PROFIT: Closing all trades at ", DoubleToString(profitPercent, 2), "% profit ($", DoubleToString(totalProfit, 2), ")");
+      CloseAllTrades("Portfolio Max Profit: " + DoubleToString(profitPercent, 2) + "%");
       return;
    }
+}
 
-   if(profitPercent >= MaxProfitPercent)
+void CheckIndividualTradeExitRules()
+{
+   // Ultra-fast profit detection - close immediately on ANY profit, never on loss
+   for(int i = totalOpenTrades - 1; i >= 0; i--)
    {
-      Print("MAX PROFIT TARGET HIT: Portfolio profit ", DoubleToString(profitPercent, 2), "% ($", DoubleToString(totalProfit, 2), ")");
-      CloseAllTrades("Max Target: " + DoubleToString(profitPercent, 2) + "% Profit");
-      return;
-   }
-
-   if(totalOpenTrades >= MaxBasketSize && profitPercent < -2.0)
-   {
-      Print("EMERGENCY EXIT: Basket full with ", DoubleToString(profitPercent, 2), "% loss");
-      CloseAllTrades("Emergency: Basket Full & Losing");
-      return;
+      if(openTrades[i].ticket > 0)
+      {
+         if(OrderSelect(openTrades[i].ticket, SELECT_BY_TICKET))
+         {
+            double tradeProfit = OrderProfit() + OrderSwap() + OrderCommission();
+            
+            // Close IMMEDIATELY on ANY profit (even $0.01)
+            if(tradeProfit > 0)
+            {
+               double closePrice = (OrderType() == OP_BUY) ? Bid : Ask;
+               double volume = OrderLots();
+               bool closed = OrderClose(openTrades[i].ticket, volume, closePrice, 3, clrYellow);
+               
+               if(closed)
+               {
+                  Print("INSTANT PROFIT EXIT: Trade #", openTrades[i].ticket, " closed at $", DoubleToString(tradeProfit, 2), " profit");
+                  dailyProfit += tradeProfit;
+                  RemoveTradeFromArray(i);
+               }
+            }
+            // Do NOT close on loss - let trades run
+         }
+      }
    }
 }
 
 void OpenBurstTrades()
 {
-
    int direction = GetFastScalpingSignal();
 
    if(direction == -1)
       return;
 
-   int tradesToOpen = MathMin(EntryBurstCount, MaxConcurrentTrades - totalOpenTrades);
-
-   for(int i = 0; i < tradesToOpen; i++)
-   {
-      OpenTrade(direction);
-      Sleep(100);
-   }
-
-   tradesOpenedInBurst = tradesToOpen;
-   Print("BURST ENTRY: Opened ", tradesOpenedInBurst, " ", (direction == OP_BUY ? "BUY" : "SELL"), " trades");
+   // Open ONE trade with MAXIMUM lot size - keep it simple
+   // Will be called continuously by OnTick, so trades open as fast as possible
+   OpenTrade(direction);
 }
 
 int GetFastScalpingSignal()
@@ -326,7 +385,7 @@ void OpenTrade(int orderType)
          totalOpenTrades++;
       }
 
-      lastTradeBar = iTime(Symbol(), PERIOD_M1, 0);
+      lastTradeBar = TimeCurrent();
    }
    else
    {
@@ -408,20 +467,32 @@ void RemoveTradeFromArray(int index)
 
 bool CanOpenNewTrade()
 {
-
-   if(totalOpenTrades >= MaxBasketSize)
-      return false;
-
+   // Simple: just check if we have margin and haven't hit max trades
+   // Open continuously - close on profit, open new ones
+   
    if(totalOpenTrades >= MaxConcurrentTrades)
       return false;
 
-   if(iTime(Symbol(), PERIOD_M1, 0) - lastTradeBar < MinBarsBetweenEntry * 60)
+   // Check if we have enough free margin for maximum lot size trade
+   double lotSize = CalculateDynamicLotSize();
+   double marginRequired = MarketInfo(Symbol(), MODE_MARGINREQUIRED) * lotSize;
+   if(marginRequired <= 0)
+      marginRequired = AccountBalance() * 0.1; // Fallback
+   
+   if(AccountFreeMargin() < marginRequired)
       return false;
 
-   if(totalOpenTrades == 0)
-      return true;
-
    return true;
+}
+
+bool HasOverallProfit()
+{
+   double currentBalance = AccountBalance();
+   if(accountStartBalance <= 0)
+      return true;
+   
+   double profitPercent = ((currentBalance - accountStartBalance) / accountStartBalance) * 100.0;
+   return (profitPercent >= 0);
 }
 
 void CheckDailyReset()
@@ -465,7 +536,7 @@ void UpdateDisplay()
       "----------------------------\n",
       "Open Trades: ", totalOpenTrades, " / ", MaxBasketSize, "\n",
       "Portfolio P&L: $", DoubleToString(portfolioProfit, 2), " (", DoubleToString(portfolioProfitPercent, 2), "%)\n",
-      "Target: ", PortfolioProfitTarget, "% | Quick: ", QuickExitPercent, "% | Max: ", MaxProfitPercent, "%\n",
+      "Target Range: ", PortfolioMinProfitPercent, "% - ", PortfolioMaxProfitPercent, "%\n",
       "----------------------------\n",
       "Daily P&L: $", DoubleToString(dailyProfit, 2), "\n",
       "Balance: $", DoubleToString(currentBalance, 2), " | Equity: $", DoubleToString(currentEquity, 2), "\n",
