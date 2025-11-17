@@ -2,113 +2,380 @@
 
 #property copyright "Copyright 2025"
 #property link      "https://www.mcgibsdigitalsolutions.com"
-#property version   "1.00"
+#property version   "2.00"
 #property strict
 
-input group "===== Trading Pairs ====="
-input bool     TradeEURUSD         = true;
-input bool     TradeGBPUSD         = true;
-input bool     TradeUSDJPY         = true;
-input bool     TradeAUDUSD         = true;
-input bool     TradeUSDCAD         = true;
-input bool     TradeNZDUSD         = true;
-input bool     TradeEURGBP         = true;
+// ---------------------------------------------------------------------------
+// Input Configuration
+// ---------------------------------------------------------------------------
+input group "===== Instruments ====="
+input string   SymbolList          = "AUTO";   // comma separated symbols; AUTO = majors+minors from Market Watch
+input bool     UseAllMarketWatch   = true;
+input bool     RestrictToFXMajors  = true;
 
-input group "===== Ultra-Fast Settings ====="
+input group "===== Signal Settings ====="
+input ENUM_TIMEFRAMES SignalTimeframe = PERIOD_M1;
+input int      TrendPeriodFast     = 10;
+input int      TrendPeriodSlow     = 20;
+input int      MomentumPeriod      = 9;
+input double   MinMomentumStrength = 15.0;
+
+input group "===== Execution Settings ====="
+input bool     UseRiskPerTrade     = true;
+input double   RiskPercentPerTrade = 0.40;
 input double   FixedLotSize        = 0.01;
-input int      ProfitTargetPips    = 5;
-input int      StopLossPips        = 8;
-input int      TradeIntervalSec    = 10;
-input int      MaxConcurrentTrades = 5;
-input double   MaxSpreadPips       = 4.0;
+input int      StopLossPips        = 6;
+input double   TakeProfitPips1     = 3.0;
+input double   TakeProfitPips2     = 5.0;
+input double   TakeProfitPips3     = 8.0;
+input bool     UseLimitEntries     = true;
+input double   LimitOffsetPips     = 1.5;
+input double   CommissionBufferPips= 0.3;
+input double   BasketProfitPercent = 1.5;
+input bool     CloseOnTP2Reach     = true;
+input double   MaxSpreadPips       = 5.0;
+input int      TradeIntervalSec    = 5;
 input int      MagicNumber         = 888888;
+input group "===== Symbol Filter ====="
+input bool     UseMajorSymbolFilter = true;
+input string   AllowedSymbolsList   = "EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,AUDUSD,NZDUSD,XAUUSD";
 
 input group "===== Safety Limits ====="
 input double   MaxDailyLossKES     = 5000.0;
 input double   DailyProfitTargetKES= 10000.0;
-input int      MaxTradesPerDay     = 500;
+input int      MaxTradesPerDay     = 100;
 input int      StartHour           = 0;
 input int      EndHour             = 23;
 
-string tradingPairs[];
-int totalPairs = 0;
-datetime lastTradeTime = 0;
-double dailyProfit = 0;
-int dailyTradeCount = 0;
-int dailyWins = 0;
-int dailyLosses = 0;
-datetime lastDayReset = 0;
-bool tradingEnabled = true;
-double dailyStartEquity = 0;
-
-struct FastTrade {
-   int ticket;
-   string symbol;
+// ---------------------------------------------------------------------------
+// Internal Structures
+// ---------------------------------------------------------------------------
+struct ActiveTrade
+{
+   int      ticket;
+   string   symbol;
+   int      direction;
+   double   lots;
    datetime openTime;
+   double   entryPrice;
+   bool     isPending;
 };
 
-FastTrade activeTrades[];
+// ---------------------------------------------------------------------------
+// Global State
+// ---------------------------------------------------------------------------
+string  symbolPool[];
+int     symbolCount     = 0;
+int     symbolCursor    = 0;
+datetime lastTradeTime  = 0;
 
+double   dailyProfit    = 0;
+int      dailyTradeCount= 0;
+int      dailyWins      = 0;
+int      dailyLosses    = 0;
+datetime lastDayReset   = 0;
+double   dailyStartEquity = 0;
+bool     tradingEnabled = true;
+
+ActiveTrade currentTrade;
+bool        tradeActive = false;
+
+string majorTokens[];
+int    majorTokenCount = 0;
+string allowedMajorBases[] = {"EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD"};
+string allowedMinorPrefixes[] = {"EUR","GBP","AUD","NZD","CHF","CAD","USD","JPY"};
+string exoticPrefixes[] = {"USDTRY","USDZAR","USDMXN","USDHUF","EURSEK","EURPLN","USDNOK","USDINR","USDHKD","EURTRY","GBPTRY","CHFTRY","JPYTRY"};
+string commodityBlocks[] = {"XAG","SILVER","UKOIL","USOIL","WTI","BRENT","COPPER","NGAS","XPT","XPD","WHEAT","CORN"};
+string indexPrefixes[] = {"NAS","US3","SPX","SP","DJ","GER","DE","JP","NK","FTSE","FRA","ITA","AUS","HK","HSI","UK","EU","CAC","DAX"};
+string cryptoPrefixes[] = {"BTC","ETH","XRP","SOL","ADA","DOT","DOGE","BNB","LTC","SHIB","BCH","XLM","TRX","AVAX","MATIC"};
+
+// ---------------------------------------------------------------------------
+// Helper Utilities
+// ---------------------------------------------------------------------------
+string TrimString(string text)
+{
+   int len = StringLen(text);
+   if(len == 0) return "";
+
+   int start = 0;
+   while(start < len)
+   {
+      int ch = StringGetChar(text, start);
+      if(ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n')
+         break;
+      start++;
+   }
+
+   int end = len - 1;
+   while(end >= start)
+   {
+      int ch = StringGetChar(text, end);
+      if(ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n')
+         break;
+      end--;
+   }
+
+   if(end < start)
+      return "";
+
+   return StringSubstr(text, start, end - start + 1);
+}
+
+string ToUpper(string text)
+{
+   int len = StringLen(text);
+   string result = "";
+   for(int i = 0; i < len; i++)
+   {
+      int ch = StringGetChar(text, i);
+      if(ch >= 'a' && ch <= 'z')
+         ch -= 32;
+      result += CharToString((ushort)ch);
+   }
+   return result;
+}
+
+string CurrencyLabel()
+{
+   string cur = AccountCurrency();
+   if(StringLen(cur) == 0)
+      cur = "CUR";
+   return cur;
+}
+
+void ClearSymbolPool()
+{
+   ArrayResize(symbolPool, 0);
+   symbolCount = 0;
+   symbolCursor = 0;
+}
+
+void ResetCurrentTrade()
+{
+   currentTrade.ticket = -1;
+   currentTrade.symbol = "";
+   currentTrade.direction = 0;
+   currentTrade.lots = 0;
+   currentTrade.openTime = 0;
+   currentTrade.entryPrice = 0;
+   currentTrade.isPending = false;
+   tradeActive = false;
+}
+
+void BuildMajorTokenList()
+{
+   ArrayResize(majorTokens, 0);
+   majorTokenCount = 0;
+
+   if(!UseMajorSymbolFilter)
+      return;
+
+   string token = "";
+   int len = StringLen(AllowedSymbolsList);
+   for(int idx = 0; idx < len; idx++)
+   {
+      int ch = StringGetChar(AllowedSymbolsList, idx);
+      if(ch == ',' || ch == ';')
+      {
+         token = TrimString(token);
+         if(StringLen(token) > 0)
+         {
+            int size = ArraySize(majorTokens);
+            ArrayResize(majorTokens, size + 1);
+            majorTokens[size] = ToUpper(token);
+         }
+         token = "";
+      }
+      else
+      {
+         token += StringSubstr(AllowedSymbolsList, idx, 1);
+      }
+   }
+   token = TrimString(token);
+   if(StringLen(token) > 0)
+   {
+      int size = ArraySize(majorTokens);
+      ArrayResize(majorTokens, size + 1);
+      majorTokens[size] = ToUpper(token);
+   }
+
+   majorTokenCount = ArraySize(majorTokens);
+}
+
+string ExtractBaseSymbol(const string sym)
+{
+   string up = ToUpper(sym);
+   string base = "";
+   int len = StringLen(up);
+   for(int i = 0; i < len; i++)
+   {
+      int ch = StringGetChar(up, i);
+      if((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9'))
+         base += CharToString((char)ch);
+      else
+         break;
+   }
+   return base;
+}
+
+bool StartsWith(const string value, const string prefix)
+{
+   int plen = StringLen(prefix);
+   if(plen == 0) return false;
+   if(StringLen(value) < plen) return false;
+   return StringSubstr(value, 0, plen) == prefix;
+}
+
+bool InStringArray(const string value, string &arr[])
+{
+   for(int i = 0; i < ArraySize(arr); i++)
+      if(value == arr[i])
+         return true;
+   return false;
+}
+
+bool SymbolMatchesAllowed(const string sym)
+{
+   string base = ExtractBaseSymbol(sym);
+   if(base == "")
+      return false;
+
+   if(StartsWith(base, "XAU"))
+      return true;
+
+   for(int c = 0; c < ArraySize(commodityBlocks); c++)
+      if(StartsWith(base, commodityBlocks[c]))
+      {
+         Print("Trading disabled for this symbol.");
+         return false;
+      }
+
+   for(int e = 0; e < ArraySize(exoticPrefixes); e++)
+      if(StartsWith(base, exoticPrefixes[e]))
+      {
+         Print("Trading disabled for this symbol.");
+         return false;
+      }
+
+   bool isIndex = false;
+   for(int i = 0; i < ArraySize(indexPrefixes); i++)
+      if(StartsWith(base, indexPrefixes[i])) { isIndex = true; break; }
+
+   bool isCrypto = false;
+   for(int k = 0; k < ArraySize(cryptoPrefixes); k++)
+      if(StartsWith(base, cryptoPrefixes[k])) { isCrypto = true; break; }
+
+   if(isIndex || isCrypto)
+      return true;
+
+   if(RestrictToFXMajors)
+   {
+      bool fxOk = false;
+      if(InStringArray(base, allowedMajorBases))
+         fxOk = true;
+      else if(StringLen(base) >= 6)
+      {
+         string pref = StringSubstr(base, 0, 3);
+         string suff = StringSubstr(base, 3, 3);
+         if(InStringArray(pref, allowedMinorPrefixes) && InStringArray(suff, allowedMinorPrefixes))
+            fxOk = true;
+      }
+      if(!fxOk)
+      {
+         Print("Trading disabled for this symbol.");
+         return false;
+      }
+   }
+
+   if(UseMajorSymbolFilter && majorTokenCount > 0)
+   {
+      for(int j = 0; j < majorTokenCount; j++)
+      {
+         string token = majorTokens[j];
+         if(token == "") continue;
+         if(StartsWith(base, token))
+            return true;
+      }
+      Print("Trading disabled for this symbol.");
+      return false;
+   }
+
+   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Forward Declarations
+// ---------------------------------------------------------------------------
+string  ExtractBaseSymbol(const string sym);
+bool    StartsWith(const string value, const string prefix);
+bool    InStringArray(const string value, string &arr[]);
+bool    BuildSymbolPool();
+void    AddSymbol(string sym);
+bool    TryOpenTrade();
+bool    EvaluateSymbol(const string sym, int &direction);
+bool    PlaceOrder(const string sym, int direction);
+double  CalculatePipPoint(const string sym);
+double  CalculatePipValue(const string sym);
+double  NormalizeLots(const string sym, double lots);
+int     GetSymbolSignal(const string sym);
+bool    SpreadAcceptable(const string sym);
+void    ManageActiveTrade();
+void    SyncActiveTrade();
+void    CloseActiveTrade(const string reason);
+void    CloseAllTrades();
+void    CheckDailyReset();
+void    CheckDailyLimits();
+void    HandleClosedTrade(int ticket, double pl);
+void    UpdateDisplay();
+string  GetStatus();
+
+// ---------------------------------------------------------------------------
 int OnInit()
 {
    Print("========================================");
-   Print("ULTRA-FAST SCALPER v1.00 - Lightning Speed!");
+   Print("UltraFastScalper v2.00");
    Print("========================================");
 
    MathSrand((int)TimeLocal());
+   ClearSymbolPool();
 
-   ArrayResize(tradingPairs, 0);
-   if(TradeEURUSD) AddPair("EURUSD");
-   if(TradeGBPUSD) AddPair("GBPUSD");
-   if(TradeUSDJPY) AddPair("USDJPY");
-   if(TradeAUDUSD) AddPair("AUDUSD");
-   if(TradeUSDCAD) AddPair("USDCAD");
-   if(TradeNZDUSD) AddPair("NZDUSD");
-   if(TradeEURGBP) AddPair("EURGBP");
-
-   totalPairs = ArraySize(tradingPairs);
-
-   Print("Trading Pairs: ", totalPairs);
-   for(int i = 0; i < totalPairs; i++)
+   if(!BuildSymbolPool())
    {
-      if(MarketInfo(tradingPairs[i], MODE_BID) > 0)
-         Print("  [", i+1, "] ", tradingPairs[i], " - OK");
-      else
-         Print("  [", i+1, "] ", tradingPairs[i], " - WARNING: Not in Market Watch!");
-   }
-
-   if(totalPairs < 3)
-   {
-      Alert("WARNING: Enable at least 3 pairs!");
+      Alert("UltraFastScalper: No tradable symbols found. Please configure SymbolList/MarketWatch.");
       return(INIT_FAILED);
    }
 
-   Print("========================================");
-   Print("LOT SIZE: ", DoubleToString(FixedLotSize, 2), " (FIXED)");
-   Print("TP: ", ProfitTargetPips, " pips | SL: ", StopLossPips, " pips");
-   Print("Trade Interval: ", TradeIntervalSec, " seconds (ULTRA-FAST!)");
-   Print("Max Concurrent: ", MaxConcurrentTrades, " trades");
-   Print("Daily Limits: +", DailyProfitTargetKES, " KES profit | -", MaxDailyLossKES, " KES loss");
-   Print("========================================");
+   ResetCurrentTrade();
 
-   ArrayResize(activeTrades, 0);
-   lastDayReset = iTime(Symbol(), PERIOD_D1, 0);
+   lastDayReset     = iTime(Symbol(), PERIOD_D1, 0);
    dailyStartEquity = AccountEquity();
+   lastTradeTime    = 0;
 
+   Print("Loaded symbols: ", symbolCount);
    return(INIT_SUCCEEDED);
 }
 
+// ---------------------------------------------------------------------------
+void OnDeinit(const int reason)
+{
+   CloseAllTrades();
+   Comment("");
+   Print("UltraFastScalper deinitialized. Reason: ", reason);
+}
+
+// ---------------------------------------------------------------------------
 void OnTick()
 {
    CheckDailyReset();
    CheckDailyLimits();
-   CleanClosedTrades();
+   SyncActiveTrade();
+   ManageActiveTrade();
 
-   if(tradingEnabled && ArraySize(activeTrades) < MaxConcurrentTrades)
+   if(tradingEnabled && !tradeActive)
    {
-      if(TimeCurrent() - lastTradeTime >= TradeIntervalSec)
+      if((TimeCurrent() - lastTradeTime) >= TradeIntervalSec)
       {
-         OpenFastTrade();
+         if(TryOpenTrade())
          lastTradeTime = TimeCurrent();
       }
    }
@@ -116,268 +383,493 @@ void OnTick()
    UpdateDisplay();
 }
 
-void CheckDailyReset()
+// ---------------------------------------------------------------------------
+bool BuildSymbolPool()
 {
-   datetime currentDay = iTime(Symbol(), PERIOD_D1, 0);
+   ClearSymbolPool();
 
-   if(currentDay != lastDayReset)
+   bool useAuto = true;
+   string cleanedList = TrimString(SymbolList);
+   if(StringLen(cleanedList) > 0 && StringCompare(ToUpper(cleanedList), "AUTO") != 0)
+      useAuto = false;
+
+   if(UseAllMarketWatch || useAuto)
    {
-      Print("========================================");
-      Print("DAILY RESET - Previous: ", dailyTradeCount, " trades | ",
-            dailyWins, "W/", dailyLosses, "L | P&L: ", DoubleToString(dailyProfit, 2), " KES");
-      Print("========================================");
+      int total = SymbolsTotal(true);
+      for(int i = 0; i < total; i++)
+      {
+         string sym = SymbolName(i, true);
+         if(StringLen(sym) > 0)
+            AddSymbol(sym);
+      }
+   }
 
-      dailyProfit = 0;
-      dailyTradeCount = 0;
-      dailyWins = 0;
-      dailyLosses = 0;
-      lastDayReset = currentDay;
-      dailyStartEquity = AccountEquity();
-      tradingEnabled = true;
+   if(!useAuto && StringLen(SymbolList) > 0)
+   {
+      string token = "";
+      int len = StringLen(SymbolList);
+      for(int idx = 0; idx < len; idx++)
+      {
+         int ch = StringGetChar(SymbolList, idx);
+         if(ch == ',' || ch == ';')
+         {
+            token = TrimString(token);
+            if(StringLen(token) > 0)
+               AddSymbol(token);
+            token = "";
+         }
+         else
+         {
+            token += StringSubstr(SymbolList, idx, 1);
+         }
+      }
+      token = TrimString(token);
+      if(StringLen(token) > 0)
+         AddSymbol(token);
+   }
+
+   symbolCount = ArraySize(symbolPool);
+   symbolCursor = 0;
+   return (symbolCount > 0);
+}
+
+// ---------------------------------------------------------------------------
+void AddSymbol(string sym)
+{
+   if(sym == "") return;
+   sym = TrimString(sym);
+   if(StringLen(sym) == 0) return;
+
+   // ensure symbol is available
+   bool selected = SymbolSelect(sym, true);
+   double tick = MarketInfo(sym, MODE_TICKSIZE);
+    if(!selected || tick <= 0)
+      return;
+
+   if(!SymbolMatchesAllowed(sym))
+      return;
+
+   // check duplicates
+   for(int i = 0; i < ArraySize(symbolPool); i++)
+   {
+      if(symbolPool[i] == sym)
+      return;
+   }
+
+   int size = ArraySize(symbolPool);
+   ArrayResize(symbolPool, size + 1);
+   symbolPool[size] = sym;
+}
+
+// ---------------------------------------------------------------------------
+bool TryOpenTrade()
+{
+   if(symbolCount == 0) return false;
+
+   int attempts = symbolCount;
+   while(attempts > 0)
+   {
+      if(symbolCursor >= symbolCount)
+         symbolCursor = 0;
+
+      string sym = symbolPool[symbolCursor];
+      symbolCursor++;
+      attempts--;
+
+      int direction = 0;
+      if(EvaluateSymbol(sym, direction))
+      {
+         if(direction == OP_BUY || direction == OP_SELL)
+         {
+            if(PlaceOrder(sym, direction))
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+// ---------------------------------------------------------------------------
+bool EvaluateSymbol(const string sym, int &direction)
+{
+   direction = -1;
+
+   if(!SpreadAcceptable(sym))
+      return false;
+
+   int signal = GetSymbolSignal(sym);
+   if(signal != OP_BUY && signal != OP_SELL)
+      return false;
+
+   direction = signal;
+   return true;
+}
+
+// ---------------------------------------------------------------------------
+bool PlaceOrder(const string sym, int direction)
+{
+   int currentHour = Hour();
+   if(currentHour < StartHour || currentHour >= EndHour)
+      return false;
+
+   double lotSize = FixedLotSize;
+   if(UseRiskPerTrade)
+   {
+      double pipValue = CalculatePipValue(sym);
+      if(pipValue > 0 && StopLossPips > 0)
+      {
+         double riskCurrency = AccountEquity() * (RiskPercentPerTrade / 100.0);
+         double calcLot = riskCurrency / (StopLossPips * pipValue);
+         lotSize = NormalizeLots(sym, calcLot);
+      }
+      else
+      {
+         lotSize = NormalizeLots(sym, FixedLotSize);
+      }
+   }
+   else
+   {
+      lotSize = NormalizeLots(sym, FixedLotSize);
+   }
+
+   lotSize = MathMax(lotSize, FixedLotSize);
+
+   double marketPrice = (direction == OP_BUY) ? MarketInfo(sym, MODE_ASK) : MarketInfo(sym, MODE_BID);
+   double pipPoint = CalculatePipPoint(sym);
+   int digits = (int)MarketInfo(sym, MODE_DIGITS);
+
+   double entryPrice = marketPrice;
+   int sendType = direction;
+
+   if(UseLimitEntries)
+   {
+      double offset = MathMax(LimitOffsetPips, 0.1) * pipPoint;
+   if(direction == OP_BUY)
+   {
+         sendType = OP_BUYLIMIT;
+         entryPrice = marketPrice - offset;
+   }
+   else
+   {
+         sendType = OP_SELLLIMIT;
+         entryPrice = marketPrice + offset;
+      }
+   }
+
+   entryPrice = NormalizeDouble(entryPrice, digits);
+
+   double tp1 = MathMax(TakeProfitPips1, 1.0);
+   double tp2 = MathMax(TakeProfitPips2, tp1);
+   double tp3 = MathMax(TakeProfitPips3, tp2);
+   double buffer = MathMax(CommissionBufferPips, 0.0);
+   double targetPips = tp3 + buffer;
+
+   double sl = (direction == OP_BUY) ? entryPrice - StopLossPips * pipPoint
+                                     : entryPrice + StopLossPips * pipPoint;
+   double tp = (direction == OP_BUY) ? entryPrice + targetPips * pipPoint
+                                     : entryPrice - targetPips * pipPoint;
+
+   sl = NormalizeDouble(sl, digits);
+   tp = NormalizeDouble(tp, digits);
+
+   color arrowColor = (direction == OP_BUY) ? clrLime : clrTomato;
+   int ticket = OrderSend(sym, sendType, lotSize, entryPrice, 0, sl, tp,
+                          "UltraFast", MagicNumber, 0, arrowColor);
+
+   if(ticket <= 0)
+   {
+      Print("UltraFastScalper: OrderSend failed ", GetLastError());
+      return false;
+   }
+
+   currentTrade.ticket = ticket;
+   currentTrade.symbol = sym;
+   currentTrade.direction = direction;
+   currentTrade.lots = lotSize;
+   currentTrade.openTime = TimeCurrent();
+   currentTrade.entryPrice = entryPrice;
+   currentTrade.isPending = (sendType == OP_BUYLIMIT || sendType == OP_SELLLIMIT);
+   tradeActive = true;
+
+   return true;
+}
+
+// ---------------------------------------------------------------------------
+double CalculatePipPoint(const string sym)
+{
+   double point = MarketInfo(sym, MODE_POINT);
+   int digits = (int)MarketInfo(sym, MODE_DIGITS);
+   if(digits == 3 || digits == 5)
+      point *= 10.0;
+   return point;
+}
+
+// ---------------------------------------------------------------------------
+double CalculatePipValue(const string sym)
+{
+   double tickValue = MarketInfo(sym, MODE_TICKVALUE);
+   double tickSize  = MarketInfo(sym, MODE_TICKSIZE);
+   double pipPoint  = CalculatePipPoint(sym);
+   if(tickSize <= 0 || pipPoint <= 0) return 0.0;
+   return (tickValue / tickSize) * pipPoint;
+}
+
+// ---------------------------------------------------------------------------
+double NormalizeLots(const string sym, double lots)
+{
+   double minLot  = MarketInfo(sym, MODE_MINLOT);
+   double maxLot  = MarketInfo(sym, MODE_MAXLOT);
+   double lotStep = MarketInfo(sym, MODE_LOTSTEP);
+
+   if(lotStep <= 0) lotStep = 0.01;
+   if(minLot <= 0)  minLot  = 0.01;
+   if(maxLot <= 0)  maxLot  = 100.0;
+
+   lots = MathMax(minLot, MathMin(maxLot, lots));
+   lots = MathFloor(lots / lotStep + 0.0001) * lotStep;
+   return NormalizeDouble(lots, 2);
+}
+
+// ---------------------------------------------------------------------------
+int GetSymbolSignal(const string sym)
+{
+   double emaFast = iMA(sym, SignalTimeframe, TrendPeriodFast, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double emaSlow = iMA(sym, SignalTimeframe, TrendPeriodSlow, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double rsi     = iRSI(sym, SignalTimeframe, MomentumPeriod, PRICE_CLOSE, 0);
+
+   double price   = iClose(sym, SignalTimeframe, 0);
+   double prev    = iClose(sym, SignalTimeframe, 1);
+
+   bool uptrend   = emaFast > emaSlow;
+   bool downtrend = emaFast < emaSlow;
+   bool priceAbove= price > emaFast;
+   bool priceBelow= price < emaFast;
+
+   bool bullishMomentum = rsi > (50 + MinMomentumStrength);
+   bool bearishMomentum = rsi < (50 - MinMomentumStrength);
+
+   int buyScore = 0;
+   if(uptrend) buyScore++;
+   if(priceAbove) buyScore++;
+   if(bullishMomentum) buyScore++;
+   if(price > prev) buyScore++;
+
+   int sellScore = 0;
+   if(downtrend) sellScore++;
+   if(priceBelow) sellScore++;
+   if(bearishMomentum) sellScore++;
+   if(price < prev) sellScore++;
+
+   if(buyScore >= 3 && sellScore <= 1)  return OP_BUY;
+   if(sellScore >= 3 && buyScore <= 1)  return OP_SELL;
+   return -1;
+}
+
+// ---------------------------------------------------------------------------
+bool SpreadAcceptable(const string sym)
+{
+   double ask = MarketInfo(sym, MODE_ASK);
+   double bid = MarketInfo(sym, MODE_BID);
+   if(ask <= 0 || bid <= 0) return false;
+
+   double spread = (ask - bid) / CalculatePipPoint(sym);
+   return (spread <= MaxSpreadPips);
+}
+
+// ---------------------------------------------------------------------------
+void ManageActiveTrade()
+{
+   if(!tradeActive || currentTrade.ticket <= 0)
+      return;
+
+   if(!OrderSelect(currentTrade.ticket, SELECT_BY_TICKET))
+   {
+      if(OrderSelect(currentTrade.ticket, SELECT_BY_TICKET, MODE_HISTORY))
+      {
+         double pl = OrderProfit() + OrderSwap() + OrderCommission();
+         HandleClosedTrade(currentTrade.ticket, pl);
+      }
+      tradeActive = false;
+      currentTrade.ticket = -1;
+      return;
+   }
+
+   if(OrderCloseTime() > 0)
+   {
+      double pl = OrderProfit() + OrderSwap() + OrderCommission();
+      HandleClosedTrade(currentTrade.ticket, pl);
+      tradeActive = false;
+      currentTrade.ticket = -1;
+      return;
+   }
+
+   double floatingPL = OrderProfit() + OrderSwap() + OrderCommission();
+   if(BasketProfitPercent > 0.0)
+   {
+      double trigger = AccountBalance() * (BasketProfitPercent / 100.0);
+      if(floatingPL >= trigger)
+      {
+         CloseActiveTrade("Basket percent target");
+         return;
+      }
+   }
+
+   if(CloseOnTP2Reach && TakeProfitPips2 > 0.0)
+   {
+      double pipPoint = CalculatePipPoint(currentTrade.symbol);
+      double price    = (currentTrade.direction == OP_BUY)
+                        ? MarketInfo(currentTrade.symbol, MODE_BID)
+                        : MarketInfo(currentTrade.symbol, MODE_ASK);
+      double entry    = currentTrade.entryPrice;
+      double gainPips = (currentTrade.direction == OP_BUY)
+                        ? (price - entry) / pipPoint
+                        : (entry - price) / pipPoint;
+
+      if(gainPips >= TakeProfitPips2)
+      {
+         CloseActiveTrade("TP2 reached");
+         return;
+      }
    }
 }
 
+// ---------------------------------------------------------------------------
+void SyncActiveTrade()
+{
+   if(!tradeActive || currentTrade.ticket <= 0)
+      return;
+
+   if(OrderSelect(currentTrade.ticket, SELECT_BY_TICKET))
+      return;
+
+   if(OrderSelect(currentTrade.ticket, SELECT_BY_TICKET, MODE_HISTORY))
+   {
+      double pl = OrderProfit() + OrderSwap() + OrderCommission();
+      HandleClosedTrade(currentTrade.ticket, pl);
+   }
+   tradeActive = false;
+   currentTrade.ticket = -1;
+}
+
+// ---------------------------------------------------------------------------
+void CloseActiveTrade(const string reason)
+{
+   if(!tradeActive || currentTrade.ticket <= 0)
+      return;
+
+   if(OrderSelect(currentTrade.ticket, SELECT_BY_TICKET))
+   {
+      double price = (currentTrade.direction == OP_BUY)
+                     ? MarketInfo(currentTrade.symbol, MODE_BID)
+                     : MarketInfo(currentTrade.symbol, MODE_ASK);
+
+      if(price > 0)
+      {
+         if(OrderClose(currentTrade.ticket, OrderLots(), price, 3, clrAqua))
+            Print("UltraFastScalper: Trade closed (", reason, ")");
+      }
+   }
+}
+
+// ---------------------------------------------------------------------------
+void CloseAllTrades()
+{
+   if(tradeActive)
+      CloseActiveTrade("CloseAll");
+
+   tradeActive = false;
+   currentTrade.ticket = -1;
+}
+
+// ---------------------------------------------------------------------------
+void CheckDailyReset()
+{
+   datetime currentDay = iTime(Symbol(), PERIOD_D1, 0);
+   if(currentDay == lastDayReset)
+      return;
+
+   Print("========================================");
+   Print("Daily Reset | Trades: ", dailyTradeCount, " | Wins: ", dailyWins,
+         " | Losses: ", dailyLosses, " | P&L: ", DoubleToString(dailyProfit, 2));
+   Print("========================================");
+
+   dailyProfit = 0;
+   dailyTradeCount = 0;
+   dailyWins = 0;
+   dailyLosses = 0;
+   dailyStartEquity = AccountEquity();
+   lastDayReset = currentDay;
+   tradingEnabled = true;
+}
+
+// ---------------------------------------------------------------------------
 void CheckDailyLimits()
 {
-   if(!tradingEnabled) return;
+   if(!tradingEnabled)
+      return;
 
    if(dailyTradeCount >= MaxTradesPerDay)
    {
       tradingEnabled = false;
-      Alert("Max trades per day reached (", MaxTradesPerDay, ")");
+      CloseAllTrades();
+      Print("UltraFastScalper: Max trades per day reached. Pausing.");
       return;
    }
 
    if(dailyProfit >= DailyProfitTargetKES)
    {
       tradingEnabled = false;
-      Alert("SUCCESS! Daily profit target reached: +", DoubleToString(dailyProfit, 2), " KES");
       CloseAllTrades();
+      Print("UltraFastScalper: Daily profit target hit (", CurrencyLabel(), "). Pausing.");
       return;
    }
 
    if(dailyProfit <= -MaxDailyLossKES)
    {
       tradingEnabled = false;
-      Alert("STOP! Daily loss limit hit: ", DoubleToString(dailyProfit, 2), " KES");
       CloseAllTrades();
+      Print("UltraFastScalper: Daily loss limit hit (", CurrencyLabel(), "). Pausing.");
       return;
    }
 }
 
-void AddPair(string pair)
+// ---------------------------------------------------------------------------
+void HandleClosedTrade(int ticket, double pl)
 {
-   int size = ArraySize(tradingPairs);
-   ArrayResize(tradingPairs, size + 1);
-   tradingPairs[size] = pair;
+   dailyProfit += pl;
+   dailyTradeCount++;
+   if(pl > 0) dailyWins++; else dailyLosses++;
 }
 
-void OpenFastTrade()
-{
-
-   int currentHour = Hour();
-   if(currentHour < StartHour || currentHour >= EndHour)
-      return;
-
-   string selectedPair = "";
-   int attempts = 0;
-
-   while(selectedPair == "" && attempts < 20)
-   {
-      int randomIndex = MathRand() % totalPairs;
-      string pair = tradingPairs[randomIndex];
-
-      double spread = GetSpreadPips(pair);
-      if(spread <= MaxSpreadPips && spread > 0)
-      {
-         selectedPair = pair;
-      }
-      attempts++;
-   }
-
-   if(selectedPair == "")
-      return;
-
-   int direction = GetFastSignal(selectedPair);
-   if(direction < 0)
-      return;
-
-   double price = (direction == OP_BUY) ? MarketInfo(selectedPair, MODE_ASK) : MarketInfo(selectedPair, MODE_BID);
-   double point = MarketInfo(selectedPair, MODE_POINT);
-   int digits = (int)MarketInfo(selectedPair, MODE_DIGITS);
-
-   if(digits == 5 || digits == 3)
-      point *= 10;
-
-   double sl = 0, tp = 0;
-   if(direction == OP_BUY)
-   {
-      sl = price - (StopLossPips * point);
-      tp = price + (ProfitTargetPips * point);
-   }
-   else
-   {
-      sl = price + (StopLossPips * point);
-      tp = price - (ProfitTargetPips * point);
-   }
-
-   sl = NormalizeDouble(sl, digits);
-   tp = NormalizeDouble(tp, digits);
-
-   color arrowColor = (direction == OP_BUY) ? clrLime : clrRed;
-   int ticket = OrderSend(selectedPair, direction, FixedLotSize, price, 3, sl, tp,
-                          "UltraFast", MagicNumber, 0, arrowColor);
-
-   if(ticket > 0)
-   {
-
-      int size = ArraySize(activeTrades);
-      ArrayResize(activeTrades, size + 1);
-
-      activeTrades[size].ticket = ticket;
-      activeTrades[size].symbol = selectedPair;
-      activeTrades[size].openTime = TimeCurrent();
-
-   }
-}
-
-int GetFastSignal(string symbol)
-{
-
-   double price1 = iClose(symbol, PERIOD_M1, 0);
-   double price2 = iClose(symbol, PERIOD_M1, 1);
-   double price3 = iClose(symbol, PERIOD_M1, 2);
-
-   double momentum = price1 - price3;
-   double recent = price1 - price2;
-
-   if(momentum > 0 && recent > 0)
-      return OP_BUY;
-
-   if(momentum < 0 && recent < 0)
-      return OP_SELL;
-
-   if(MathRand() % 3 == 0)
-      return (MathRand() % 2 == 0) ? OP_BUY : OP_SELL;
-
-   return -1;
-}
-
-double GetSpreadPips(string symbol)
-{
-   double ask = MarketInfo(symbol, MODE_ASK);
-   double bid = MarketInfo(symbol, MODE_BID);
-   double point = MarketInfo(symbol, MODE_POINT);
-   int digits = (int)MarketInfo(symbol, MODE_DIGITS);
-
-   if(ask == 0 || bid == 0 || point == 0) return 999;
-
-   double spread = (ask - bid) / point;
-
-   if(digits == 5 || digits == 3)
-      spread = spread / 10.0;
-
-   return spread;
-}
-
-void CleanClosedTrades()
-{
-   for(int i = ArraySize(activeTrades) - 1; i >= 0; i--)
-   {
-      if(activeTrades[i].ticket > 0)
-      {
-         if(OrderSelect(activeTrades[i].ticket, SELECT_BY_TICKET))
-         {
-            if(OrderCloseTime() > 0)
-            {
-
-               double pl = OrderProfit() + OrderSwap() + OrderCommission();
-               dailyProfit += pl;
-               dailyTradeCount++;
-
-               if(pl > 0)
-                  dailyWins++;
-               else
-                  dailyLosses++;
-
-               RemoveTradeAtIndex(i);
-            }
-         }
-         else
-         {
-            RemoveTradeAtIndex(i);
-         }
-      }
-   }
-}
-
-void CloseAllTrades()
-{
-   for(int i = ArraySize(activeTrades) - 1; i >= 0; i--)
-   {
-      if(activeTrades[i].ticket > 0)
-      {
-         if(OrderSelect(activeTrades[i].ticket, SELECT_BY_TICKET))
-         {
-            double closePrice = (OrderType() == OP_BUY) ? MarketInfo(OrderSymbol(), MODE_BID) : MarketInfo(OrderSymbol(), MODE_ASK);
-
-            if(closePrice > 0)
-            {
-               OrderClose(activeTrades[i].ticket, OrderLots(), closePrice, 5, clrYellow);
-            }
-         }
-      }
-   }
-
-   ArrayResize(activeTrades, 0);
-}
-
-void RemoveTradeAtIndex(int index)
-{
-   int size = ArraySize(activeTrades);
-
-   for(int i = index; i < size - 1; i++)
-   {
-      activeTrades[i] = activeTrades[i + 1];
-   }
-
-   ArrayResize(activeTrades, size - 1);
-}
-
+// ---------------------------------------------------------------------------
 void UpdateDisplay()
 {
-   int activeCount = ArraySize(activeTrades);
-   int nextTrade = (int)(TradeIntervalSec - (TimeCurrent() - lastTradeTime));
-   if(nextTrade < 0) nextTrade = 0;
+   Comment(GetStatus());
+}
 
-   double currentPL = 0;
-   for(int i = 0; i < activeCount; i++)
-   {
-      if(OrderSelect(activeTrades[i].ticket, SELECT_BY_TICKET))
-      {
-         currentPL += OrderProfit() + OrderSwap() + OrderCommission();
-      }
-   }
+// ---------------------------------------------------------------------------
+string GetStatus()
+{
+   double winRate = (dailyTradeCount > 0) ? (double)dailyWins * 100.0 / dailyTradeCount : 0.0;
+   string tradeInfo = tradeActive ? StringConcatenate(currentTrade.symbol, " | ",
+                                                      DoubleToString(currentTrade.lots, 2), " lots, ",
+                                                      (currentTrade.direction == OP_BUY ? "BUY" : "SELL"))
+                                  : "None";
+   string cur = CurrencyLabel();
 
-   double winRate = (dailyTradeCount > 0) ? (dailyWins * 100.0 / dailyTradeCount) : 0;
-
-   string status = "⚡ ULTRA-FAST SCALPER ⚡\n";
-   status += "Status: " + (tradingEnabled ? "ACTIVE ✓" : "STOPPED ✗") + "\n";
+   string status = "⚡ UltraFastScalper ⚡\n";
+   status += "Trading: " + string(tradingEnabled ? "ON" : "OFF") + " | Active Trade: " + tradeInfo + "\n";
    status += "========================================\n";
-   status += "Active: " + IntegerToString(activeCount) + "/" + IntegerToString(MaxConcurrentTrades);
-   status += " | Next: " + IntegerToString(nextTrade) + "s\n";
-   status += "Current P&L: " + DoubleToString(currentPL, 2) + " KES\n";
+   status += "Daily P&L: " + DoubleToString(dailyProfit, 2) + " " + cur + " | Trades: " +
+             IntegerToString(dailyTradeCount) + " | Win%: " + DoubleToString(winRate, 1) + "%\n";
+   status += "Goals: +" + DoubleToString(DailyProfitTargetKES, 0) + " / -" +
+             DoubleToString(MaxDailyLossKES, 0) + " " + cur + " | Max/Day: " +
+             IntegerToString(MaxTradesPerDay) + "\n";
+   status += "Current Pool: " + IntegerToString(symbolCount) + " symbols\n";
    status += "========================================\n";
-   status += "TODAY: " + IntegerToString(dailyTradeCount) + " trades | ";
-   status += IntegerToString(dailyWins) + "W/" + IntegerToString(dailyLosses) + "L (";
-   status += DoubleToString(winRate, 1) + "%)\n";
-   status += "Daily P&L: " + DoubleToString(dailyProfit, 2) + " KES\n";
-   status += "Target: +" + DoubleToString(DailyProfitTargetKES, 0) + " | Limit: -" + DoubleToString(MaxDailyLossKES, 0) + "\n";
-   status += "========================================\n";
-   status += "Lot: " + DoubleToString(FixedLotSize, 2) + " (FIXED) | ";
-   status += "TP: " + IntegerToString(ProfitTargetPips) + " | SL: " + IntegerToString(StopLossPips) + " pips\n";
-   status += "Interval: " + IntegerToString(TradeIntervalSec) + "s ⚡";
-
-   Comment(status);
+   status += "Risk: " + DoubleToString(RiskPercentPerTrade, 2) + "% | SL: " + IntegerToString(StopLossPips) +
+             " pips | TP Levels: " + DoubleToString(TakeProfitPips1, 1) + "/" +
+             DoubleToString(TakeProfitPips2, 1) + "/" + DoubleToString(TakeProfitPips3, 1) + " pips\n";
+   return status;
 }
 

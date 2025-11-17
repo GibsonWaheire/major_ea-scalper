@@ -5,19 +5,17 @@
 #property version   "3.00"
 #property strict
 
-#define FIXED_STOP_LOSS_PIPS 30.0
-
 input group "===== Dynamic Lot Sizing ====="
 input double   AccountBalance_10K  = 1000000.0;
 input double   AccountBalance_100  = 100000.0;
 input double   AccountBalance_1500 = 500000.0;
 input double   MinLotSize          = 0.01;
-input double   MaxLotSize          = 0.08;
+input double   MaxLotSize          = 0.10;
 
 input group "===== Core Trading Settings ====="
 input int      MagicNumber         = 202503;
-input int      MaxTrades           = 3;
-input int      TradesPerBurst      = 3;
+input int      MaxTrades           = 12;
+input int      TradesPerBurst      = 5;
 input int      BurstDelayMS        = 100;
 
 input group "===== Adaptive Profit Engine ====="
@@ -34,7 +32,7 @@ input bool     UseRiskRewardTarget  = false;    // Combine RR target with equity
 input double   RiskRewardMultiplier = 3.0;      // Multiple of risk to target (if enabled)
 input double   PeakGivebackPercent = 30.0;    // Allowable giveback from profit peak
 input int      MinimumHoldMS       = 250;     // Prevent premature exits
-input double   MaxSpreadPips       = 6.0;
+input double   MaxSpreadPips       = 3.0;
 
 input group "===== Trading Controls ====="
 input bool     TradeEnabled        = true;
@@ -42,6 +40,9 @@ input int      TickDelay           = 1;
 input int      MaxConsecutiveLosses= 5;
 input bool     UseGoldOnly         = true;
 input int      MaxDailyTrades      = 100000;
+
+input group "===== Risk Parameters ====="
+input double   StopLossPips        = 50.0;
 
 input group "===== Strategy Settings ====="
 input int      TrendPeriod         = 10;
@@ -56,10 +57,6 @@ input bool     UseTrailingStop     = true;
 input double   TrailingStartPips   = 120.0;
 input double   TrailingStepPips    = 60.0;
 input double   PerTradeProfitLock  = 5000.0;   // Close individual positions once profit exceeds this amount
-
-input group "===== Instant Profit Exit ====="
-input bool     UseInstantProfitExit = true;
-input double   InstantProfitPips    = 5.0;
 
 input group "===== Lot Growth Settings ====="
 input double   ProfitStepForLotIncrease= 20.0;     // Increase lot size every X profit
@@ -380,7 +377,7 @@ void OpenScalpTrade(int orderType)
       return;
    }
 
-   double stopLossPips = FIXED_STOP_LOSS_PIPS;
+   double stopLossPips = StopLossPips;
    if(stopLossPips > 0.0 && pipToPoint > 0.0)
    {
       double slDistance = stopLossPips * pipToPoint;
@@ -483,9 +480,6 @@ void UpdatePerTradeTrailing(int index, double pipToPoint)
    if(!OrderSelect(ticket, SELECT_BY_TICKET))
       return;
 
-   if(OrderCloseTime() > 0)
-      return;
-
    int type = OrderType();
    double price = (type == OP_BUY) ? Bid : Ask;
    double entry = activeTrades[index].entryPrice;
@@ -534,9 +528,6 @@ bool ModifyOrderStop(int ticket, double newStop)
    if(!OrderSelect(ticket, SELECT_BY_TICKET))
       return(false);
 
-   if(OrderCloseTime() > 0)
-      return(false);
-
    double price = OrderOpenPrice();
    double tp = OrderTakeProfit();
 
@@ -577,26 +568,7 @@ void ManageActiveTrades()
       if(!OrderSelect(activeTrades[i].ticket, SELECT_BY_TICKET))
          continue;
 
-      int orderType = OrderType();
-      double entry = OrderOpenPrice();
-      double currentPrice = (orderType == OP_BUY) ? Bid : Ask;
-      double pipGain = 0.0;
-      if(pipToPoint > 0.0)
-      {
-         if(orderType == OP_BUY)
-            pipGain = (currentPrice - entry) / pipToPoint;
-         else if(orderType == OP_SELL)
-            pipGain = (entry - currentPrice) / pipToPoint;
-      }
-
       double tradeProfit = OrderProfit() + OrderSwap() + OrderCommission();
-
-       if(UseInstantProfitExit && InstantProfitPips > 0.0 && tradeProfit > 0.0 && pipGain >= InstantProfitPips)
-       {
-         CloseTradeAtIndex(i, "Instant profit exit +" + DoubleToString(tradeProfit, 2));
-         i--;
-         continue;
-       }
 
        if(PerTradeProfitLock > 0.0 && tradeProfit >= PerTradeProfitLock)
        {
@@ -608,8 +580,9 @@ void ManageActiveTrades()
       totalProfit += tradeProfit;
 
       double lotSize = OrderLots();
-      double riskPips = FIXED_STOP_LOSS_PIPS;
+      double riskPips = StopLossPips;
       double stop = OrderStopLoss();
+      double entry = OrderOpenPrice();
 
       if(stop > 0 && pipToPoint > 0)
          riskPips = MathAbs(entry - stop) / pipToPoint;

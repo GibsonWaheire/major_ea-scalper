@@ -18,14 +18,13 @@ Ultra-fast tick-based trading EA designed for instant entries/exits with basket 
 ### Tick-Based Entry Methods
 
 1. **Micro Price Movement (Default)**
-   - Opens trades when price moves X pips from last tick
-   - Direction based on price movement direction
-   - Can open both directions simultaneously (hedge mode)
+   - Opens trades when price moves X **points** from the last tick
+   - Direction based on price movement direction (or preferred direction)
+   - Locks the basket to a single direction until it closes
 
-2. **Random Hedge**
-   - Opens BUY and SELL simultaneously
-   - Creates instant hedge positions
-   - Relies on basket profit closure
+2. **Random Direction**
+   - Chooses a direction per cycle (respecting preferred direction)
+   - Useful for fast testing without directional bias
 
 3. **Spread-Based**
    - Opens when spread is tight (half of max)
@@ -60,10 +59,13 @@ Ultra-fast tick-based trading EA designed for instant entries/exits with basket 
 - `TradingMode`: 0 = Basket TP (recommended), 1 = Per-Trade TP
 
 ### Tick Entry Logic
-- `EntryMethod`: 0 = Micro movement, 1 = Random hedge, 2 = Spread-based
-- `MicroMovementPips`: Minimum price movement to trigger entry (default: 0.5 pips)
+- `EntryMethod`: 0 = Micro movement, 1 = Random, 2 = Spread-based
+- `PreferredDirection`: 0 = Auto, 1 = Buy only, -1 = Sell only (default: 1)
+- `MicroMovementPoints`: Minimum price movement to trigger entry (default: 1 point)
 - `MaxConcurrentTrades`: Maximum trades per symbol (default: 10)
-- `OpenBothDirections`: Open BUY+SELL simultaneously (hedge mode)
+- `AllowOppositeDirection`: Allow switching direction while a basket is open (default: false)
+- `MaxStagnantTicks`: Force entry after this many ticks without movement (default: 5)
+- `EnableDebugLogs`: Print spread and entry diagnostics to the Journal (default: true)
 
 ### Position Sizing
 - `LotSizingMode`: 0=Fixed, 1=Risk%, 2=Martingale, 3=GridStep (default), 4=EquityScale
@@ -77,14 +79,14 @@ Ultra-fast tick-based trading EA designed for instant entries/exits with basket 
 
 ### Risk Management
 - `MaxDrawdownPercent`: Maximum equity drawdown % (default: 30%)
-- `MaxSpreadPips`: Max spread filter (default: 10.0 - relaxed for speed)
+- `MaxSpreadPoints`: Max spread filter in points (default: 45.0 for gold-style pricing)
 
 ## Usage
 
 1. **Attach to M1 chart** (or any timeframe - it's tick-based)
 2. **Set Entry Method**:
-   - Method 0: Adjust `MicroMovementPips` (0.1-1.0 for very fast, 1.0-5.0 for slower)
-   - Method 1: Enable `OpenBothDirections` for hedge mode
+   - Method 0: Adjust `MicroMovementPoints` (smaller = more trades)
+   - Method 1: Pure random direction (still respects preferred direction)
    - Method 2: Uses spread conditions
 3. **Set Basket Target**: `BasketProfitFixed` = $1-$5 for fast cycles
 4. **Set Lot Sizing**: `LotSizingMode = 3` (GridStep) recommended
@@ -117,15 +119,17 @@ Ultra-fast tick-based trading EA designed for instant entries/exits with basket 
 
 For "machine-gun" behavior:
 - `EntryMethod = 0` (Micro movement)
-- `MicroMovementPips = 0.5`
+- `MicroMovementPoints = 1.0`
+- `PreferredDirection = 1` for BUY cycles or `-1` for SELL cycles (keeps direction consistent)
 - `BasketProfitFixed = 1.0` ($1 target)
 - `LotSizingMode = 3` (GridStep)
 - `GridLotStep = 0.01`
 - `MaxConcurrentTrades = 10`
 - `UseBasketTimeLimit = false`
-- `MaxSpreadPips = 10.0`
+- `MaxSpreadPoints = 45.0`
+- `MaxStagnantTicks = 5`
 
 ## Version
 
-v2.00 - Initial tick-based release
+v2.10 - Direction-locked tick-based release with point-based controls
 

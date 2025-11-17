@@ -5,19 +5,18 @@
 #property version   "3.00"
 #property strict
 
-#define FIXED_STOP_LOSS_PIPS 30.0
-
 input group "===== Dynamic Lot Sizing ====="
 input double   AccountBalance_10K  = 1000000.0;
 input double   AccountBalance_100  = 100000.0;
 input double   AccountBalance_1500 = 500000.0;
 input double   MinLotSize          = 0.01;
-input double   MaxLotSize          = 0.08;
+input double   MaxLotSize          = 0.10;
+input double   LotVariationPercent = 15.0;    // +/- variation applied to each trade lot
 
 input group "===== Core Trading Settings ====="
 input int      MagicNumber         = 202503;
-input int      MaxTrades           = 3;
-input int      TradesPerBurst      = 3;
+input int      MaxTrades           = 2;
+input int      TradesPerBurst      = 5;
 input int      BurstDelayMS        = 100;
 
 input group "===== Adaptive Profit Engine ====="
@@ -33,8 +32,9 @@ input double   CustomEquityPercent  = 2.0;      // Used when custom target enabl
 input bool     UseRiskRewardTarget  = false;    // Combine RR target with equity percent
 input double   RiskRewardMultiplier = 3.0;      // Multiple of risk to target (if enabled)
 input double   PeakGivebackPercent = 30.0;    // Allowable giveback from profit peak
-input int      MinimumHoldMS       = 250;     // Prevent premature exits
-input double   MaxSpreadPips       = 6.0;
+input int      MinimumHoldMS       = 120;     // Prevent premature exits
+input double   MaxSpreadPips       = 5.0;
+input double   DrawdownStopPercent = 30.0;
 
 input group "===== Trading Controls ====="
 input bool     TradeEnabled        = true;
@@ -42,6 +42,10 @@ input int      TickDelay           = 1;
 input int      MaxConsecutiveLosses= 5;
 input bool     UseGoldOnly         = true;
 input int      MaxDailyTrades      = 100000;
+
+input group "===== Risk Parameters ====="
+input double   StopLossBasePips    = 50.0;    // Central stop loss distance
+input double   StopLossVariancePips= 10.0;    // +/- variation applied per trade
 
 input group "===== Strategy Settings ====="
 input int      TrendPeriod         = 10;
@@ -57,10 +61,10 @@ input double   TrailingStartPips   = 120.0;
 input double   TrailingStepPips    = 60.0;
 input double   PerTradeProfitLock  = 5000.0;   // Close individual positions once profit exceeds this amount
 
-input group "===== Instant Profit Exit ====="
-input bool     UseInstantProfitExit = true;
-input double   InstantProfitPips    = 5.0;
-
+input group "===== Rapid Profit Capture ====="
+input double   RapidTargetPerMicroLot = 6.0;
+input int      QuickCloseWindowMS     = 1500;
+input int      RapidTimeoutMS         = 4000;
 input group "===== Lot Growth Settings ====="
 input double   ProfitStepForLotIncrease= 20.0;     // Increase lot size every X profit
 input double   LotIncrementPerStep     = 0.01;     // Additional lot size per profit step
@@ -74,6 +78,7 @@ struct QuickTrade {
    bool     trailingArmed;
    double   highWatermark;
    double   lowWatermark;
+   double   stopLossPips;
 };
 
 QuickTrade activeTrades[20];
@@ -98,6 +103,8 @@ int consecutiveTradeCount = 0;
 double lastPrice = 0;
 int priceChangeCount = 0;
 double tickSum = 0;
+int lotVariationSeeded = 0;
+double startingEquity = 0;
 
 int OnInit()
 {
@@ -128,9 +135,18 @@ int OnInit()
       activeTrades[i].trailingArmed = false;
       activeTrades[i].highWatermark = 0;
       activeTrades[i].lowWatermark = 0;
+      activeTrades[i].stopLossPips = 0;
    }
 
    double minStopLevel = MarketInfo(Symbol(), MODE_STOPLEVEL);
+
+   if(lotVariationSeeded == 0)
+   {
+      MathSrand((int)GetTickCount());
+      lotVariationSeeded = 1;
+   }
+
+   startingEquity = AccountEquity();
 
    Print("Initialization successful!");
    Print("========================================");
@@ -240,7 +256,6 @@ void TrackTickMovement()
 
 void LookForScalpingOpportunity()
 {
-
    if(dailyTradeCount >= MaxDailyTrades)
    {
       Comment("Daily trade limit reached: ", dailyTradeCount, "/", MaxDailyTrades);
@@ -251,10 +266,8 @@ void LookForScalpingOpportunity()
 
    if(signal == OP_BUY || signal == OP_SELL)
    {
-
       for(int burst = 0; burst < TradesPerBurst; burst++)
       {
-
          if(totalActiveTrades >= MaxTrades || dailyTradeCount >= MaxDailyTrades)
             break;
 
@@ -335,12 +348,23 @@ int GetScalpingSignal()
       sellSignal = (sellScore >= 1);
    }
 
-   if(consecutiveLosses >= MaxConsecutiveLosses)
-   {
+   double currentDrawdown = GetDrawdownPercent();
 
-      if(buyScore >= 2) return OP_BUY;
-      if(sellScore >= 2) return OP_SELL;
+   if(DrawdownStopPercent > 0.0 && currentDrawdown >= DrawdownStopPercent)
       return -1;
+
+   if(MaxConsecutiveLosses > 0 && consecutiveLosses >= MaxConsecutiveLosses)
+   {
+      if(DrawdownStopPercent > 0.0 && currentDrawdown < DrawdownStopPercent)
+      {
+         // ignore consecutive loss lock until drawdown threshold reached
+      }
+      else
+      {
+         if(buyScore >= 2) return OP_BUY;
+         if(sellScore >= 2) return OP_SELL;
+         return -1;
+      }
    }
 
    if(buySignal && sellSignal)
@@ -369,7 +393,8 @@ void OpenScalpTrade(int orderType)
 {
    double price = (orderType == OP_BUY) ? Ask : Bid;
 
-   double lotSize = CalculateDynamicLotSize();
+   double baseLot = CalculateDynamicLotSize();
+   double lotSize = ApplyLotVariation(baseLot);
    double sl = 0;
    double tp = 0;
    double pipToPoint = Point * 10.0;
@@ -380,7 +405,7 @@ void OpenScalpTrade(int orderType)
       return;
    }
 
-   double stopLossPips = FIXED_STOP_LOSS_PIPS;
+   double stopLossPips = GetStopLossPipsForTrade();
    if(stopLossPips > 0.0 && pipToPoint > 0.0)
    {
       double slDistance = stopLossPips * pipToPoint;
@@ -431,6 +456,7 @@ void OpenScalpTrade(int orderType)
          activeTrades[totalActiveTrades].trailingArmed = false;
          activeTrades[totalActiveTrades].highWatermark = price;
          activeTrades[totalActiveTrades].lowWatermark = price;
+         activeTrades[totalActiveTrades].stopLossPips = stopLossPips;
          totalActiveTrades++;
       }
 
@@ -468,6 +494,57 @@ double GetEquityTargetPercent()
    return percent;
 }
 
+double GetStopLossPipsForTrade()
+{
+   double sl = StopLossBasePips;
+   if(sl <= 0.0)
+      sl = 50.0;
+
+   if(StopLossVariancePips > 0.0)
+   {
+      double randUnit = (double)MathRand() / 32767.0; // 0..1
+      double offset = (randUnit * 2.0 - 1.0) * StopLossVariancePips;
+      sl += offset;
+   }
+
+   if(sl < 1.0)
+      sl = 1.0;
+
+   return sl;
+}
+
+double ApplyLotVariation(double baseLot)
+{
+   if(baseLot <= 0.0)
+      return(baseLot);
+
+   if(LotVariationPercent <= 0.0)
+      return NormalizeDouble(MathMax(MathMin(baseLot, MaxLotSize), MinLotSize), 2);
+
+   double variance = LotVariationPercent / 100.0;
+   double randUnit = (double)MathRand() / 32767.0; // 0..1
+   double factor = 1.0 + variance * ((randUnit * 2.0) - 1.0);
+   double variedLot = baseLot * factor;
+
+   variedLot = MathMax(variedLot, MinLotSize);
+   variedLot = MathMin(variedLot, MaxLotSize);
+
+   return NormalizeDouble(variedLot, 2);
+}
+
+double GetDrawdownPercent()
+{
+   if(startingEquity <= 0.0)
+      return 0.0;
+
+   double equity = AccountEquity();
+   double drawdown = (startingEquity - equity) / startingEquity * 100.0;
+   if(drawdown < 0.0)
+      drawdown = 0.0;
+
+   return drawdown;
+}
+
 void UpdatePerTradeTrailing(int index, double pipToPoint)
 {
    if(!UseTrailingStop || TrailingStartPips <= 0.0 || TrailingStepPips <= 0.0)
@@ -481,9 +558,6 @@ void UpdatePerTradeTrailing(int index, double pipToPoint)
       return;
 
    if(!OrderSelect(ticket, SELECT_BY_TICKET))
-      return;
-
-   if(OrderCloseTime() > 0)
       return;
 
    int type = OrderType();
@@ -534,9 +608,6 @@ bool ModifyOrderStop(int ticket, double newStop)
    if(!OrderSelect(ticket, SELECT_BY_TICKET))
       return(false);
 
-   if(OrderCloseTime() > 0)
-      return(false);
-
    double price = OrderOpenPrice();
    double tp = OrderTakeProfit();
 
@@ -577,49 +648,63 @@ void ManageActiveTrades()
       if(!OrderSelect(activeTrades[i].ticket, SELECT_BY_TICKET))
          continue;
 
-      int orderType = OrderType();
-      double entry = OrderOpenPrice();
-      double currentPrice = (orderType == OP_BUY) ? Bid : Ask;
-      double pipGain = 0.0;
-      if(pipToPoint > 0.0)
-      {
-         if(orderType == OP_BUY)
-            pipGain = (currentPrice - entry) / pipToPoint;
-         else if(orderType == OP_SELL)
-            pipGain = (entry - currentPrice) / pipToPoint;
-      }
-
       double tradeProfit = OrderProfit() + OrderSwap() + OrderCommission();
+      double lotSize = OrderLots();
+      double targetProfit = 0.0;
+      if(RapidTargetPerMicroLot > 0.0 && lotSize > 0.0)
+         targetProfit = RapidTargetPerMicroLot * (lotSize / 0.01);
 
-       if(UseInstantProfitExit && InstantProfitPips > 0.0 && tradeProfit > 0.0 && pipGain >= InstantProfitPips)
-       {
-         CloseTradeAtIndex(i, "Instant profit exit +" + DoubleToString(tradeProfit, 2));
-         i--;
-         continue;
-       }
+      ulong openTick = activeTrades[i].openTickTime;
+      ulong heldMs = (openTick > 0 && nowTick >= openTick) ? (nowTick - openTick) : 0;
 
-       if(PerTradeProfitLock > 0.0 && tradeProfit >= PerTradeProfitLock)
-       {
+      if(PerTradeProfitLock > 0.0 && tradeProfit >= PerTradeProfitLock)
+      {
          CloseTradeAtIndex(i, "Per-trade profit lock +" + DoubleToString(tradeProfit, 2));
          i--;
          continue;
-       }
+      }
+
+      if(targetProfit > 0.0 && tradeProfit >= targetProfit)
+      {
+         bool withinWindow = (QuickCloseWindowMS == 0 && heldMs >= (ulong)MinimumHoldMS) ||
+                             (QuickCloseWindowMS > 0 && heldMs >= (ulong)MinimumHoldMS && heldMs <= (ulong)QuickCloseWindowMS);
+         bool overflowWindow = (QuickCloseWindowMS > 0 && heldMs > (ulong)QuickCloseWindowMS);
+         if(withinWindow || overflowWindow)
+         {
+            CloseTradeAtIndex(i, "Rapid target +" + DoubleToString(tradeProfit, 2));
+            i--;
+            continue;
+         }
+      }
+
+      if(RapidTimeoutMS > 0 && heldMs >= (ulong)RapidTimeoutMS && tradeProfit > 0.0)
+      {
+         CloseTradeAtIndex(i, "Rapid timeout +" + DoubleToString(tradeProfit, 2));
+         i--;
+         continue;
+      }
 
       totalProfit += tradeProfit;
 
-      double lotSize = OrderLots();
-      double riskPips = FIXED_STOP_LOSS_PIPS;
+      double riskPips = activeTrades[i].stopLossPips;
       double stop = OrderStopLoss();
+      double entry = OrderOpenPrice();
 
       if(stop > 0 && pipToPoint > 0)
-         riskPips = MathAbs(entry - stop) / pipToPoint;
+      {
+         double derived = MathAbs(entry - stop) / pipToPoint;
+         riskPips = derived;
+         activeTrades[i].stopLossPips = derived;
+      }
+      else if(riskPips <= 0.0)
+      {
+         riskPips = StopLossBasePips;
+      }
 
       totalRiskCurrency += riskPips * pipValuePerLot * lotSize;
 
       if(minHoldMs > 0)
       {
-         ulong openTick = activeTrades[i].openTickTime;
-         ulong heldMs = (openTick > 0 && nowTick >= openTick) ? (nowTick - openTick) : 0;
          if(heldMs < minHoldMs)
             holdSatisfied = false;
       }
@@ -643,10 +728,10 @@ void ManageActiveTrades()
                           : equityTarget;
    lastDynamicTarget = dynamicTarget;
 
+   bool profitReady = (totalProfit > 0.0) && holdSatisfied;
+
    if(dynamicTarget <= 0.0)
       dynamicTarget = equityTarget;
-
-   bool profitReady = (totalProfit > 0.0) && holdSatisfied;
 
    if(profitReady && dynamicTarget > 0.0 && totalProfit >= dynamicTarget)
    {
@@ -663,8 +748,8 @@ void ManageActiveTrades()
 
       if(profitReady && highestBasketProfit > 0.0 && giveback > 0.0 && totalProfit <= trailLevel)
       {
-        CloseAllTrades("Dynamic peak trail: KES " + DoubleToString(totalProfit, 2));
-        return;
+         CloseAllTrades("Dynamic peak trail: KES " + DoubleToString(totalProfit, 2));
+         return;
       }
    }
    else
@@ -729,6 +814,7 @@ void CloseTradeAtIndex(int index, string reason)
          activeTrades[lastIdx].trailingArmed = false;
          activeTrades[lastIdx].highWatermark = 0;
          activeTrades[lastIdx].lowWatermark = 0;
+         activeTrades[lastIdx].stopLossPips = 0;
       }
 
       totalActiveTrades--;
@@ -778,6 +864,8 @@ void CleanupClosedTrades()
             activeTrades[lastIdx].trailingArmed = false;
             activeTrades[lastIdx].highWatermark = 0;
             activeTrades[lastIdx].lowWatermark = 0;
+            activeTrades[lastIdx].stopLossPips = 0;
+            activeTrades[lastIdx].stopLossPips = 0;
 
             totalActiveTrades--;
          }
@@ -787,6 +875,14 @@ void CleanupClosedTrades()
 
 bool PreFlightChecks()
 {
+   double drawdown = GetDrawdownPercent();
+   if(DrawdownStopPercent > 0.0 && drawdown >= DrawdownStopPercent)
+   {
+      tradingAllowed = false;
+      Comment("Drawdown limit reached: ", DoubleToString(drawdown, 2), "% / ", DoubleToString(DrawdownStopPercent, 2), "%");
+      return false;
+   }
+
    if(!TradeEnabled)
    {
       tradingAllowed = false;
@@ -855,6 +951,7 @@ void CheckDailyReset()
       dailyProfit = 0;
       dailyTradeCount = 0;
       lastDayReset = currentDay;
+      startingEquity = AccountEquity();
       highestBasketProfit = 0;
       basketTrailingActive = false;
       lastDynamicTarget = 0;
