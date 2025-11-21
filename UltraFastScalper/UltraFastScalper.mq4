@@ -24,16 +24,18 @@ input group "===== Execution Settings ====="
 input bool     UseRiskPerTrade     = true;
 input double   RiskPercentPerTrade = 0.40;
 input double   FixedLotSize        = 0.01;
-input int      StopLossPips        = 6;
-input double   TakeProfitPips1     = 3.0;
-input double   TakeProfitPips2     = 5.0;
-input double   TakeProfitPips3     = 8.0;
+input bool     UseStopLoss         = false;
+input int      StopLossPips        = 15;
+input double   TakeProfitPips1     = 5.0;
+input double   TakeProfitPips2     = 8.0;
+input double   TakeProfitPips3     = 10.0;
 input bool     UseLimitEntries     = true;
+input bool     AutoFallbackToMarket= true;
 input double   LimitOffsetPips     = 1.5;
 input double   CommissionBufferPips= 0.3;
 input double   BasketProfitPercent = 1.5;
 input bool     CloseOnTP2Reach     = true;
-input double   MaxSpreadPips       = 5.0;
+input double   MaxSpreadPips       = 6.0;
 input int      TradeIntervalSec    = 5;
 input int      MagicNumber         = 888888;
 input group "===== Symbol Filter ====="
@@ -43,7 +45,7 @@ input string   AllowedSymbolsList   = "EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,AUDUSD
 input group "===== Safety Limits ====="
 input double   MaxDailyLossKES     = 5000.0;
 input double   DailyProfitTargetKES= 10000.0;
-input int      MaxTradesPerDay     = 100;
+input int      MaxTradesPerDay     = 5;
 input int      StartHour           = 0;
 input int      EndHour             = 23;
 
@@ -87,6 +89,8 @@ string allowedMinorPrefixes[] = {"EUR","GBP","AUD","NZD","CHF","CAD","USD","JPY"
 string exoticPrefixes[] = {"USDTRY","USDZAR","USDMXN","USDHUF","EURSEK","EURPLN","USDNOK","USDINR","USDHKD","EURTRY","GBPTRY","CHFTRY","JPYTRY"};
 string commodityBlocks[] = {"XAG","SILVER","UKOIL","USOIL","WTI","BRENT","COPPER","NGAS","XPT","XPD","WHEAT","CORN"};
 string indexPrefixes[] = {"NAS","US3","SPX","SP","DJ","GER","DE","JP","NK","FTSE","FRA","ITA","AUS","HK","HSI","UK","EU","CAC","DAX"};
+string usIndexPrefixes[] = {"US30","US500","US100","US2000","NAS","NDX","SPX","SP500","SP","DJ","DJI","US3","US5","US10"};
+string strictSymbolWhitelist[] = {"XAUUSD","US30","GBPUSD"};
 string cryptoPrefixes[] = {"BTC","ETH","XRP","SOL","ADA","DOT","DOGE","BNB","LTC","SHIB","BCH","XLM","TRX","AVAX","MATIC"};
 
 // ---------------------------------------------------------------------------
@@ -240,8 +244,13 @@ bool SymbolMatchesAllowed(const string sym)
    if(base == "")
       return false;
 
-   if(StartsWith(base, "XAU"))
-      return true;
+   if(!IsStrictWhitelisted(base))
+   {
+      Print("Trading disabled for this symbol.");
+      return false;
+   }
+
+   bool isGold = StartsWith(base, "XAU");
 
    for(int c = 0; c < ArraySize(commodityBlocks); c++)
       if(StartsWith(base, commodityBlocks[c]))
@@ -257,50 +266,122 @@ bool SymbolMatchesAllowed(const string sym)
          return false;
       }
 
-   bool isIndex = false;
-   for(int i = 0; i < ArraySize(indexPrefixes); i++)
-      if(StartsWith(base, indexPrefixes[i])) { isIndex = true; break; }
+   bool isUSIndex = false;
+   for(int u = 0; u < ArraySize(usIndexPrefixes); u++)
+      if(StartsWith(base, usIndexPrefixes[u])) { isUSIndex = true; break; }
+
+   bool matchesIndex = isUSIndex;
+   if(!matchesIndex)
+   {
+      for(int i = 0; i < ArraySize(indexPrefixes); i++)
+         if(StartsWith(base, indexPrefixes[i])) { matchesIndex = true; break; }
+   }
 
    bool isCrypto = false;
    for(int k = 0; k < ArraySize(cryptoPrefixes); k++)
       if(StartsWith(base, cryptoPrefixes[k])) { isCrypto = true; break; }
 
-   if(isIndex || isCrypto)
-      return true;
+   if(isCrypto)
+   {
+      Print("Trading disabled for this symbol.");
+      return false;
+   }
+
+   if(matchesIndex && !isUSIndex)
+   {
+      Print("Trading disabled for this symbol.");
+      return false;
+   }
+
+   bool fxCandidate = IsFxMajorOrMinor(base);
+   if(!isGold && !isUSIndex && !fxCandidate)
+   {
+      Print("Trading disabled for this symbol.");
+      return false;
+   }
 
    if(RestrictToFXMajors)
    {
-      bool fxOk = false;
-      if(InStringArray(base, allowedMajorBases))
-         fxOk = true;
-      else if(StringLen(base) >= 6)
-      {
-         string pref = StringSubstr(base, 0, 3);
-         string suff = StringSubstr(base, 3, 3);
-         if(InStringArray(pref, allowedMinorPrefixes) && InStringArray(suff, allowedMinorPrefixes))
-            fxOk = true;
-      }
-      if(!fxOk)
+      if(!fxCandidate && !isGold && !isUSIndex)
       {
          Print("Trading disabled for this symbol.");
          return false;
       }
    }
 
-   if(UseMajorSymbolFilter && majorTokenCount > 0)
+   if(UseMajorSymbolFilter && majorTokenCount > 0 && fxCandidate)
    {
+      bool match = false;
       for(int j = 0; j < majorTokenCount; j++)
       {
          string token = majorTokens[j];
          if(token == "") continue;
          if(StartsWith(base, token))
-            return true;
+         {
+            match = true;
+            break;
+         }
       }
-      Print("Trading disabled for this symbol.");
-      return false;
+      if(!match)
+      {
+         Print("Trading disabled for this symbol.");
+         return false;
+      }
    }
 
    return true;
+}
+
+bool IsFxMajorOrMinor(const string base)
+{
+   if(StringLen(base) < 6)
+      return false;
+
+   if(InStringArray(base, allowedMajorBases))
+      return true;
+
+   string pref = StringSubstr(base, 0, 3);
+   string suff = StringSubstr(base, 3, 3);
+   if(InStringArray(pref, allowedMinorPrefixes) && InStringArray(suff, allowedMinorPrefixes))
+      return true;
+
+   return false;
+}
+
+bool CanTradeSymbol(const string sym)
+{
+   if(!IsTradeAllowed(sym, TimeCurrent()))
+      return false;
+
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+      return false;
+
+   double tradeAllowed = MarketInfo(sym, MODE_TRADEALLOWED);
+   if(tradeAllowed == 0.0)
+      return false;
+
+   return true;
+}
+
+bool ShouldFallbackToMarket(const int errorCode)
+{
+   if(errorCode == ERR_TRADE_DISABLED || errorCode == ERR_TRADE_NOT_ALLOWED)
+      return true;
+
+   return false;
+}
+
+bool IsStrictWhitelisted(const string base)
+{
+   string upper = ToUpper(base);
+   for(int i = 0; i < ArraySize(strictSymbolWhitelist); i++)
+   {
+      string token = strictSymbolWhitelist[i];
+      if(token == "") continue;
+      if(upper == token)
+         return true;
+   }
+   return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -321,13 +402,17 @@ int     GetSymbolSignal(const string sym);
 bool    SpreadAcceptable(const string sym);
 void    ManageActiveTrade();
 void    SyncActiveTrade();
-void    CloseActiveTrade(const string reason);
+bool    CloseActiveTrade(const string reason);
 void    CloseAllTrades();
 void    CheckDailyReset();
 void    CheckDailyLimits();
 void    HandleClosedTrade(int ticket, double pl);
 void    UpdateDisplay();
 string  GetStatus();
+bool    IsFxMajorOrMinor(const string base);
+bool    CanTradeSymbol(const string sym);
+bool    ShouldFallbackToMarket(const int errorCode);
+bool    IsStrictWhitelisted(const string base);
 
 // ---------------------------------------------------------------------------
 int OnInit()
@@ -512,11 +597,17 @@ bool PlaceOrder(const string sym, int direction)
    if(currentHour < StartHour || currentHour >= EndHour)
       return false;
 
+   if(!CanTradeSymbol(sym))
+   {
+      Print("UltraFastScalper: Trading disabled by broker for ", sym, ". Skipping order attempt.");
+      return false;
+   }
+
    double lotSize = FixedLotSize;
-   if(UseRiskPerTrade)
+   if(UseRiskPerTrade && UseStopLoss && StopLossPips > 0)
    {
       double pipValue = CalculatePipValue(sym);
-      if(pipValue > 0 && StopLossPips > 0)
+      if(pipValue > 0)
       {
          double riskCurrency = AccountEquity() * (RiskPercentPerTrade / 100.0);
          double calcLot = riskCurrency / (StopLossPips * pipValue);
@@ -540,20 +631,22 @@ bool PlaceOrder(const string sym, int direction)
 
    double entryPrice = marketPrice;
    int sendType = direction;
+   bool pendingAttempt = false;
 
    if(UseLimitEntries)
    {
       double offset = MathMax(LimitOffsetPips, 0.1) * pipPoint;
-   if(direction == OP_BUY)
-   {
+      if(direction == OP_BUY)
+      {
          sendType = OP_BUYLIMIT;
          entryPrice = marketPrice - offset;
-   }
-   else
-   {
+      }
+      else
+      {
          sendType = OP_SELLLIMIT;
          entryPrice = marketPrice + offset;
       }
+      pendingAttempt = true;
    }
 
    entryPrice = NormalizeDouble(entryPrice, digits);
@@ -564,34 +657,67 @@ bool PlaceOrder(const string sym, int direction)
    double buffer = MathMax(CommissionBufferPips, 0.0);
    double targetPips = tp3 + buffer;
 
-   double sl = (direction == OP_BUY) ? entryPrice - StopLossPips * pipPoint
-                                     : entryPrice + StopLossPips * pipPoint;
+   double sl = 0.0;
+   if(UseStopLoss && StopLossPips > 0)
+   {
+      sl = (direction == OP_BUY) ? entryPrice - StopLossPips * pipPoint
+                                 : entryPrice + StopLossPips * pipPoint;
+      sl = NormalizeDouble(sl, digits);
+   }
    double tp = (direction == OP_BUY) ? entryPrice + targetPips * pipPoint
                                      : entryPrice - targetPips * pipPoint;
 
-   sl = NormalizeDouble(sl, digits);
    tp = NormalizeDouble(tp, digits);
 
    color arrowColor = (direction == OP_BUY) ? clrLime : clrTomato;
-   int ticket = OrderSend(sym, sendType, lotSize, entryPrice, 0, sl, tp,
-                          "UltraFast", MagicNumber, 0, arrowColor);
-
-   if(ticket <= 0)
+   for(int attempt = 0; attempt < 2; attempt++)
    {
-      Print("UltraFastScalper: OrderSend failed ", GetLastError());
-      return false;
+      int ticket = OrderSend(sym, sendType, lotSize, entryPrice, 0, sl, tp,
+                             "UltraFast", MagicNumber, 0, arrowColor);
+
+      if(ticket > 0)
+      {
+         currentTrade.ticket = ticket;
+         currentTrade.symbol = sym;
+         currentTrade.direction = direction;
+         currentTrade.lots = lotSize;
+         currentTrade.openTime = TimeCurrent();
+         currentTrade.entryPrice = entryPrice;
+         currentTrade.isPending = (sendType == OP_BUYLIMIT || sendType == OP_SELLLIMIT);
+         tradeActive = true;
+         return true;
+      }
+
+      int err = GetLastError();
+      Print("UltraFastScalper: OrderSend failed ", err, " on ", sym, " (attempt ", attempt + 1, ")");
+
+      bool allowRetry = (attempt == 0 && pendingAttempt && AutoFallbackToMarket && ShouldFallbackToMarket(err));
+      if(!allowRetry)
+         return false;
+
+      Print("UltraFastScalper: Retrying ", sym, " as market order because pending order was rejected (error ", err, ")");
+
+      pendingAttempt = false;
+      sendType = direction;
+      RefreshRates();
+      marketPrice = (direction == OP_BUY) ? MarketInfo(sym, MODE_ASK) : MarketInfo(sym, MODE_BID);
+      entryPrice = NormalizeDouble(marketPrice, digits);
+      if(UseStopLoss && StopLossPips > 0)
+      {
+         sl = (direction == OP_BUY) ? entryPrice - StopLossPips * pipPoint
+                                    : entryPrice + StopLossPips * pipPoint;
+         sl = NormalizeDouble(sl, digits);
+      }
+      else
+      {
+         sl = 0.0;
+      }
+      tp = (direction == OP_BUY) ? entryPrice + targetPips * pipPoint
+                                 : entryPrice - targetPips * pipPoint;
+      tp = NormalizeDouble(tp, digits);
    }
 
-   currentTrade.ticket = ticket;
-   currentTrade.symbol = sym;
-   currentTrade.direction = direction;
-   currentTrade.lots = lotSize;
-   currentTrade.openTime = TimeCurrent();
-   currentTrade.entryPrice = entryPrice;
-   currentTrade.isPending = (sendType == OP_BUYLIMIT || sendType == OP_SELLLIMIT);
-   tradeActive = true;
-
-   return true;
+   return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -752,33 +878,55 @@ void SyncActiveTrade()
 }
 
 // ---------------------------------------------------------------------------
-void CloseActiveTrade(const string reason)
+bool CloseActiveTrade(const string reason)
 {
    if(!tradeActive || currentTrade.ticket <= 0)
-      return;
+      return false;
 
    if(OrderSelect(currentTrade.ticket, SELECT_BY_TICKET))
    {
+      double floatingPL = OrderProfit() + OrderSwap() + OrderCommission();
+      if(floatingPL <= 0)
+      {
+         Print("UltraFastScalper: Skipping close (", reason, ") because trade not yet profitable (P&L: ",
+               DoubleToString(floatingPL, 2), ")");
+         return false;
+      }
+
       double price = (currentTrade.direction == OP_BUY)
                      ? MarketInfo(currentTrade.symbol, MODE_BID)
                      : MarketInfo(currentTrade.symbol, MODE_ASK);
 
-      if(price > 0)
+      if(price <= 0)
+         return false;
+
+      if(OrderClose(currentTrade.ticket, OrderLots(), price, 3, clrAqua))
       {
-         if(OrderClose(currentTrade.ticket, OrderLots(), price, 3, clrAqua))
-            Print("UltraFastScalper: Trade closed (", reason, ")");
+         Print("UltraFastScalper: Trade closed (", reason, ") | P&L: ",
+               DoubleToString(floatingPL, 2));
+         return true;
       }
+      return false;
    }
+
+   if(OrderSelect(currentTrade.ticket, SELECT_BY_TICKET, MODE_HISTORY))
+      return true;
+
+   return false;
 }
 
 // ---------------------------------------------------------------------------
 void CloseAllTrades()
 {
-   if(tradeActive)
-      CloseActiveTrade("CloseAll");
+   if(!tradeActive)
+      return;
 
-   tradeActive = false;
-   currentTrade.ticket = -1;
+   bool closed = CloseActiveTrade("CloseAll");
+   if(closed)
+   {
+      tradeActive = false;
+      currentTrade.ticket = -1;
+   }
 }
 
 // ---------------------------------------------------------------------------
