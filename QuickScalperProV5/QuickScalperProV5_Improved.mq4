@@ -120,6 +120,7 @@ input int      PendingOrderLifetimeMinutes= 1;   // REDUCED: Close pending order
 input int      ActiveReplenishThreshold   = 3;
 input bool     ForceTPOnPendingOrders     = true;  // Force TP on pending orders (scalping style)
 input double   PendingOrderTPPips         = 5.0;   // TP for pending orders when they execute
+input int      MaxPendingOrdersPerCycle   = 4;     // Maximum pending orders per cycle (density control)
 
 input group "===== Market Execution ====="
 input bool     UseMarketBursts            = true;  // Use market orders (BUY/SELL) in addition to pending
@@ -211,6 +212,11 @@ double effectiveMaxSpreadPips = 12.0;
 double effectiveLimitOffsetPips = 1.2;
 double effectiveStopOffsetPips = 0.0;
 
+// Pending Order Safety Control variables
+bool pendingGridLocked = false;
+datetime lastTrendFlipTime = 0;
+int lastTrendDirection = 0; // 1 = up, -1 = down, 0 = unknown
+
 int OnInit()
 {
    Print("========================================");
@@ -262,6 +268,11 @@ int OnInit()
    effectiveMaxSpreadPips = MaxSpreadPips;
    effectiveLimitOffsetPips = LimitOffsetPips;
    effectiveStopOffsetPips = StopOffsetPips;
+   
+   // Initialize pending order safety controls
+   pendingGridLocked = false;
+   lastTrendFlipTime = 0;
+   lastTrendDirection = 0;
 
    exposureScale = 1.0;
    effectiveMaxTrades = MaxTrades;
@@ -1810,6 +1821,71 @@ int CountPendingByType(int type)
    return count;
 }
 
+int CountPendingOrders()
+{
+   return totalPendingOrders;
+}
+
+void CheckAndCancelOrdersOnTrendFlip()
+{
+   double emaFast = iMA(Symbol(), PERIOD_M1, 5, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double emaSlow = iMA(Symbol(), PERIOD_M1, 20, 0, MODE_EMA, PRICE_CLOSE, 0);
+   
+   int currentTrend = 0;
+   if(emaFast > emaSlow)
+      currentTrend = 1; // uptrend
+   else if(emaFast < emaSlow)
+      currentTrend = -1; // downtrend
+   
+   // Detect trend flip
+   if(lastTrendDirection != 0 && currentTrend != 0 && currentTrend != lastTrendDirection)
+   {
+      Print("TREND FLIP DETECTED: Cancelling pending orders on old side");
+      lastTrendFlipTime = TimeCurrent();
+      
+      // Unlock grid on trend reversal (safety feature)
+      if(pendingGridLocked)
+      {
+         pendingGridLocked = false;
+         Print("Grid lock released due to trend reversal");
+      }
+      
+      // Cancel orders on the old side
+      for(int i = totalPendingOrders - 1; i >= 0; i--)
+      {
+         int ticket = pendingOrders[i].ticket;
+         if(ticket <= 0) continue;
+         
+         if(!OrderSelect(ticket, SELECT_BY_TICKET)) continue;
+         
+         int type = OrderType();
+         
+         // If trend flipped to uptrend, cancel all sell orders
+         if(currentTrend == 1)
+         {
+            if(type == OP_SELLLIMIT || type == OP_SELLSTOP)
+            {
+               if(OrderDelete(ticket))
+                  Print("Cancelled ", (type == OP_SELLLIMIT ? "SELL LIMIT" : "SELL STOP"), " on trend flip to UP");
+               RemovePendingOrderAt(i);
+            }
+         }
+         // If trend flipped to downtrend, cancel all buy orders
+         else if(currentTrend == -1)
+         {
+            if(type == OP_BUYLIMIT || type == OP_BUYSTOP)
+            {
+               if(OrderDelete(ticket))
+                  Print("Cancelled ", (type == OP_BUYLIMIT ? "BUY LIMIT" : "BUY STOP"), " on trend flip to DOWN");
+               RemovePendingOrderAt(i);
+            }
+         }
+      }
+   }
+   
+   lastTrendDirection = currentTrend;
+}
+
 bool SubmitPendingOrder(int pendingType, double price)
 {
    bool isLong = (pendingType == OP_BUYLIMIT || pendingType == OP_BUYSTOP);
@@ -1972,16 +2048,77 @@ void RefreshPendingOrders()
 
 void GeneratePendingOrderGrid()
 {
+   // ==== SAFETY CHECK 1: Grid Lock Mode After Losing Basket ====
+   if(consecutiveLosses >= 1)
+   {
+      pendingGridLocked = true;
+      // Unlock after 30 minutes or if trend reverses
+      datetime now = TimeCurrent();
+      if(lastTrendFlipTime > 0 && (now - lastTrendFlipTime) >= 1800) // 30 minutes
+      {
+         pendingGridLocked = false;
+         Print("Grid lock released after 30 minutes");
+      }
+   }
+   else
+   {
+      pendingGridLocked = false;
+   }
+   
+   if(pendingGridLocked)
+   {
+      Print("PENDING GRID LOCKED: Skipping grid generation after losing basket");
+      return;
+   }
+   
+   // ==== SAFETY CHECK 2: Session Filter (ONLY for pending orders) ====
+   int hr = TimeHour(TimeCurrent());
+   bool pendingSession = (hr >= 10 && hr <= 18); // safer window
+   
+   if(!pendingSession)
+   {
+      // Allow market trades, but block pending grids outside session
+      return;
+   }
+   
+   // ==== SAFETY CHECK 3: Volatility Filter (ATR-Based) ====
+   double atr = iATR(Symbol(), PERIOD_M1, 14, 0);
+   bool highVol = atr > (Point * 300);   // extremely volatile
+   bool lowVol  = atr < (Point * 60);    // dead market
+   
+   // Do NOT place pending orders in extreme volatility or dead markets
+   if(highVol || lowVol)
+   {
+      Print("PENDING ORDERS BLOCKED: HighVol=", highVol, " LowVol=", lowVol, " ATR=", DoubleToString(atr/Point, 1));
+      return;
+   }
+   
+   // ==== SAFETY CHECK 4: Pending Order Density Control ====
+   int activePendings = CountPendingOrders();
+   if(activePendings >= MaxPendingOrdersPerCycle)
+   {
+      return; // Already at max density
+   }
+   
    RefreshRates();
    double emaTrend = iMA(Symbol(), PERIOD_M1, TrendPeriod, 0, MODE_EMA, PRICE_CLOSE, 0);
    double pipToPoint = Point * 10.0;
    if(pipToPoint <= 0.0)
       pipToPoint = Point;
 
-   double limitSpacing = MathMax(LimitGridSpacingPips, 0.1) * pipToPoint;
+   // ==== SAFETY CHECK 5: Dynamic Spacing Based on Volatility ====
+   double dynamicSpacing = LimitGridSpacingPips;
+   if(atr > (Point * 180)) dynamicSpacing *= 2.0;     // high volatility → farther spacing
+   if(atr < (Point * 80))  dynamicSpacing *= 0.7;     // calm market → tighter spacing
+   
+   double limitSpacing = MathMax(dynamicSpacing, 0.1) * pipToPoint;
    double limitOffset = MathMax(effectiveLimitOffsetPips, 0.0) * pipToPoint;
    double stopSpacing = MathMax(StopGridSpacingPips, 0.1) * pipToPoint;
    double stopOffset = MathMax(effectiveStopOffsetPips, 0.0) * pipToPoint;
+   
+   // ==== SAFETY CHECK 6: Max Distance Cutoff ====
+   double maxDepth = 300 * Point * 10;  // around 300 pips depth limit
+   double basePrice = (Ask + Bid) / 2.0;
 
    int limitBudget = MathMax((int)MathRound(effectivePendingLimitsSide * 2), 2);
    int stopBudget = MathMax((int)MathRound(effectivePendingStopsSide * 2), 0);
@@ -2005,6 +2142,10 @@ void GeneratePendingOrderGrid()
    double currentAsk = Ask;
    double currentBid = Bid;
 
+   // ==== SAFETY CHECK 7: Micro Confirmation ====
+   double m1close = iClose(Symbol(), PERIOD_M1, 0);
+   double m1prev  = iClose(Symbol(), PERIOD_M1, 1);
+   
    // Buy limits below bid
    double baseBuyLimit = emaTrend - limitOffset;
    for(int i = currentBuyLimits; i < targetBuyLimits && totalPendingOrders < MAX_PENDING_ORDERS; i++)
@@ -2015,6 +2156,15 @@ void GeneratePendingOrderGrid()
          price = maxBuyLimitPrice - (i + 1) * Point;
       if(price <= 0)
          break;
+      
+      // Max distance cutoff
+      if(MathAbs(price - basePrice) > maxDepth)
+         continue; // skip this grid level
+      
+      // Micro confirmation: Don't place BUYLIMIT during mini-crashes
+      if(m1close < m1prev)
+         continue; // skip if price is falling
+      
       SubmitPendingOrder(OP_BUYLIMIT, NormalizeDouble(price, Digits));
    }
 
@@ -2026,6 +2176,15 @@ void GeneratePendingOrderGrid()
       double minSellLimitPrice = currentAsk + Point;
       if(price <= minSellLimitPrice)
          price = minSellLimitPrice + (i + 1) * Point;
+      
+      // Max distance cutoff
+      if(MathAbs(price - basePrice) > maxDepth)
+         continue; // skip this grid level
+      
+      // Micro confirmation: Don't place SELLLIMIT during mini-pumps
+      if(m1close > m1prev)
+         continue; // skip if price is rising
+      
       SubmitPendingOrder(OP_SELLLIMIT, NormalizeDouble(price, Digits));
    }
 
@@ -2037,6 +2196,11 @@ void GeneratePendingOrderGrid()
       double minBuyStopPrice = currentAsk + Point;
       if(price <= minBuyStopPrice)
          price = minBuyStopPrice + (i + 1) * Point;
+      
+      // Max distance cutoff
+      if(MathAbs(price - basePrice) > maxDepth)
+         continue; // skip this grid level
+      
       SubmitPendingOrder(OP_BUYSTOP, NormalizeDouble(price, Digits));
    }
 
@@ -2050,6 +2214,11 @@ void GeneratePendingOrderGrid()
          price = maxSellStopPrice - (i + 1) * Point;
       if(price <= 0)
          break;
+      
+      // Max distance cutoff
+      if(MathAbs(price - basePrice) > maxDepth)
+         continue; // skip this grid level
+      
       SubmitPendingOrder(OP_SELLSTOP, NormalizeDouble(price, Digits));
    }
 }
@@ -2068,6 +2237,9 @@ void MaintainPendingOrders()
 
    UpdateExposureGovernor();
    RefreshPendingOrders();
+   
+   // ==== SAFETY CHECK 8: Check and Cancel Orders on Trend Flip ====
+   CheckAndCancelOrdersOnTrendFlip();
 
    datetime nowTime = TimeCurrent();
    // More frequent refresh for scalping - check every 30 seconds instead of 60
@@ -2195,6 +2367,9 @@ void CheckDailyReset()
       guardrailPnlPercent = 0.0;
       cycleStartTime = TimeCurrent(); // Reset timed trade control cycle on daily reset
       inPauseMode = false;
+      pendingGridLocked = false; // Reset grid lock on daily reset
+      lastTrendFlipTime = 0;
+      lastTrendDirection = 0;
       CancelAllPendingOrders();
    }
 }
