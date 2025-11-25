@@ -6,6 +6,7 @@
 
 #define MAX_ACTIVE_TRADES 50     // BROKER-SAFE: Reduced from 1000 to prevent hyper-activity
 #define MAX_PENDING_ORDERS 20    // BROKER-SAFE: Reduced from 400 to prevent order spamming
+#define MAX_BASKET_TRADES 3      // STRICT LIMIT: Maximum 3 trades per basket regardless of other settings
 
 input group "===== Dynamic Lot Sizing ====="
 input double   AccountBalance_10K  = 1000000.0;
@@ -507,6 +508,10 @@ void LookForScalpingOpportunity()
       return;
    }
 
+   // STRICT BASKET LIMIT: Maximum 3 trades per basket
+   if(totalActiveTrades >= MAX_BASKET_TRADES)
+      return;
+
    // BROKER-SAFE: Single execution per tick (no loops)
    if(totalActiveTrades >= effectiveMaxTrades || dailyTradeCount >= MaxDailyTrades)
       return;
@@ -681,6 +686,13 @@ void CompleteForcedBurst(bool executedTrades)
 
 int OpenScalpTrade(int orderType)
 {
+   // STRICT BASKET LIMIT: Maximum 3 trades per basket
+   if(totalActiveTrades >= MAX_BASKET_TRADES)
+   {
+      Print("Trade blocked - Basket limit reached: ", totalActiveTrades, "/", MAX_BASKET_TRADES, " trades");
+      return 0;
+   }
+   
    double price = (orderType == OP_BUY) ? Ask : Bid;
 
    double lotSize = CalculateDynamicLotSize();
@@ -777,7 +789,7 @@ int OpenScalpTrade(int orderType)
 
       Print("Basket trade #", dailyTradeCount, " opened: ", comment, " | Ticket: ", ticket,
             " | Price: ", DoubleToString(price, Digits), " | Lot: ", DoubleToString(lotSize, 2),
-            " | Basket: ", totalActiveTrades, "/", effectiveMaxTrades);
+            " | Basket: ", totalActiveTrades, "/", MAX_BASKET_TRADES);
       
       CompleteForcedBurst(true);
       return ticket;
@@ -1254,8 +1266,8 @@ void SyncActiveTradesWithBroker()
                break;
             }
          }
-         // Strict bounds checking to prevent array out of range error
-         if(!found && totalActiveTrades >= 0 && totalActiveTrades < MAX_ACTIVE_TRADES)
+         // STRICT BASKET LIMIT: Only add if we're below 3 trades
+         if(!found && totalActiveTrades < MAX_BASKET_TRADES && totalActiveTrades >= 0 && totalActiveTrades < MAX_ACTIVE_TRADES)
          {
             int arraySize = ArraySize(activeTrades);
             if(totalActiveTrades >= arraySize)
@@ -1278,11 +1290,27 @@ void SyncActiveTradesWithBroker()
             if(newCount <= MAX_ACTIVE_TRADES && newCount <= arraySize)
             {
                totalActiveTrades = newCount;
+               
+               // STRICT BASKET LIMIT: If we just hit 3 trades, cancel all remaining pending orders
+               if(totalActiveTrades >= MAX_BASKET_TRADES)
+               {
+                  Print("BASKET LIMIT REACHED (", totalActiveTrades, "/", MAX_BASKET_TRADES, "): Cancelling remaining pending orders");
+                  CancelAllPendingOrders();
+               }
             }
             else
             {
                Print("WARNING: Cannot increment totalActiveTrades - at maximum capacity (", MAX_ACTIVE_TRADES, ")");
                break; // Exit loop to prevent further additions
+            }
+         }
+         else if(!found && totalActiveTrades >= MAX_BASKET_TRADES)
+         {
+            // Pending order executed but we're at limit - cancel it
+            Print("Pending order executed but basket limit reached (", totalActiveTrades, "/", MAX_BASKET_TRADES, "): Closing excess trade");
+            if(OrderClose(OrderTicket(), OrderLots(), (type == OP_BUY ? Bid : Ask), 3, clrYellow))
+            {
+               Print("Excess trade closed: Ticket ", OrderTicket());
             }
          }
       }
@@ -1753,6 +1781,12 @@ int CountPendingByType(int type)
 
 bool SubmitPendingOrder(int pendingType, double price)
 {
+   // STRICT BASKET LIMIT: Don't place pending orders if we're already at 3 active trades
+   if(totalActiveTrades >= MAX_BASKET_TRADES)
+   {
+      return false; // Don't place more pending orders
+   }
+   
    bool isLong = (pendingType == OP_BUYLIMIT || pendingType == OP_BUYSTOP);
    bool isValidType = (pendingType == OP_BUYLIMIT || pendingType == OP_SELLLIMIT ||
                        pendingType == OP_BUYSTOP  || pendingType == OP_SELLSTOP);
@@ -1854,7 +1888,29 @@ bool SubmitPendingOrder(int pendingType, double price)
             resultingType == OP_BUYSTOP || resultingType == OP_SELLSTOP)
             AddPendingOrderEntry(ticket, resultingType, OrderOpenTime());
          else if(resultingType == OP_BUY || resultingType == OP_SELL)
-            SyncActiveTradesWithBroker();
+         {
+            // STRICT BASKET LIMIT: Check if we can add this immediately executed pending order
+            if(totalActiveTrades >= MAX_BASKET_TRADES)
+            {
+               // Close this excess trade that executed immediately
+               Print("Pending order executed immediately but basket limit reached (", totalActiveTrades, "/", MAX_BASKET_TRADES, "): Closing excess trade");
+               if(OrderClose(ticket, OrderLots(), (resultingType == OP_BUY ? Bid : Ask), 3, clrYellow))
+               {
+                  Print("Excess trade closed: Ticket ", ticket);
+               }
+            }
+            else
+            {
+               SyncActiveTradesWithBroker();
+               
+               // STRICT BASKET LIMIT: If we just hit 3 trades, cancel all pending orders
+               if(totalActiveTrades >= MAX_BASKET_TRADES)
+               {
+                  Print("BASKET LIMIT REACHED (", totalActiveTrades, "/", MAX_BASKET_TRADES, "): Cancelling all pending orders");
+                  CancelAllPendingOrders();
+               }
+            }
+         }
       }
 
       Print("Pending order placed: ", side, " ticket ", ticket,
@@ -1890,8 +1946,62 @@ void RefreshPendingOrders()
       int type = OrderType();
       if(type == OP_BUY || type == OP_SELL)
       {
-         SyncActiveTradesWithBroker();
+         // STRICT BASKET LIMIT: Check BEFORE adding to see if we can accept this executed pending order
+         int currentActiveCount = totalActiveTrades;
+         
+         // Check if this ticket is already in our active trades array
+         bool alreadyTracked = false;
+         for(int k = 0; k < totalActiveTrades; k++)
+         {
+            if(activeTrades[k].ticket == ticket)
+            {
+               alreadyTracked = true;
+               break;
+            }
+         }
+         
+         // If not tracked and we're at limit, close this excess trade
+         if(!alreadyTracked && currentActiveCount >= MAX_BASKET_TRADES)
+         {
+            Print("Pending order executed but basket limit reached (", currentActiveCount, "/", MAX_BASKET_TRADES, "): Closing excess trade");
+            if(OrderClose(ticket, OrderLots(), (type == OP_BUY ? Bid : Ask), 3, clrYellow))
+            {
+               Print("Excess trade closed: Ticket ", ticket);
+            }
+            RemovePendingOrderAt(i);
+            continue;
+         }
+         
+         // Add to active trades if not already tracked
+         if(!alreadyTracked)
+         {
+            SyncActiveTradesWithBroker();
+         }
+         
          RemovePendingOrderAt(i);
+         
+         // STRICT BASKET LIMIT: If we just hit 3 trades, cancel all remaining pending orders
+         if(totalActiveTrades >= MAX_BASKET_TRADES)
+         {
+            Print("BASKET LIMIT REACHED (", totalActiveTrades, "/", MAX_BASKET_TRADES, "): Cancelling remaining pending orders");
+            // Cancel all remaining pending orders
+            for(int j = totalPendingOrders - 1; j >= 0; j--)
+            {
+               int cancelTicket = pendingOrders[j].ticket;
+               if(cancelTicket > 0 && OrderSelect(cancelTicket, SELECT_BY_TICKET))
+               {
+                  int cancelType = OrderType();
+                  if(cancelType == OP_BUYLIMIT || cancelType == OP_SELLLIMIT || 
+                     cancelType == OP_BUYSTOP || cancelType == OP_SELLSTOP)
+                  {
+                     if(OrderDelete(cancelTicket))
+                        Print("Cancelled pending order ", cancelTicket, " due to basket limit");
+                  }
+               }
+               RemovePendingOrderAt(j);
+            }
+            break; // Exit loop since we cancelled all remaining
+         }
          continue;
       }
 
@@ -1913,6 +2023,17 @@ void RefreshPendingOrders()
 
 void GeneratePendingOrderGrid()
 {
+   // STRICT BASKET LIMIT: Don't generate grid if we're at 3 active trades
+   if(totalActiveTrades >= MAX_BASKET_TRADES)
+   {
+      // Cancel any existing pending orders since we're at limit
+      if(totalPendingOrders > 0)
+      {
+         CancelAllPendingOrders();
+      }
+      return;
+   }
+   
    RefreshRates();
    double emaTrend = iMA(Symbol(), PERIOD_M1, TrendPeriod, 0, MODE_EMA, PRICE_CLOSE, 0);
    double pipToPoint = Point * 10.0;
@@ -2054,6 +2175,10 @@ void AttemptMarketEntries()
       return;
 
    if(guardrailActive)
+      return;
+
+   // STRICT BASKET LIMIT: Maximum 3 trades per basket
+   if(totalActiveTrades >= MAX_BASKET_TRADES)
       return;
 
    int burstCap = (int)MathMax(1, MathRound(effectiveMarketBurstSize));
@@ -2205,7 +2330,7 @@ void UpdateDisplay()
    string status = StringConcatenate(
       "==== QuickScalperPro v5.00 (Combined Strategy) ====\n",
       "Status: ", (tradingAllowed ? "ACTIVE" : "PAUSED"), " | ", trend, " | RSI: ", DoubleToString(rsi, 1), " | Momentum: ", momentum, "\n",
-      "Basket: ", totalActiveTrades, "/", effectiveMaxTrades, " | Daily Baskets: ", basketsCompleted, " | Trades: ", dailyTradeCount, "\n",
+      "Basket: ", totalActiveTrades, "/", MAX_BASKET_TRADES, " (Max: ", MAX_BASKET_TRADES, ") | Daily Baskets: ", basketsCompleted, " | Trades: ", dailyTradeCount, "\n",
       "========================================\n",
       "BASKET P&L: KES ", DoubleToString(basketProfit, 2), "\n",
       profitInfo, "\n",
