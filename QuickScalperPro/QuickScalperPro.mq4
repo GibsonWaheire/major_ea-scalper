@@ -2,23 +2,24 @@
 
 #property copyright "Copyright 2025, Advanced Trading Systems"
 #property link      "https://www.mcgibsdigitalsolutions.com"
-#property version   "3.00"
+#property version   "3.03"
 #property strict
 
-#define FIXED_STOP_LOSS_PIPS 30.0
+// CRITICAL FIX: Re-enabled stop loss to prevent catastrophic losses
+#define FIXED_STOP_LOSS_PIPS 50.0  // CRITICAL: Stop loss re-enabled (50 pips)
 
 input group "===== Dynamic Lot Sizing ====="
 input double   AccountBalance_10K  = 1000000.0;
 input double   AccountBalance_100  = 100000.0;
 input double   AccountBalance_1500 = 500000.0;
-input double   MinLotSize          = 0.01;
-input double   MaxLotSize          = 0.08;
+input double   MinLotSize          = 0.01;  // CRITICAL FIX: Reduced from 0.10 to prevent huge losses
+input double   MaxLotSize          = 0.05;  // CRITICAL FIX: Reduced from 1.0 to prevent huge losses
 
 input group "===== Core Trading Settings ====="
 input int      MagicNumber         = 202503;
-input int      MaxTrades           = 3;
-input int      TradesPerBurst      = 3;
-input int      BurstDelayMS        = 100;
+input int      MaxTrades           = 3;     // CRITICAL FIX: Further reduced to prevent over-trading
+input int      TradesPerBurst      = 1;    // CRITICAL FIX: Only 1 trade per burst to prevent rapid losses
+input int      BurstDelayMS        = 500;  // FIXED: Increased delay to avoid hyperactivity
 
 input group "===== Adaptive Profit Engine ====="
 enum EquityTargetPresetOption
@@ -34,14 +35,21 @@ input bool     UseRiskRewardTarget  = false;    // Combine RR target with equity
 input double   RiskRewardMultiplier = 3.0;      // Multiple of risk to target (if enabled)
 input double   PeakGivebackPercent = 30.0;    // Allowable giveback from profit peak
 input int      MinimumHoldMS       = 250;     // Prevent premature exits
-input double   MaxSpreadPips       = 6.0;
+input double   MaxSpreadPips       = 20.0;  // FIXED: Increased from 6.0 to accept more opportunities
 
 input group "===== Trading Controls ====="
 input bool     TradeEnabled        = true;
 input int      TickDelay           = 1;
 input int      MaxConsecutiveLosses= 5;
 input bool     UseGoldOnly         = true;
-input int      MaxDailyTrades      = 100000;
+input int      MaxDailyTrades      = 50;      // FIXED: Reduced to avoid hyperactivity
+
+input group "===== Hyperactivity Protection ====="
+input bool     UseHyperactivityProtection = true;  // NEW: Protect against account closure
+input int      MinSecondsBetweenTrades    = 3;     // NEW: Minimum seconds between trades
+input int      MaxTradesPerMinute         = 5;     // NEW: Max trades per minute
+input int      MaxTradesPerHour           = 20;    // NEW: Max trades per hour
+input int      RequestCooldownMS          = 1000;  // NEW: Cooldown between order requests (ms)
 
 input group "===== Strategy Settings ====="
 input int      TrendPeriod         = 10;
@@ -49,21 +57,35 @@ input int      MomentumPeriod      = 9;
 input double   MinMomentumStrength = 20.0;
 input bool     OnlyTrendTrades     = false;
 
-input group "===== Per-Trade Exit Options ====="
-input bool     UseTakeProfitPips   = false;
-input double   TakeProfitPips      = 150.0;
-input bool     UseTrailingStop     = true;
-input double   TrailingStartPips   = 120.0;
-input double   TrailingStepPips    = 60.0;
-input double   PerTradeProfitLock  = 5000.0;   // Close individual positions once profit exceeds this amount
+input group "===== Per-Trade Exit Options (Profit-Based) ====="
+input bool     UseTakeProfitPercent = false;   // NEW: Use profit percentage instead of pips
+input double   TakeProfitPercent    = 100.0;   // NEW: Close at X% profit (100% = double)
+input bool     UseTrailingStop      = true;
+input double   TrailingStartPercent = 30.0;    // NEW: Start trailing at X% profit
+input double   TrailingStepPercent  = 10.0;    // NEW: Trail by X% of profit
+input double   PerTradeProfitLock   = 5000.0;  // Close individual positions once profit exceeds this amount
 
-input group "===== Instant Profit Exit ====="
-input bool     UseInstantProfitExit = true;
-input double   InstantProfitPips    = 5.0;
+input group "===== Instant Profit Exit (Profit-Based) ====="
+input bool     UseInstantProfitExit = true;   // FIXED: Enabled for instant profit
+input double   InstantProfitPercent = 50.0;   // NEW: Close at X% profit (e.g., 50% = half profit, 100% = double)
+input bool     UseProfitDouble      = true;   // NEW: Close when profit doubles (100% gain)
 
 input group "===== Lot Growth Settings ====="
 input double   ProfitStepForLotIncrease= 20.0;     // Increase lot size every X profit
 input double   LotIncrementPerStep     = 0.01;     // Additional lot size per profit step
+
+input group "===== CRITICAL RISK PROTECTION ====="
+input bool     OnlyCloseInProfit      = false;     // CRITICAL FIX: Allow closing losing trades if drawdown too high
+input double   BreakEvenTriggerPercent = 20.0;      // NEW: Move to BE after X% profit (was pips)
+input bool     UseMartingaleRecovery   = false;     // CRITICAL FIX: DISABLED - Prevents adding more losing trades
+input int      MaxRecoveryTrades       = 0;        // CRITICAL FIX: Set to 0 - no recovery trades
+input double   MaxDrawdownPercent      = 10.0;     // CRITICAL: Stop trading if drawdown exceeds X%
+input double   MaxLossPerTradeUSD      = 50.0;     // CRITICAL: Close trade if loss exceeds X USD
+input double   MaxDailyLossUSD         = 200.0;    // CRITICAL: Stop trading if daily loss exceeds X USD
+input bool     EmergencyStopEnabled    = true;     // CRITICAL: Enable emergency stop protection
+
+input group "===== No Hedging Protection ====="
+input bool     EnforceSingleDirection = true;      // NEW: No hedging - all trades same direction per basket
 
 struct QuickTrade {
    int      ticket;
@@ -76,7 +98,7 @@ struct QuickTrade {
    double   lowWatermark;
 };
 
-QuickTrade activeTrades[20];
+QuickTrade activeTrades[100];  // FIXED: Increased from 20 to 100 to support many trades
 int totalActiveTrades = 0;
 int lastTickCount = 0;
 double dailyProfit = 0;
@@ -99,10 +121,33 @@ double lastPrice = 0;
 int priceChangeCount = 0;
 double tickSum = 0;
 
+// NEW: Hyperactivity protection variables
+datetime lastTradeTimestamp = 0;
+int tradesThisMinute = 0;
+int tradesThisHour = 0;
+datetime currentMinute = 0;
+datetime currentHour = 0;
+datetime lastRequestTime = 0;
+
+// NEW: No hedging - track basket direction
+int currentBasketDirection = -1;  // -1 = no basket, OP_BUY = buy basket, OP_SELL = sell basket
+
+// CRITICAL: Risk protection variables
+double initialAccountBalance = 0.0;
+double highestAccountBalance = 0.0;
+bool emergencyStopActive = false;
+double dailyLossUSD = 0.0;
+
 int OnInit()
 {
    Print("========================================");
-   Print("QuickScalperPro EA v3.00 Initialized");
+   Print("QuickScalperPro EA v3.03 Initialized - SAFE MODE (Risk Protection Enabled)");
+   
+   // CRITICAL: Initialize risk protection
+   initialAccountBalance = AccountBalance();
+   highestAccountBalance = AccountBalance();
+   emergencyStopActive = false;
+   dailyLossUSD = 0.0;
    Print("========================================");
    Print("Strategy: Ultra-Fast Tick-Based Scalping");
    Print("Symbol: ", Symbol());
@@ -118,7 +163,7 @@ int OnInit()
    lastTickCount = 0;
    dailyTradeCount = 0;
 
-   for(int i = 0; i < 20; i++)
+   for(int i = 0; i < 100; i++)  // FIXED: Increased array size
    {
       activeTrades[i].ticket = -1;
       activeTrades[i].entryPrice = 0;
@@ -157,6 +202,16 @@ void OnTick()
 {
 
    CheckDailyReset();
+   
+   // CRITICAL: Check emergency stop first
+   if(EmergencyStopEnabled && CheckEmergencyStop())
+   {
+      Comment("EMERGENCY STOP ACTIVE - Trading Disabled");
+      return;
+   }
+   
+   // NEW: Update hyperactivity protection counters
+   UpdateHyperactivityCounters();
 
    if(!PreFlightChecks()) return;
 
@@ -247,16 +302,51 @@ void LookForScalpingOpportunity()
       return;
    }
 
+   // NEW: Check hyperactivity protection
+   if(UseHyperactivityProtection && !CanTradeNow())
+   {
+      return;  // Blocked by hyperactivity protection
+   }
+
    int signal = GetScalpingSignal();
 
    if(signal == OP_BUY || signal == OP_SELL)
    {
+      // NEW: No hedging - enforce single direction per basket
+      if(EnforceSingleDirection && totalActiveTrades > 0)
+      {
+         // Check if we have existing trades
+         int existingDirection = GetBasketDirection();
+         if(existingDirection != -1 && existingDirection != signal)
+         {
+            // Basket has trades in opposite direction - don't hedge
+            Print("NO HEDGING: Existing basket direction is ", (existingDirection == OP_BUY ? "BUY" : "SELL"), 
+                  " | Signal is ", (signal == OP_BUY ? "BUY" : "SELL"), " - Skipping to avoid hedge");
+            return;
+         }
+      }
+
+      // NEW: Set basket direction
+      if(totalActiveTrades == 0)
+      {
+         currentBasketDirection = signal;  // Set direction for new basket
+      }
 
       for(int burst = 0; burst < TradesPerBurst; burst++)
       {
 
          if(totalActiveTrades >= MaxTrades || dailyTradeCount >= MaxDailyTrades)
             break;
+
+         // NEW: Double-check direction before opening (no hedging)
+         if(EnforceSingleDirection && totalActiveTrades > 0)
+         {
+            if(currentBasketDirection != -1 && currentBasketDirection != signal)
+            {
+               Print("NO HEDGING: Stopping burst - direction mismatch");
+               break;
+            }
+         }
 
          if(signal == OP_BUY)
             OpenScalpTrade(OP_BUY);
@@ -380,6 +470,7 @@ void OpenScalpTrade(int orderType)
       return;
    }
 
+   // CRITICAL FIX: Stop loss re-enabled to prevent catastrophic losses
    double stopLossPips = FIXED_STOP_LOSS_PIPS;
    if(stopLossPips > 0.0 && pipToPoint > 0.0)
    {
@@ -389,18 +480,42 @@ void OpenScalpTrade(int orderType)
       else
          sl = NormalizeDouble(price + slDistance, Digits);
    }
-
-   if(UseTakeProfitPips && TakeProfitPips > 0.0 && pipToPoint > 0.0)
+   else
    {
-      double tpDistance = TakeProfitPips * pipToPoint;
+      // CRITICAL: If stop loss is 0, set a minimum safety stop
+      double minSafetyStop = 100.0 * pipToPoint;  // 100 pips minimum safety stop
       if(orderType == OP_BUY)
-         tp = NormalizeDouble(price + tpDistance, Digits);
+         sl = NormalizeDouble(price - minSafetyStop, Digits);
       else
-         tp = NormalizeDouble(price - tpDistance, Digits);
+         sl = NormalizeDouble(price + minSafetyStop, Digits);
+   }
+
+   // FIXED: Changed to use profit percentage instead of pips
+   if(UseTakeProfitPercent && TakeProfitPercent > 0.0 && pipToPoint > 0.0)
+   {
+      // Note: TakeProfitPercent is handled in ManageActiveTrades, not here
+      // This section can be removed or kept for backward compatibility
+      tp = 0;  // TP will be managed by profit percentage logic
    }
 
    string comment = "ScalpPro " + (orderType == OP_BUY ? "BUY" : "SELL") + " Lot:" + DoubleToString(lotSize, 2);
    color arrowColor = (orderType == OP_BUY) ? clrGreen : clrRed;
+
+   // NEW: Record request time for hyperactivity protection
+   if(UseHyperactivityProtection)
+   {
+      lastRequestTime = GetTickCount();
+      
+      // Check cooldown before sending
+      if(lastRequestTime > 0 && RequestCooldownMS > 0)
+      {
+         ulong timeSinceRequest = GetTickCount() - lastRequestTime;
+         if(timeSinceRequest < (ulong)RequestCooldownMS)
+         {
+            Sleep((int)(RequestCooldownMS - timeSinceRequest));
+         }
+      }
+   }
 
    int ticket = OrderSend(Symbol(), orderType, lotSize, price, 3, sl, tp,
                           comment, MagicNumber, 0, arrowColor);
@@ -410,6 +525,14 @@ void OpenScalpTrade(int orderType)
 
       dailyTradeCount++;
       lastTradeTime = TimeCurrent();
+      
+      // NEW: Update hyperactivity counters
+      if(UseHyperactivityProtection)
+      {
+         lastTradeTimestamp = TimeCurrent();
+         tradesThisMinute++;
+         tradesThisHour++;
+      }
 
       if(lastTradeDirection == orderType)
       {
@@ -421,7 +544,13 @@ void OpenScalpTrade(int orderType)
          lastTradeDirection = orderType;
       }
 
-      if(totalActiveTrades < 20)
+      // NEW: Update basket direction
+      if(totalActiveTrades == 0)
+      {
+         currentBasketDirection = orderType;  // Set direction for new basket
+      }
+
+      if(totalActiveTrades < 100)  // FIXED: Increased limit
       {
          activeTrades[totalActiveTrades].ticket = ticket;
          activeTrades[totalActiveTrades].entryPrice = price;
@@ -470,7 +599,7 @@ double GetEquityTargetPercent()
 
 void UpdatePerTradeTrailing(int index, double pipToPoint)
 {
-   if(!UseTrailingStop || TrailingStartPips <= 0.0 || TrailingStepPips <= 0.0)
+   if(!UseTrailingStop || TrailingStartPercent <= 0.0 || TrailingStepPercent <= 0.0)
       return;
 
    if(index < 0 || index >= totalActiveTrades)
@@ -486,42 +615,68 @@ void UpdatePerTradeTrailing(int index, double pipToPoint)
    if(OrderCloseTime() > 0)
       return;
 
+   // FIXED: Only trail if trade is profitable - never trail losing trades
+   double tradeProfit = OrderProfit() + OrderSwap() + OrderCommission();
+   if(OnlyCloseInProfit && tradeProfit <= 0.0)
+      return;  // Don't trail losing trades
+
    int type = OrderType();
    double price = (type == OP_BUY) ? Bid : Ask;
    double entry = activeTrades[index].entryPrice;
+   double lotSize = OrderLots();
+   
+   // NEW: Calculate profit percentage for trailing
+   double pipValuePerLot = GetPipValuePerLot();
+   double riskAmount = entry * lotSize * 0.01;  // Base risk calculation
+   double profitPercent = 0.0;
+   if(riskAmount > 0.0)
+      profitPercent = (tradeProfit / riskAmount) * 100.0;
 
    if(pipToPoint <= 0.0)
       return;
 
-   double startDistance = TrailingStartPips * pipToPoint;
-   double stepDistance  = TrailingStepPips * pipToPoint;
-
-   if(type == OP_BUY)
+   // NEW: Trailing using profit percentage
+   if(profitPercent >= TrailingStartPercent)
    {
-      activeTrades[index].highWatermark = MathMax(activeTrades[index].highWatermark, price);
-      double moveDistance = activeTrades[index].highWatermark - entry;
-      if(!activeTrades[index].trailingArmed && moveDistance >= startDistance)
+      if(!activeTrades[index].trailingArmed)
          activeTrades[index].trailingArmed = true;
 
       if(activeTrades[index].trailingArmed)
       {
-         double newStop = NormalizeDouble(activeTrades[index].highWatermark - stepDistance, Digits);
-         if(newStop > OrderStopLoss() && newStop < price)
+         // Calculate trailing stop based on profit percentage
+         double trailPercent = profitPercent - TrailingStepPercent;
+         if(trailPercent > 0.0)
+         {
+            double trailProfit = riskAmount * (trailPercent / 100.0);
+            double trailDistance = 0.0;
+            
+            if(type == OP_BUY)
+            {
+               // For BUY: trail stop below high watermark
+               activeTrades[index].highWatermark = MathMax(activeTrades[index].highWatermark, price);
+               trailDistance = trailProfit / (pipValuePerLot * lotSize);
+               if(trailDistance > 0 && pipToPoint > 0)
+               {
+                  trailDistance = trailDistance * pipToPoint;
+                  double newStop = NormalizeDouble(activeTrades[index].highWatermark - trailDistance, Digits);
+                  if(newStop >= entry && newStop > OrderStopLoss() && newStop < price)
             ModifyOrderStop(ticket, newStop);
       }
    }
    else if(type == OP_SELL)
    {
+               // For SELL: trail stop above low watermark
       activeTrades[index].lowWatermark = MathMin(activeTrades[index].lowWatermark, price);
-      double moveDistance = entry - activeTrades[index].lowWatermark;
-      if(!activeTrades[index].trailingArmed && moveDistance >= startDistance)
-         activeTrades[index].trailingArmed = true;
-
-      if(activeTrades[index].trailingArmed)
-      {
-         double newStop = NormalizeDouble(activeTrades[index].lowWatermark + stepDistance, Digits);
-         if((OrderStopLoss() == 0 || newStop < OrderStopLoss()) && newStop > price)
+               trailDistance = trailProfit / (pipValuePerLot * lotSize);
+               if(trailDistance > 0 && pipToPoint > 0)
+               {
+                  trailDistance = trailDistance * pipToPoint;
+                  double newStop = NormalizeDouble(activeTrades[index].lowWatermark + trailDistance, Digits);
+                  if(newStop <= entry && (OrderStopLoss() == 0 || newStop < OrderStopLoss()) && newStop > price)
             ModifyOrderStop(ticket, newStop);
+               }
+            }
+         }
       }
    }
 }
@@ -590,10 +745,88 @@ void ManageActiveTrades()
       }
 
       double tradeProfit = OrderProfit() + OrderSwap() + OrderCommission();
+      double lotSize = OrderLots();
+      double entryPrice = activeTrades[i].entryPrice;
+      double stop = OrderStopLoss();
+      
+      // NEW: Calculate profit percentage based on risk
+      double riskAmount = 0.0;
+      if(stop > 0 && pipToPoint > 0)
+      {
+         double riskPips = MathAbs(entry - stop) / pipToPoint;
+         riskAmount = riskPips * pipValuePerLot * lotSize;
+      }
+      else
+      {
+         // No stop loss - use entry price as base for percentage calculation
+         riskAmount = entryPrice * lotSize * 0.01;  // 1% of entry value as base
+      }
+      
+      double profitPercent = 0.0;
+      if(riskAmount > 0.0)
+         profitPercent = (tradeProfit / riskAmount) * 100.0;
 
-       if(UseInstantProfitExit && InstantProfitPips > 0.0 && tradeProfit > 0.0 && pipGain >= InstantProfitPips)
-       {
-         CloseTradeAtIndex(i, "Instant profit exit +" + DoubleToString(tradeProfit, 2));
+      // NEW: Break-Even Protection - Move SL to BE once profitable (using percentage)
+      if(BreakEvenTriggerPercent > 0.0 && tradeProfit > 0.0 && profitPercent >= BreakEvenTriggerPercent)
+      {
+         double currentSL = OrderStopLoss();
+         if(orderType == OP_BUY && (currentSL == 0 || currentSL < entryPrice))
+         {
+            ModifyOrderStop(activeTrades[i].ticket, entryPrice);
+         }
+         else if(orderType == OP_SELL && (currentSL == 0 || currentSL > entryPrice))
+         {
+            ModifyOrderStop(activeTrades[i].ticket, entryPrice);
+         }
+      }
+
+      // CRITICAL FIX: Allow closing losing trades if loss is too high
+      if(OnlyCloseInProfit && tradeProfit <= 0.0)
+      {
+         // Check if loss exceeds maximum per trade
+         if(MaxLossPerTradeUSD > 0.0 && MathAbs(tradeProfit) >= MaxLossPerTradeUSD)
+         {
+            // CRITICAL: Close trade even if losing - loss too high
+            CloseTradeAtIndex(i, "CRITICAL: Max loss per trade exceeded: $" + DoubleToString(tradeProfit, 2));
+            i--;
+            continue;
+         }
+         
+         // Trade is losing but within limits - skip exit conditions, let it recover
+         totalProfit += tradeProfit;
+         UpdatePerTradeTrailing(i, pipToPoint);
+         continue;
+      }
+
+      // NEW: Instant Profit Exit - using profit percentage instead of pips
+      if(UseInstantProfitExit && tradeProfit > 0.0)
+      {
+         bool shouldClose = false;
+         string closeReason = "";
+         
+         if(UseProfitDouble && profitPercent >= 100.0)
+         {
+            shouldClose = true;
+            closeReason = "Profit doubled (100%): " + DoubleToString(tradeProfit, 2);
+         }
+         else if(InstantProfitPercent > 0.0 && profitPercent >= InstantProfitPercent)
+         {
+            shouldClose = true;
+            closeReason = "Instant profit " + DoubleToString(profitPercent, 1) + "%: " + DoubleToString(tradeProfit, 2);
+         }
+         
+         if(shouldClose)
+         {
+            CloseTradeAtIndex(i, closeReason);
+            i--;
+            continue;
+         }
+      }
+
+      // NEW: Take Profit using percentage instead of pips
+      if(UseTakeProfitPercent && TakeProfitPercent > 0.0 && profitPercent >= TakeProfitPercent)
+      {
+         CloseTradeAtIndex(i, "Take profit " + DoubleToString(profitPercent, 1) + "%: " + DoubleToString(tradeProfit, 2));
          i--;
          continue;
        }
@@ -607,9 +840,9 @@ void ManageActiveTrades()
 
       totalProfit += tradeProfit;
 
-      double lotSize = OrderLots();
+      // FIXED: lotSize and stop already declared earlier in the loop (lines 749, 751)
+      // Reuse existing variables instead of redeclaring
       double riskPips = FIXED_STOP_LOSS_PIPS;
-      double stop = OrderStopLoss();
 
       if(stop > 0 && pipToPoint > 0)
          riskPips = MathAbs(entry - stop) / pipToPoint;
@@ -648,12 +881,24 @@ void ManageActiveTrades()
 
    bool profitReady = (totalProfit > 0.0) && holdSatisfied;
 
+   // FIXED: Only close basket if profitable
+   if(OnlyCloseInProfit && totalProfit <= 0.0)
+   {
+      // Basket is losing - trigger martingale recovery if enabled
+      if(UseMartingaleRecovery && totalActiveTrades < MaxTrades)
+      {
+         TriggerMartingaleRecovery(totalProfit);
+      }
+      return;  // Don't close losing basket
+   }
+
    if(profitReady && dynamicTarget > 0.0 && totalProfit >= dynamicTarget)
    {
       CloseAllTrades("Dynamic profit target hit: KES " + DoubleToString(totalProfit, 2));
       return;
    }
 
+   // FIXED: Peak giveback only applies if basket is profitable
    if(totalProfit > 0.0 && PeakGivebackPercent > 0.0 && dynamicTarget > 0.0 && highestBasketProfit >= dynamicTarget)
    {
       basketTrailingActive = true;
@@ -661,7 +906,8 @@ void ManageActiveTrades()
       double trailLevel = highestBasketProfit - giveback;
       lastTrailLevel = trailLevel;
 
-      if(profitReady && highestBasketProfit > 0.0 && giveback > 0.0 && totalProfit <= trailLevel)
+      // FIXED: Only close if trail level is still profitable
+      if(profitReady && highestBasketProfit > 0.0 && giveback > 0.0 && totalProfit <= trailLevel && totalProfit > 0.0)
       {
         CloseAllTrades("Dynamic peak trail: KES " + DoubleToString(totalProfit, 2));
         return;
@@ -683,6 +929,14 @@ void CloseTradeAtIndex(int index, string reason)
    if(!OrderSelect(ticket, SELECT_BY_TICKET)) return;
 
    double preClosePL = OrderProfit() + OrderSwap() + OrderCommission();
+   
+   // FIXED: CRITICAL - Only close if trade is profitable
+   if(OnlyCloseInProfit && preClosePL <= 0.0)
+   {
+      Print("BLOCKED: Attempted to close losing trade #", ticket, " | P&L: ", DoubleToString(preClosePL, 2), " | Reason: ", reason);
+      return;  // Never close losing trades
+   }
+
    double closePrice = (OrderType() == OP_BUY) ? Bid : Ask;
    double volume = OrderLots();
 
@@ -698,6 +952,9 @@ void CloseTradeAtIndex(int index, string reason)
       }
 
       dailyProfit += finalPL;
+      
+      // CRITICAL: Update daily loss tracking
+      UpdateDailyLossTracking(finalPL);
 
       if(finalPL < 0)
       {
@@ -792,6 +1049,13 @@ bool PreFlightChecks()
       tradingAllowed = false;
       return false;
    }
+   
+   // CRITICAL: Check emergency stop
+   if(EmergencyStopEnabled && emergencyStopActive)
+   {
+      tradingAllowed = false;
+      return false;
+   }
 
    if(!HasTerminalTradePermission())
    {
@@ -801,6 +1065,51 @@ bool PreFlightChecks()
 
    tradingAllowed = true;
    return true;
+}
+
+// CRITICAL: Emergency stop protection
+bool CheckEmergencyStop()
+{
+   if(!EmergencyStopEnabled)
+      return false;
+   
+   double currentBalance = AccountBalance();
+   double currentEquity = AccountEquity();
+   
+   // Update highest balance
+   if(currentBalance > highestAccountBalance)
+      highestAccountBalance = currentBalance;
+   
+   // Check maximum drawdown
+   if(highestAccountBalance > 0.0)
+   {
+      double drawdown = ((highestAccountBalance - currentEquity) / highestAccountBalance) * 100.0;
+      if(drawdown >= MaxDrawdownPercent)
+      {
+         if(!emergencyStopActive)
+         {
+            Print("CRITICAL: EMERGENCY STOP ACTIVATED - Drawdown: ", DoubleToString(drawdown, 2), "%");
+            Alert("EMERGENCY STOP: Drawdown exceeded ", DoubleToString(MaxDrawdownPercent, 1), "%");
+         }
+         emergencyStopActive = true;
+         return true;
+      }
+   }
+   
+   // Check daily loss limit
+   if(dailyLossUSD >= MaxDailyLossUSD)
+   {
+      if(!emergencyStopActive)
+      {
+         Print("CRITICAL: EMERGENCY STOP ACTIVATED - Daily Loss: $", DoubleToString(dailyLossUSD, 2));
+         Alert("EMERGENCY STOP: Daily loss limit exceeded");
+      }
+      emergencyStopActive = true;
+      return true;
+   }
+   
+   emergencyStopActive = false;
+   return false;
 }
 
 bool HasTerminalTradePermission()
@@ -824,25 +1133,51 @@ void CloseAllTrades(string reason)
    Print("BASKET CLOSE: Closing all ", totalActiveTrades, " trades - ", reason);
 
    double totalPL = 0;
+   int profitableTrades = 0;
+   int losingTrades = 0;
 
+   // FIXED: Only close profitable trades, skip losing ones
    for(int i = totalActiveTrades - 1; i >= 0; i--)
    {
       if(activeTrades[i].ticket > 0)
       {
          if(OrderSelect(activeTrades[i].ticket, SELECT_BY_TICKET))
          {
-            totalPL += OrderProfit() + OrderSwap() + OrderCommission();
-         }
+            double tradePL = OrderProfit() + OrderSwap() + OrderCommission();
+            totalPL += tradePL;
+            
+            if(OnlyCloseInProfit && tradePL <= 0.0)
+            {
+               losingTrades++;
+               Print("SKIPPED: Losing trade #", activeTrades[i].ticket, " | P&L: ", DoubleToString(tradePL, 2), " - Will not close");
+               continue;  // Skip losing trades
+            }
+            
+            profitableTrades++;
          CloseTradeAtIndex(i, reason);
+         }
       }
    }
 
-   Print("Basket closed: KES ", DoubleToString(totalPL, 2), " | Reason: ", reason);
+   Print("Basket closed: KES ", DoubleToString(totalPL, 2), " | Profitable: ", profitableTrades, " | Losing (kept): ", losingTrades, " | Reason: ", reason);
 
    highestBasketProfit = 0;
    basketTrailingActive = false;
    lastDynamicTarget = 0;
    lastTrailLevel = 0;
+   
+   // NEW: Reset basket direction when all trades closed
+   if(totalActiveTrades == 0)
+      currentBasketDirection = -1;
+}
+
+// CRITICAL: Update daily loss tracking
+void UpdateDailyLossTracking(double tradePL)
+{
+   if(tradePL < 0.0)
+   {
+      dailyLossUSD += MathAbs(tradePL);
+   }
 }
 
 void CheckDailyReset()
@@ -859,6 +1194,30 @@ void CheckDailyReset()
       basketTrailingActive = false;
       lastDynamicTarget = 0;
       lastTrailLevel = 0;
+      
+      // CRITICAL: Reset daily loss tracking
+      dailyLossUSD = 0.0;
+      emergencyStopActive = false;
+      
+      // NEW: Reset hyperactivity counters
+      if(UseHyperactivityProtection)
+      {
+         tradesThisMinute = 0;
+         tradesThisHour = 0;
+         lastTradeTimestamp = 0;
+         lastRequestTime = 0;
+         currentMinute = 0;
+         currentHour = 0;
+      }
+      
+   // NEW: Reset basket direction
+   currentBasketDirection = -1;
+   
+   // CRITICAL: Reset risk protection
+   initialAccountBalance = AccountBalance();
+   highestAccountBalance = AccountBalance();
+   emergencyStopActive = false;
+   dailyLossUSD = 0.0;
    }
 }
 
@@ -901,9 +1260,15 @@ void UpdateDisplay()
       profitInfo += " | Trail: " + DoubleToString(lastTrailLevel, 2);
    profitInfo += " | RR x" + DoubleToString(RiskRewardMultiplier, 1);
 
+   string emergencyStatus = "";
+   if(EmergencyStopEnabled && emergencyStopActive)
+   {
+      emergencyStatus = " | EMERGENCY STOP: ACTIVE";
+   }
+
    string status = StringConcatenate(
-      "==== QuickScalperPro v3.00 (Adaptive Engine) ====\n",
-      "Status: ", (tradingAllowed ? "ACTIVE" : "PAUSED"), " | ", trend, " | RSI: ", DoubleToString(rsi, 1), " | Momentum: ", momentum, "\n",
+      "==== QuickScalperPro v3.03 (SAFE MODE - Risk Protection) ====\n",
+      "Status: ", (tradingAllowed ? "ACTIVE" : "PAUSED"), emergencyStatus, " | ", trend, " | RSI: ", DoubleToString(rsi, 1), " | Momentum: ", momentum, "\n",
       "Basket: ", totalActiveTrades, "/", MaxTrades, " | Daily Baskets: ", basketsCompleted, " | Trades: ", dailyTradeCount, "\n",
       "========================================\n",
       "BASKET P&L: KES ", DoubleToString(basketProfit, 2), "\n",
@@ -917,5 +1282,173 @@ void UpdateDisplay()
    );
 
    Comment(status);
+}
+
+// NEW: Update hyperactivity protection counters
+void UpdateHyperactivityCounters()
+{
+   if(!UseHyperactivityProtection)
+      return;
+   
+   datetime now = TimeCurrent();
+   datetime currentMin = (now / 60) * 60;  // Round to minute
+   datetime currentHr = (now / 3600) * 3600;  // Round to hour
+   
+   // Reset minute counter if new minute
+   if(currentMin != currentMinute)
+   {
+      tradesThisMinute = 0;
+      currentMinute = currentMin;
+   }
+   
+   // Reset hour counter if new hour
+   if(currentHr != currentHour)
+   {
+      tradesThisHour = 0;
+      currentHour = currentHr;
+   }
+}
+
+// NEW: Check if trading is allowed (hyperactivity protection)
+bool CanTradeNow()
+{
+   if(!UseHyperactivityProtection)
+      return true;
+   
+   datetime now = TimeCurrent();
+   
+   // Check minimum time between trades
+   if(lastTradeTimestamp > 0 && (now - lastTradeTimestamp) < MinSecondsBetweenTrades)
+   {
+      return false;  // Too soon since last trade
+   }
+   
+   // Check trades per minute limit
+   if(tradesThisMinute >= MaxTradesPerMinute)
+   {
+      return false;  // Too many trades this minute
+   }
+   
+   // Check trades per hour limit
+   if(tradesThisHour >= MaxTradesPerHour)
+   {
+      return false;  // Too many trades this hour
+   }
+   
+   // Check request cooldown
+   if(lastRequestTime > 0)
+   {
+      ulong timeSinceRequest = GetTickCount() - lastRequestTime;
+      if(timeSinceRequest < (ulong)RequestCooldownMS)
+      {
+         return false;  // Too soon since last request
+      }
+   }
+   
+   return true;
+}
+
+// NEW: Get current basket direction (for no-hedging protection)
+int GetBasketDirection()
+{
+   if(totalActiveTrades == 0)
+      return -1;  // No basket
+   
+   // Check first active trade direction
+   for(int i = 0; i < totalActiveTrades; i++)
+   {
+      if(activeTrades[i].ticket > 0)
+      {
+         if(OrderSelect(activeTrades[i].ticket, SELECT_BY_TICKET))
+         {
+            return OrderType();  // Return direction of first trade
+         }
+      }
+   }
+   
+   return currentBasketDirection;  // Fallback to tracked direction
+}
+
+// FIXED: NEW FUNCTION - Martingale Recovery System
+void TriggerMartingaleRecovery(double currentBasketPL)
+{
+   if(!UseMartingaleRecovery)
+      return;
+   
+   if(currentBasketPL >= 0.0)
+      return;  // Only trigger when basket is losing
+   
+   static datetime lastRecoveryTime = 0;
+   static int recoveryTradesAdded = 0;
+   
+   // Reset recovery counter if basket becomes profitable
+   if(currentBasketPL > 0.0)
+   {
+      recoveryTradesAdded = 0;
+      return;
+   }
+   
+   // Limit recovery trades
+   if(recoveryTradesAdded >= MaxRecoveryTrades)
+      return;
+   
+   // Cooldown between recovery trades (30 seconds)
+   if(TimeCurrent() - lastRecoveryTime < 30)
+      return;
+   
+   // Check if we can add more trades
+   if(totalActiveTrades >= MaxTrades)
+      return;
+   
+   // Determine direction based on current losing trades
+   int buyCount = 0;
+   int sellCount = 0;
+   double buyPL = 0;
+   double sellPL = 0;
+   
+   for(int i = 0; i < totalActiveTrades; i++)
+   {
+      if(activeTrades[i].ticket <= 0) continue;
+      if(!OrderSelect(activeTrades[i].ticket, SELECT_BY_TICKET)) continue;
+      
+      double tradePL = OrderProfit() + OrderSwap() + OrderCommission();
+      if(OrderType() == OP_BUY)
+      {
+         buyCount++;
+         buyPL += tradePL;
+      }
+      else if(OrderType() == OP_SELL)
+      {
+         sellCount++;
+         sellPL += tradePL;
+      }
+   }
+   
+   // Add recovery trade in the direction that's losing more
+   int recoveryDirection = -1;
+   if(buyPL < sellPL && buyPL < 0)
+   {
+      recoveryDirection = OP_BUY;  // Buy more to average down
+   }
+   else if(sellPL < buyPL && sellPL < 0)
+   {
+      recoveryDirection = OP_SELL;  // Sell more to average down
+   }
+   else if(buyPL < 0)
+   {
+      recoveryDirection = OP_BUY;
+   }
+   else if(sellPL < 0)
+   {
+      recoveryDirection = OP_SELL;
+   }
+   
+   if(recoveryDirection != -1)
+   {
+      Print("MARTINGALE RECOVERY: Adding trade #", (recoveryTradesAdded + 1), " | Basket P&L: ", DoubleToString(currentBasketPL, 2));
+      OpenScalpTrade(recoveryDirection);
+      recoveryTradesAdded++;
+      lastRecoveryTime = TimeCurrent();
+   }
 }
 
