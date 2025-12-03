@@ -1901,7 +1901,7 @@ bool SubmitPendingOrder(int pendingType, double price)
             }
             else
             {
-               SyncActiveTradesWithBroker();
+            SyncActiveTradesWithBroker();
                
                // STRICT BASKET LIMIT: If we just hit 3 trades, cancel all pending orders
                if(totalActiveTrades >= MAX_BASKET_TRADES)
@@ -1974,8 +1974,8 @@ void RefreshPendingOrders()
          
          // Add to active trades if not already tracked
          if(!alreadyTracked)
-         {
-            SyncActiveTradesWithBroker();
+      {
+         SyncActiveTradesWithBroker();
          }
          
          RemovePendingOrderAt(i);

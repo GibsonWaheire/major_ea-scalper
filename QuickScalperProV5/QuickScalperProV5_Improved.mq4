@@ -2145,7 +2145,7 @@ void GeneratePendingOrderGrid()
    // ==== SAFETY CHECK 7: Micro Confirmation ====
    double m1close = iClose(Symbol(), PERIOD_M1, 0);
    double m1prev  = iClose(Symbol(), PERIOD_M1, 1);
-   
+
    // Buy limits below bid
    double baseBuyLimit = emaTrend - limitOffset;
    for(int i = currentBuyLimits; i < targetBuyLimits && totalPendingOrders < MAX_PENDING_ORDERS; i++)
