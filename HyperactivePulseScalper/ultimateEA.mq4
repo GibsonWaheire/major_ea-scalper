@@ -524,28 +524,29 @@ void OnTick()
             
             // Try market execution first (immediate entry)
             if(OpenHFTrade(direction))
-         {
-            Print("✓ MARKET ORDER EXECUTED: ", (direction == 1 ? "BUY" : "SELL"), 
-                  " | Ticket: ", currentTrade.ticket,
-                  " | Basket: ", CountActiveTrades(), "/", MaxTradesInBasket);
-            
-            // Track pattern if enabled
-            if(UsePatternStrategy)
             {
-               patternIndex++;
+               Print("✓ MARKET ORDER EXECUTED: ", (direction == 1 ? "BUY" : "SELL"), 
+                     " | Ticket: ", currentTrade.ticket,
+                     " | Basket: ", CountActiveTrades(), "/", MaxTradesInBasket);
+               
+               // Track pattern if enabled
+               if(UsePatternStrategy)
+               {
+                  patternIndex++;
+               }
+               
+               // Delete any remaining pending orders (safety)
+               DeleteAllPendingOrdersByScan();
             }
-            
-            // Delete any remaining pending orders (safety)
-            DeleteAllPendingOrdersByScan();
-         }
-         else
-         {
-            // Market execution failed - fallback to pending orders
-            int error = GetLastError();
-            Print("Market execution failed (Error: ", error, ") - Falling back to pending orders...");
-            
-            // ===== FALLBACK: Use Smart Entry Staging if market execution fails =====
-            SmartEntryStaging(direction);
+            else
+            {
+               // Market execution failed - fallback to pending orders
+               int error = GetLastError();
+               Print("Market execution failed (Error: ", error, ") - Falling back to pending orders...");
+               
+               // ===== FALLBACK: Use Smart Entry Staging if market execution fails =====
+               SmartEntryStaging(direction);
+            }
          }
       }
    }
