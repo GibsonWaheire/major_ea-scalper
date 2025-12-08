@@ -631,3 +631,14 @@ void DetectMarketRegime()
 
 
 
+
+
+
+
+
+
+
+
+
+
+

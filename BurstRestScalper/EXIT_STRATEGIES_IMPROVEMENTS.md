@@ -820,3 +820,14 @@ MinATRExitPips = 0.5;
 - **Equity Exits:** Reset daily tracking on new day
 
 
+
+
+
+
+
+
+
+
+
+
+

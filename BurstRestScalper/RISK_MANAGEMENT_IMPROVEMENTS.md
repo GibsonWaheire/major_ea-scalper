@@ -162,3 +162,14 @@ The current risk management allows for **20% account risk per basket**, which is
 
 **Recommended immediate action**: Implement Solutions 1 and 2 (Max Basket Risk Cap + Use Equity) as these address the most critical issues.
 
+
+
+
+
+
+
+
+
+
+
+

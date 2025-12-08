@@ -1,10 +1,10 @@
 #property copyright "Copyright 2025, Hyperactive Pulse Scalper V2 - Ultra High Frequency Micro-Scalper"
 #property link      "https://www.mcgibsdigitalsolutions.com"
-#property version   "3.10"
+#property version   "3.00"
 #property strict
 
 // =====================================================================================================
-// HYPERACTIVE PULSE SCALPER V3 - ULTRA HIGH FREQUENCY MICRO-SCALPER
+// HYPERACTIVE PULSE SCALPER V3 - ULTRA HIGH FREQUENCY MICRO-SCALPER (MT5 VERSION - CONVERTED FROM MT4)
 // Strategy: True HFT micro-scalper using 3-in-1 entry system
 // - Tick-based only (no candles, no indicators)
 // - 3 entry models: Tick Momentum, Micro Pullback, Spread Compression
@@ -23,22 +23,11 @@ input int      MaxHoldSeconds        = 5;      // Maximum hold time (3-10 second
 input double   TrailingStopPips         = 10.0;   // Trailing stop distance (pips)
 input double   BreakevenTriggerPips     = 5.0;    // Move to breakeven after profit (pips)
 input double   DailyLossLimitPercent    = 10.0;   // Stop trading if daily loss exceeds (%)
-input double   DailyProfitTargetPercent = 20.0;   // Stop trading if daily profit exceeds (%)
 input double   MaxDrawdownPercent       = 15.0;   // Stop all trading if drawdown exceeds (%)
-input double   EquityProtectionPercent  = 20.0;   // Stop trading if equity drops below (% from start)
 input double   MaxSpreadPips            = 4.0;    // Don't trade if spread exceeds (pips)
-input double   MaxSpreadMultiplier     = 1.5;    // Don't trade if spread > avg * multiplier
 input int      ConsecutiveLossLimit     = 3;      // Pause after X consecutive losses
 input int      CooldownSeconds          = 45;     // Seconds to pause after consecutive losses
 input double   MinProfitToClose         = 0.50;   // Minimum profit to close trade ($)
-input int      MaxTradesPerDay          = 500;    // Maximum trades per day (0 = unlimited)
-input int      MaxTradesPerHour         = 100;    // Maximum trades per hour (0 = unlimited)
-input double   MaxPositionSizePercent   = 50.0;   // Max total position size (% of balance)
-input bool     UseDynamicRisk           = true;   // Adjust risk based on performance
-input double   RiskReductionOnLoss      = 0.8;    // Reduce risk by this factor after loss
-input double   RiskIncreaseOnWin        = 1.1;    // Increase risk by this factor after win
-input int      RecoveryModeThreshold    = 5;      // Enter recovery mode after X losses
-input double   RecoveryModeRiskMultiplier = 0.5;  // Risk multiplier in recovery mode
 
 // ===== Pattern Strategy Settings =====
 input int      PatternSequenceLength = 4;      // Number of trades in each pattern sequence (3-5)
@@ -98,19 +87,10 @@ int recentTradeCount = 0;
 double dailyStartBalance = 0.0;
 double dailyProfitLoss = 0.0;
 double sessionHighEquity = 0.0;
-double sessionStartEquity = 0.0;
 int consecutiveLosses = 0;
 datetime cooldownUntil = 0;
 bool breakevenSet = false;
 double highestProfit = 0.0;
-int tradesToday = 0;
-int tradesThisHour = 0;
-datetime lastTradeHour = 0;
-double currentRiskMultiplier = 1.0;
-bool recoveryMode = false;
-int totalLossesToday = 0;
-double averageSpread = 0.0;
-int spreadSampleCount = 0;
 
 // =====================================================================================================
 // INITIALIZATION
@@ -119,8 +99,7 @@ int spreadSampleCount = 0;
 int OnInit()
 {
    Print("========================================");
-   Print("ULTRA HIGH FREQUENCY MICRO-SCALPER V3.10");
-   Print("ENHANCED RISK MANAGEMENT");
+   Print("ULTRA HIGH FREQUENCY MICRO-SCALPER V3.00");
    Print("AGGRESSIVE MODE: 5-IN-1 ENTRY SYSTEM");
    Print("Tick Momentum | Direction Change | Micro Pullback | Spread Compression | Continuous Momentum");
    Print("========================================");
@@ -130,17 +109,10 @@ int OnInit()
    Print("  - Trailing Stop: ", TrailingStopPips, " pips");
    Print("  - Breakeven Trigger: ", BreakevenTriggerPips, " pips");
    Print("  - Daily Loss Limit: ", DailyLossLimitPercent, "%");
-   Print("  - Daily Profit Target: ", DailyProfitTargetPercent, "%");
    Print("  - Max Drawdown: ", MaxDrawdownPercent, "%");
-   Print("  - Equity Protection: ", EquityProtectionPercent, "%");
-   Print("  - Max Spread: ", MaxSpreadPips, " pips (or ", MaxSpreadMultiplier, "x average)");
+   Print("  - Max Spread: ", MaxSpreadPips, " pips");
    Print("  - Consecutive Loss Limit: ", ConsecutiveLossLimit, " trades");
    Print("  - Min Profit to Close: $", MinProfitToClose);
-   Print("  - Max Trades/Day: ", (MaxTradesPerDay > 0 ? IntegerToString(MaxTradesPerDay) : "Unlimited"));
-   Print("  - Max Trades/Hour: ", (MaxTradesPerHour > 0 ? IntegerToString(MaxTradesPerHour) : "Unlimited"));
-   Print("  - Max Position Size: ", MaxPositionSizePercent, "%");
-   Print("  - Dynamic Risk: ", (UseDynamicRisk ? "ON" : "OFF"));
-   Print("  - Recovery Mode: After ", RecoveryModeThreshold, " losses (", RecoveryModeRiskMultiplier, "x risk)");
    if(UsePatternStrategy)
    {
       Print("Entry Strategy: PATTERN-BASED (Sequence Length: ", PatternSequenceLength, " trades)");
@@ -169,19 +141,10 @@ int OnInit()
    dailyStartBalance = AccountBalance();
    dailyProfitLoss = 0.0;
    sessionHighEquity = AccountEquity();
-   sessionStartEquity = AccountEquity();
    consecutiveLosses = 0;
    cooldownUntil = 0;
    breakevenSet = false;
    highestProfit = 0.0;
-   tradesToday = 0;
-   tradesThisHour = 0;
-   lastTradeHour = 0;
-   currentRiskMultiplier = 1.0;
-   recoveryMode = false;
-   totalLossesToday = 0;
-   averageSpread = 0.0;
-   spreadSampleCount = 0;
    
    // Initialize pattern strategy
    patternIndex = 0;
@@ -226,7 +189,7 @@ int OnInit()
    }
    else
    {
-      Print("⚠ AutoTrading is DISABLED - Please enable AutoTrading button in MT4!");
+      Print("⚠ AutoTrading is DISABLED - Please enable AutoTrading button in MT5!");
    }
    
    return(INIT_SUCCEEDED);
@@ -648,18 +611,6 @@ void UpdateTickBuffers()
    }
    spreadBuffer[0] = currentSpread;
    
-   // Track average spread for dynamic filtering
-   if(spreadSampleCount < 100)
-   {
-      averageSpread = (averageSpread * spreadSampleCount + currentSpread) / (spreadSampleCount + 1);
-      spreadSampleCount++;
-   }
-   else
-   {
-      // Rolling average (exponential moving average)
-      averageSpread = averageSpread * 0.99 + currentSpread * 0.01;
-   }
-   
    tickIndex++;
    spreadIndex++;
    
@@ -827,7 +778,6 @@ void UpdateDailyTracking()
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
    int currentDay = dt.day;
-   int currentHour = dt.hour;
    
    if(currentDay != lastDay)
    {
@@ -835,21 +785,8 @@ void UpdateDailyTracking()
       dailyProfitLoss = 0.0;
       consecutiveLosses = 0;
       cooldownUntil = 0;
-      tradesToday = 0;
-      tradesThisHour = 0;
-      totalLossesToday = 0;
-      currentRiskMultiplier = 1.0;
-      recoveryMode = false;
-      sessionStartEquity = AccountEquity();
       lastDay = currentDay;
       Print("New trading day - Daily tracking reset");
-   }
-   
-   // Reset hourly trade counter
-   if(currentHour != lastTradeHour)
-   {
-      tradesThisHour = 0;
-      lastTradeHour = currentHour;
    }
    
    // Update daily P&L
@@ -859,20 +796,6 @@ void UpdateDailyTracking()
    double currentEquity = AccountEquity();
    if(currentEquity > sessionHighEquity)
       sessionHighEquity = currentEquity;
-   
-   // Update recovery mode status
-   if(totalLossesToday >= RecoveryModeThreshold && !recoveryMode)
-   {
-      recoveryMode = true;
-      currentRiskMultiplier = RecoveryModeRiskMultiplier;
-      Print("RECOVERY MODE ACTIVATED - Risk reduced to ", DoubleToString(currentRiskMultiplier * 100, 1), "%");
-   }
-   else if(totalLossesToday < RecoveryModeThreshold && recoveryMode)
-   {
-      recoveryMode = false;
-      currentRiskMultiplier = 1.0;
-      Print("Recovery mode deactivated - Normal risk restored");
-   }
 }
 
 bool CheckRiskManagement()
@@ -906,19 +829,6 @@ bool CheckRiskManagement()
       return false;
    }
    
-   // Check daily profit target
-   double dailyProfitPercent = (dailyProfitLoss / dailyStartBalance) * 100.0;
-   if(dailyProfitPercent >= DailyProfitTargetPercent)
-   {
-      static int lastWarning = 0;
-      if(TimeCurrent() - lastWarning > 60)  // Warn once per minute
-      {
-         Print("Trading BLOCKED - Daily profit target reached: ", DoubleToString(dailyProfitPercent, 2), "%");
-         lastWarning = TimeCurrent();
-      }
-      return false;
-   }
-   
    // Check maximum drawdown
    double currentDrawdown = ((sessionHighEquity - AccountEquity()) / sessionHighEquity) * 100.0;
    if(currentDrawdown >= MaxDrawdownPercent)
@@ -932,44 +842,7 @@ bool CheckRiskManagement()
       return false;
    }
    
-   // Check equity protection
-   double equityDropPercent = ((sessionStartEquity - AccountEquity()) / sessionStartEquity) * 100.0;
-   if(equityDropPercent >= EquityProtectionPercent)
-   {
-      static int lastWarning = 0;
-      if(TimeCurrent() - lastWarning > 60)  // Warn once per minute
-      {
-         Print("Trading BLOCKED - Equity protection triggered: ", DoubleToString(equityDropPercent, 2), "% drop");
-         lastWarning = TimeCurrent();
-      }
-      return false;
-   }
-   
-   // Check maximum trades per day
-   if(MaxTradesPerDay > 0 && tradesToday >= MaxTradesPerDay)
-   {
-      static int lastWarning = 0;
-      if(TimeCurrent() - lastWarning > 60)  // Warn once per minute
-      {
-         Print("Trading BLOCKED - Maximum trades per day reached: ", tradesToday, "/", MaxTradesPerDay);
-         lastWarning = TimeCurrent();
-      }
-      return false;
-   }
-   
-   // Check maximum trades per hour
-   if(MaxTradesPerHour > 0 && tradesThisHour >= MaxTradesPerHour)
-   {
-      static int lastWarning = 0;
-      if(TimeCurrent() - lastWarning > 30)  // Warn every 30 seconds
-      {
-         Print("Trading BLOCKED - Maximum trades per hour reached: ", tradesThisHour, "/", MaxTradesPerHour);
-         lastWarning = TimeCurrent();
-      }
-      return false;
-   }
-   
-   // Check spread - absolute limit
+   // Check spread
    double currentSpread = (Ask - Bid) / pipToPoint;
    if(currentSpread > MaxSpreadPips)
    {
@@ -977,53 +850,6 @@ bool CheckRiskManagement()
       if(TimeCurrent() - lastWarning > 30)  // Warn every 30 seconds
       {
          Print("Trading BLOCKED - Spread too wide: ", DoubleToString(currentSpread, 1), " pips (Max: ", MaxSpreadPips, ")");
-         lastWarning = TimeCurrent();
-      }
-      return false;
-   }
-   
-   // Check spread - relative to average
-   if(spreadSampleCount >= 10 && averageSpread > 0.0)
-   {
-      double avgSpreadPips = averageSpread / pipToPoint;
-      if(currentSpread > avgSpreadPips * MaxSpreadMultiplier)
-      {
-         static int lastWarning = 0;
-         if(TimeCurrent() - lastWarning > 30)  // Warn every 30 seconds
-         {
-            Print("Trading BLOCKED - Spread too wide relative to average: ", DoubleToString(currentSpread, 1), 
-                  " pips (Avg: ", DoubleToString(avgSpreadPips, 1), " x ", MaxSpreadMultiplier, ")");
-            lastWarning = TimeCurrent();
-         }
-         return false;
-      }
-   }
-   
-   // Check maximum position size
-   double totalVolume = 0.0;
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket > 0)
-      {
-         if(PositionSelectByTicket(ticket))
-         {
-            if(PositionGetString(POSITION_SYMBOL) == Symbol() && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
-            {
-               totalVolume += PositionGetDouble(POSITION_VOLUME);
-            }
-         }
-      }
-   }
-   
-   double balance = AccountBalance();
-   double maxVolume = (balance * MaxPositionSizePercent / 100.0) / (balance * RiskPercentPerTrade / 100.0);
-   if(maxVolume > 0 && totalVolume >= maxVolume)
-   {
-      static int lastWarning = 0;
-      if(TimeCurrent() - lastWarning > 30)  // Warn every 30 seconds
-      {
-         Print("Trading BLOCKED - Maximum position size reached: ", DoubleToString(totalVolume, 2), " lots");
          lastWarning = TimeCurrent();
       }
       return false;
@@ -1039,20 +865,10 @@ bool CheckRiskManagement()
 double CalculateRiskLotSize()
 {
    double balance = AccountBalance();
+   double riskMoney = balance * (RiskPercentPerTrade / 100.0);
    
-   // Apply dynamic risk multiplier
-   double effectiveRiskPercent = RiskPercentPerTrade * currentRiskMultiplier;
-   
-   // Apply recovery mode multiplier if active
-   if(recoveryMode)
-   {
-      effectiveRiskPercent *= RecoveryModeRiskMultiplier;
-   }
-   
-   double riskMoney = balance * (effectiveRiskPercent / 100.0);
-   
-   double tickValue = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_VALUE);
-   double tickSize = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = MarketInfo(Symbol(), MODE_TICKVALUE);
+   double tickSize = MarketInfo(Symbol(), MODE_TICKSIZE);
    double pipValuePerLot = 0.0;
    
    if(tickSize > 0)
@@ -1061,15 +877,15 @@ double CalculateRiskLotSize()
    if(pipValuePerLot <= 0.0)
    {
       Print("ERROR: Cannot calculate pip value. Using minimum lot.");
-      return SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN);
+      return MarketInfo(Symbol(), MODE_MINLOT);
    }
    
    double virtualSL_Pips = 10.0;   // virtual stop to size lots for HFT
    double lot = riskMoney / (virtualSL_Pips * pipValuePerLot);
    
-   double minLot = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN);
-   double maxLot = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MAX);
-   double lotStep = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP);
+   double minLot = MarketInfo(Symbol(), MODE_MINLOT);
+   double maxLot = MarketInfo(Symbol(), MODE_MAXLOT);
+   double lotStep = MarketInfo(Symbol(), MODE_LOTSTEP);
    
    lot = MathFloor(lot / lotStep) * lotStep;
    if(lot < minLot) lot = minLot;
@@ -1158,16 +974,8 @@ bool OpenHFTrade(int direction)
          hasActiveTrade = true;
          highestProfit = 0.0;
          
-         // Increment trade counters
-         tradesToday++;
-         tradesThisHour++;
-         MqlDateTime dt;
-         TimeToStruct(TimeCurrent(), dt);
-         lastTradeHour = dt.hour;
-         
          Print("HFT TRADE OPENED: ", (direction == 1 ? "BUY" : "SELL"), 
-               " | Lot: ", tradeLots, " | Risk: ", DoubleToString(RiskPercentPerTrade * currentRiskMultiplier, 2), 
-               "% | Price: ", price, " | Trades Today: ", tradesToday);
+               " | Lot: ", tradeLots, " | Risk: ", RiskPercentPerTrade, "% | Price: ", price);
          return true;
       }
    }
@@ -1236,20 +1044,11 @@ void CloseHFTrade(string reason)
       // Update risk management tracking
       UpdateDailyTracking();
       
-      // Track consecutive losses and update dynamic risk
+      // Track consecutive losses
       if(profit < 0)
       {
          consecutiveLosses++;
-         totalLossesToday++;
          Print("Consecutive losses: ", consecutiveLosses, "/", ConsecutiveLossLimit);
-         
-         // Update dynamic risk multiplier (reduce risk after loss)
-         if(UseDynamicRisk)
-         {
-            currentRiskMultiplier *= RiskReductionOnLoss;
-            if(currentRiskMultiplier < 0.1) currentRiskMultiplier = 0.1;  // Minimum 10% risk
-            Print("Risk reduced to ", DoubleToString(currentRiskMultiplier * 100, 1), "% after loss");
-         }
          
          // Activate cooldown if consecutive loss limit reached
          if(consecutiveLosses >= ConsecutiveLossLimit)
@@ -1263,14 +1062,6 @@ void CloseHFTrade(string reason)
       {
          // Reset consecutive losses on profitable trade
          consecutiveLosses = 0;
-         
-         // Update dynamic risk multiplier (increase risk after win)
-         if(UseDynamicRisk)
-         {
-            currentRiskMultiplier *= RiskIncreaseOnWin;
-            if(currentRiskMultiplier > 2.0) currentRiskMultiplier = 2.0;  // Maximum 200% risk
-            Print("Risk increased to ", DoubleToString(currentRiskMultiplier * 100, 1), "% after win");
-         }
       }
       
       // Track pattern sequence progress
@@ -1333,17 +1124,12 @@ void UpdateDisplay()
    // Risk Management Status
    display += "\n--- RISK MANAGEMENT ---\n";
    double dailyLossPercent = (dailyProfitLoss / dailyStartBalance) * 100.0;
-   double dailyProfitPercent = (dailyProfitLoss / dailyStartBalance) * 100.0;
    double currentDrawdown = sessionHighEquity > 0 ? ((sessionHighEquity - AccountEquity()) / sessionHighEquity) * 100.0 : 0.0;
-   double equityDropPercent = sessionStartEquity > 0 ? ((sessionStartEquity - AccountEquity()) / sessionStartEquity) * 100.0 : 0.0;
    double currentSpread = (Ask - Bid) / pipToPoint;
-   double avgSpreadPips = (spreadSampleCount > 0 && averageSpread > 0) ? (averageSpread / pipToPoint) : 0.0;
    
    display += "Daily P&L: $" + DoubleToString(dailyProfitLoss, 2) + " (" + DoubleToString(dailyLossPercent, 2) + "%)";
    if(dailyLossPercent <= -DailyLossLimitPercent)
-      display += " [LOSS LIMIT]";
-   if(dailyProfitPercent >= DailyProfitTargetPercent)
-      display += " [PROFIT TARGET]";
+      display += " [LIMIT REACHED]";
    display += "\n";
    
    display += "Drawdown: " + DoubleToString(currentDrawdown, 2) + "%";
@@ -1351,37 +1137,12 @@ void UpdateDisplay()
       display += " [LIMIT REACHED]";
    display += "\n";
    
-   display += "Equity Drop: " + DoubleToString(equityDropPercent, 2) + "%";
-   if(equityDropPercent >= EquityProtectionPercent)
-      display += " [PROTECTION TRIGGERED]";
-   display += "\n";
-   
    display += "Spread: " + DoubleToString(currentSpread, 1) + " pips";
-   if(avgSpreadPips > 0)
-      display += " (Avg: " + DoubleToString(avgSpreadPips, 1) + ")";
    if(currentSpread > MaxSpreadPips)
       display += " [TOO WIDE]";
-   else if(avgSpreadPips > 0 && currentSpread > avgSpreadPips * MaxSpreadMultiplier)
-      display += " [RELATIVE LIMIT]";
    display += "\n";
    
-   display += "Trades Today: " + IntegerToString(tradesToday);
-   if(MaxTradesPerDay > 0)
-      display += "/" + IntegerToString(MaxTradesPerDay);
-   display += " | This Hour: " + IntegerToString(tradesThisHour);
-   if(MaxTradesPerHour > 0)
-      display += "/" + IntegerToString(MaxTradesPerHour);
-   display += "\n";
-   
-   display += "Consecutive Losses: " + IntegerToString(consecutiveLosses) + "/" + IntegerToString(ConsecutiveLossLimit);
-   if(totalLossesToday > 0)
-      display += " | Total Losses Today: " + IntegerToString(totalLossesToday);
-   display += "\n";
-   
-   if(recoveryMode)
-      display += "RECOVERY MODE: ACTIVE (Risk: " + DoubleToString(currentRiskMultiplier * 100, 1) + "%)\n";
-   else if(UseDynamicRisk)
-      display += "Dynamic Risk: " + DoubleToString(currentRiskMultiplier * 100, 1) + "%\n";
+   display += "Consecutive Losses: " + IntegerToString(consecutiveLosses) + "/" + IntegerToString(ConsecutiveLossLimit) + "\n";
    
    if(cooldownUntil > 0 && TimeCurrent() < cooldownUntil)
    {
