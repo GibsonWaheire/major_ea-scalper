@@ -166,3 +166,4 @@ MeanReversionScalperMT5/
 
 - **v2.00**: Current MT4 version with dynamic lot sizing
 - **v1.10**: Previous version (referenced in code comments)
+

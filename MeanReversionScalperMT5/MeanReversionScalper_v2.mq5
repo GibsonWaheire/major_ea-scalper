@@ -1032,3 +1032,4 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
       UpdateTradeInfo();
    }
 }
+

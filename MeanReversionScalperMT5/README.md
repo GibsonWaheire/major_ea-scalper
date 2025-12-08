@@ -121,3 +121,4 @@ See `EA_SUMMARY.md` for complete parameter list.
 - Test thoroughly in demo before live trading
 - Monitor spread conditions, especially for scalping
 - Consider broker-specific requirements (ECN/STP)
+
