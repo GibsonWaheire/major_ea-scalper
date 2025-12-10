@@ -60,6 +60,16 @@ input bool     UseAnchorMode           = true;   // Treat first trade as anchor 
 input double   AnchorLotSize           = 0.03;   // Anchor trade lot size (smaller to reduce risk)
 input double   AnchorStopLossPips      = 300.0;  // Close anchor if loss exceeds this many pips
 
+input group "===== Dynamic Leverage Strategy ====="
+input bool     UseDynamicLeverage      = true;   // Enable dynamic lot sizing based on win/loss streaks
+input double   LossMultiplier           = 1.5;    // Lot multiplier after consecutive losses (1.2-2.0)
+input double   WinMultiplier            = 1.2;    // Lot multiplier after consecutive wins (1.1-1.5)
+input double   MaxLotSize               = 0.15;   // Maximum lot size (safety limit)
+input double   MinLotSize               = 0.01;   // Minimum lot size (safety limit)
+input int      MaxConsecutiveLosses     = 3;      // Reset leverage after this many losses (safety)
+input int      MaxConsecutiveWins       = 5;      // Reset leverage after this many wins (lock profits)
+input bool     ResetOnBasketClose       = true;   // Reset win/loss streak when basket closes
+
 // =====================================================================================================
 // STRUCTURES & GLOBALS
 // =====================================================================================================
@@ -111,6 +121,11 @@ int    anchorDirection = 0;   // 1=BUY, -1=SELL
 double anchorEntryPrice = 0.0;
 datetime anchorOpenTime = 0;
 
+// Leverage strategy tracking
+int consecutiveWins = 0;
+int consecutiveLosses = 0;
+double baseLotSize = 0.0;  // Base lot size for calculations
+
 // Market data
 double pipToPoint = 0.0;
 int symbolDigits = 0;
@@ -156,6 +171,11 @@ int OnInit()
    anchorDirection = 0;
    anchorEntryPrice = 0.0;
    anchorOpenTime = 0;
+   
+   // Initialize leverage strategy
+   consecutiveWins = 0;
+   consecutiveLosses = 0;
+   baseLotSize = LotSize;
    
    // Initialize arrays
    for(int i = 0; i < 10; i++)
@@ -464,21 +484,26 @@ void LookForEntry()
    }
    
    // Open trade
-   double lotToUse = LotSize;
+   double lotToUse = CalculateDynamicLotSize();
    bool isRecovery = false;
    
-   if(totalActiveTrades > 0 && recoveryTradesAdded < MaxRecoveryTrades)
+   // If this is the first trade and anchor mode is enabled, use anchor lot size
+   if(UseAnchorMode && totalActiveTrades == 0 && anchorTicket == 0)
+   {
+      lotToUse = CalculateDynamicLotSize(AnchorLotSize);
+   }
+   else if(totalActiveTrades > 0 && recoveryTradesAdded < MaxRecoveryTrades)
    {
       // Check if we should add recovery trade
       if(CheckIfRecoveryNeeded())
       {
-         lotToUse = RecoveryLotSize;
+         lotToUse = CalculateDynamicLotSize(RecoveryLotSize);
          isRecovery = true;
       }
       else if(totalActiveTrades < (1 + AdditionalTrades))
       {
          // Add additional small trade
-         lotToUse = RecoveryLotSize; // Use smaller lot for additional trades
+         lotToUse = CalculateDynamicLotSize(RecoveryLotSize); // Use smaller base for additional trades
       }
       else
       {
@@ -583,6 +608,88 @@ bool CheckIfRecoveryNeeded()
    }
    
    return false;
+}
+
+// =====================================================================================================
+// DYNAMIC LEVERAGE STRATEGY
+// =====================================================================================================
+
+double CalculateDynamicLotSize(double baseLot = 0.0)
+{
+   if(baseLot <= 0.0)
+      baseLot = LotSize;
+   
+   if(!UseDynamicLeverage)
+      return baseLot;
+   
+   double calculatedLot = baseLot;
+   
+   // Apply loss multiplier (martingale-style for recovery)
+   if(consecutiveLosses > 0)
+   {
+      // Increase lot size after losses (up to max consecutive losses)
+      int effectiveLosses = MathMin(consecutiveLosses, MaxConsecutiveLosses);
+      calculatedLot = baseLot * MathPow(LossMultiplier, effectiveLosses);
+   }
+   // Apply win multiplier (anti-martingale for profit growth)
+   else if(consecutiveWins > 0)
+   {
+      // Increase lot size after wins (up to max consecutive wins)
+      int effectiveWins = MathMin(consecutiveWins, MaxConsecutiveWins);
+      calculatedLot = baseLot * MathPow(WinMultiplier, effectiveWins);
+   }
+   
+   // Apply safety limits
+   calculatedLot = MathMax(MinLotSize, MathMin(MaxLotSize, calculatedLot));
+   
+   // Normalize to broker's lot step
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(lotStep > 0.0)
+      calculatedLot = MathFloor(calculatedLot / lotStep) * lotStep;
+   
+   // Ensure it's at least minimum lot
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   calculatedLot = MathMax(minLot, calculatedLot);
+   
+   return NormalizeDouble(calculatedLot, 2);
+}
+
+void UpdateWinLossStreak(double tradeProfit)
+{
+   if(tradeProfit > 0.0)
+   {
+      // Winning trade
+      consecutiveWins++;
+      consecutiveLosses = 0; // Reset loss streak
+      
+      // Safety: reset after max wins to lock in profits
+      if(consecutiveWins >= MaxConsecutiveWins)
+      {
+         Print("Leverage reset: Max consecutive wins (", MaxConsecutiveWins, ") reached. Locking profits.");
+         consecutiveWins = 0;
+      }
+   }
+   else if(tradeProfit < 0.0)
+   {
+      // Losing trade
+      consecutiveLosses++;
+      consecutiveWins = 0; // Reset win streak
+      
+      // Safety: reset after max losses to prevent excessive risk
+      if(consecutiveLosses >= MaxConsecutiveLosses)
+      {
+         Print("Leverage reset: Max consecutive losses (", MaxConsecutiveLosses, ") reached. Reducing risk.");
+         consecutiveLosses = 0;
+      }
+   }
+   // If profit == 0, don't change streaks (breakeven)
+}
+
+void ResetWinLossStreak()
+{
+   consecutiveWins = 0;
+   consecutiveLosses = 0;
+   Print("Win/Loss streak reset");
 }
 
 bool OpenTrade(int direction, double lotSize, bool isRecovery)
@@ -933,7 +1040,7 @@ void CheckBasketBreakeven()
    }
 }
 
-void CloseTrade(int index, string reason)
+void CloseTrade(int index, string reason, bool updateStreak = true)
 {
    if(index < 0 || index >= totalActiveTrades)
       return;
@@ -956,6 +1063,13 @@ void CloseTrade(int index, string reason)
    if(closed)
    {
       Print("Trade closed: ", reason, " | P&L: $", DoubleToString(profit, 2));
+      
+      // Update win/loss streak for individual trade (skip if called from basket close)
+      if(updateStreak && reason != "Basket breakeven/profit target")
+      {
+         UpdateWinLossStreak(profit);
+      }
+      
       RemoveTrade(index);
    }
    else
@@ -968,12 +1082,35 @@ void CloseAllTrades(string reason)
 {
    Print("Closing all trades: ", reason);
    
+   // Calculate total basket profit before closing
+   double totalBasketProfit = 0.0;
+   for(int i = 0; i < totalActiveTrades; i++)
+   {
+      if(activeTrades[i].ticket > 0 && PositionSelectByTicket(activeTrades[i].ticket))
+      {
+         totalBasketProfit += PositionGetDouble(POSITION_PROFIT) + 
+                             PositionGetDouble(POSITION_SWAP);
+      }
+   }
+   
+   // Close all trades without updating streak (we'll do it once at the end)
    for(int i = totalActiveTrades - 1; i >= 0; i--)
    {
       if(activeTrades[i].ticket > 0)
       {
-         CloseTrade(i, reason);
+         CloseTrade(i, reason, false); // Don't update streak for individual trades
       }
+   }
+   
+   // Update win/loss streak based on basket result (once for the whole basket)
+   if(ResetOnBasketClose)
+   {
+      ResetWinLossStreak();
+   }
+   else
+   {
+      // Update streak based on total basket profit
+      UpdateWinLossStreak(totalBasketProfit);
    }
    
    recoveryTradesAdded = 0;
@@ -1049,6 +1186,18 @@ void UpdateDisplay()
    if(currentDrawdown > MaxRecoveryDD)
       status += " [LIMIT]";
    status += "\n";
+   if(UseDynamicLeverage)
+   {
+      status += "\n--- Leverage Strategy ---\n";
+      status += "Consecutive Wins: " + IntegerToString(consecutiveWins);
+      if(consecutiveWins > 0)
+         status += " (Lot: " + DoubleToString(CalculateDynamicLotSize(), 2) + ")";
+      status += "\n";
+      status += "Consecutive Losses: " + IntegerToString(consecutiveLosses);
+      if(consecutiveLosses > 0)
+         status += " (Lot: " + DoubleToString(CalculateDynamicLotSize(), 2) + ")";
+      status += "\n";
+   }
    status += "\n--- Account ---\n";
    status += "Balance: $" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + "\n";
    status += "Equity: $" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + "\n";

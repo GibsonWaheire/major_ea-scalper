@@ -219,3 +219,4 @@ For issues or questions, please refer to the code comments or contact support.
 **Disclaimer**: This EA is for educational and research purposes. Trading involves risk. Past performance does not guarantee future results. Always test thoroughly on demo accounts before live trading.
 
 
+

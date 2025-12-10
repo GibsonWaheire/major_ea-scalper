@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Script to copy HyperactivePulseScalper.mq5 to MetaTrader 5 Experts folder
-# Usage: ./copy_hyperactive_to_mt5.sh
+# Script to copy HybridTrendPullbackMT5 folder to MetaTrader 5 Experts folder
+# Usage: ./copy_hybrid_trend_to_mt5.sh
 
 # Colors for output
 GREEN='\033[0;32m'
@@ -9,8 +9,8 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
-# Source file
-SOURCE_FILE="HyperactivePulseScalper/HyperactivePulseScalper.mq5"
+# Source folder
+SOURCE_FOLDER="HybridTrendPullbackMT5"
 
 # Common MetaTrader 5 destination paths (macOS)
 MT5_PATHS=(
@@ -20,13 +20,13 @@ MT5_PATHS=(
 )
 
 echo "=========================================="
-echo "HyperactivePulseScalper - MetaTrader 5 Copy Script"
+echo "HybridTrendPullbackMT5 - MetaTrader 5 Copy Script"
 echo "=========================================="
 echo ""
 
-# Check if source file exists
-if [ ! -f "$SOURCE_FILE" ]; then
-    echo -e "${RED}ERROR: Source file not found: $SOURCE_FILE${NC}"
+# Check if source folder exists
+if [ ! -d "$SOURCE_FOLDER" ]; then
+    echo -e "${RED}ERROR: Source folder not found: $SOURCE_FOLDER${NC}"
     echo "Please make sure you're running this script from the project root directory."
     exit 1
 fi
@@ -54,9 +54,9 @@ if [ -z "$MT5_EXPERTS_DIR" ]; then
     if [ -z "$MT5_EXPERTS_DIR" ]; then
         echo -e "${RED}ERROR: MetaTrader 5 Experts directory not found!${NC}"
         echo ""
-        echo "Please manually copy the file:"
-        echo "  From: $(pwd)/$SOURCE_FILE"
-        echo "  To:   [Your MT5 Installation]/MQL5/Experts/HyperactivePulseScalper.mq5"
+        echo "Please manually copy the folder:"
+        echo "  From: $(pwd)/$SOURCE_FOLDER"
+        echo "  To:   [Your MT5 Installation]/MQL5/Experts/HybridTrendPullbackMT5"
         echo ""
         echo "Common locations:"
         for path in "${MT5_PATHS[@]}"; do
@@ -66,44 +66,41 @@ if [ -z "$MT5_EXPERTS_DIR" ]; then
     fi
 fi
 
-DEST_FILE="$MT5_EXPERTS_DIR/HyperactivePulseScalper.mq5"
+DEST_FOLDER="$MT5_EXPERTS_DIR/HybridTrendPullbackMT5"
 
 echo "Found MetaTrader 5 directory:"
 echo "  $MT5_EXPERTS_DIR"
 echo ""
 
-# Create backup of existing file if it exists
-if [ -f "$DEST_FILE" ]; then
-    BACKUP_FILE="${DEST_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
-    echo -e "${YELLOW}Backing up existing file to: $BACKUP_FILE${NC}"
-    cp "$DEST_FILE" "$BACKUP_FILE"
+# Create backup of existing folder if it exists
+if [ -d "$DEST_FOLDER" ]; then
+    BACKUP_FOLDER="${DEST_FOLDER}.backup.$(date +%Y%m%d_%H%M%S)"
+    echo -e "${YELLOW}Backing up existing folder to: $BACKUP_FOLDER${NC}"
+    cp -r "$DEST_FOLDER" "$BACKUP_FOLDER"
 fi
 
-# Copy the file
-echo "Copying $SOURCE_FILE to MetaTrader 5..."
-cp "$SOURCE_FILE" "$DEST_FILE"
+# Copy the folder (with all subdirectories)
+echo "Copying $SOURCE_FOLDER to MetaTrader 5..."
+cp -r "$SOURCE_FOLDER" "$MT5_EXPERTS_DIR/"
 
 # Check if copy was successful
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}✓ Successfully copied to MetaTrader 5!${NC}"
     echo ""
-    echo "File location: $DEST_FILE"
+    echo "Folder location: $DEST_FOLDER"
     echo ""
     echo "Next steps:"
     echo "1. Open MetaTrader 5"
     echo "2. Press F4 to open MetaEditor"
-    echo "3. Find 'HyperactivePulseScalper.mq5' in the Navigator (under Experts)"
+    echo "3. Find 'HybridTrendPullbackMT5.mq5' in the Navigator (under Experts)"
     echo "4. Press F7 to compile"
-    echo "5. Drag the EA onto a chart to use it"
+    echo "5. Drag the EA onto XAUUSD M5 chart to use it"
     echo ""
     echo -e "${GREEN}Done!${NC}"
 else
-    echo -e "${RED}ERROR: Failed to copy file!${NC}"
+    echo -e "${RED}ERROR: Failed to copy folder!${NC}"
     exit 1
 fi
-
-
-
 
 
 

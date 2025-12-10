@@ -1033,3 +1033,4 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
    }
 }
 
+

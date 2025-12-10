@@ -832,3 +832,4 @@ MinATRExitPips = 0.5;
 
 
 
+

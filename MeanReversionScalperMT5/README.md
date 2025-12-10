@@ -122,3 +122,4 @@ See `EA_SUMMARY.md` for complete parameter list.
 - Monitor spread conditions, especially for scalping
 - Consider broker-specific requirements (ECN/STP)
 
+

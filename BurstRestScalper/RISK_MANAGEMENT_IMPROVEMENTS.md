@@ -174,3 +174,4 @@ The current risk management allows for **20% account risk per basket**, which is
 
 
 
+

@@ -153,3 +153,4 @@ This EA is designed for ultra-fast scalping with high trade frequency. It:
 
 
 
+
