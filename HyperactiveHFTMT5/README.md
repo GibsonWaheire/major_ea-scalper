@@ -172,3 +172,16 @@ For issues, questions, or feature requests, please refer to the main repository 
 **Disclaimer**: This EA is provided as-is for educational and research purposes. Trading involves substantial risk of loss. Past performance does not guarantee future results.
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+

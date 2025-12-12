@@ -8,7 +8,7 @@
 CTrade trade;
 
 // CRITICAL FIX: Re-enabled stop loss to prevent catastrophic losses
-#define FIXED_STOP_LOSS_PIPS 50.0  // CRITICAL: Stop loss re-enabled (50 pips)
+#define FIXED_STOP_LOSS_PIPS 100.0  // CRITICAL: Stop loss re-enabled (100 pips)
 
 input group "===== Dynamic Lot Sizing ====="
 input double   AccountBalance_10K  = 1000000.0;
@@ -19,9 +19,10 @@ input double   MaxLotSize          = 0.05;  // CRITICAL FIX: Reduced from 1.0 to
 
 input group "===== Core Trading Settings ====="
 input int      MagicNumber         = 202503;
-input int      MaxTrades           = 3;     // CRITICAL FIX: Further reduced to prevent over-trading
+input int      MaxTrades           = 5;     // Allow up to 5 trades as long as previous is profitable
 input int      TradesPerBurst      = 1;    // CRITICAL FIX: Only 1 trade per burst to prevent rapid losses
 input int      BurstDelayMS        = 500;  // FIXED: Increased delay to avoid hyperactivity
+input double   MinPreviousTradeProfitPips = 10.0;  // NEW: Minimum profit in pips required on previous trade before opening new one
 
 input group "===== Adaptive Profit Engine ====="
 enum EquityTargetPresetOption
@@ -66,6 +67,8 @@ input bool     UseTrailingStop      = true;
 input double   TrailingStartPercent = 30.0;    // NEW: Start trailing at X% profit
 input double   TrailingStepPercent  = 10.0;    // NEW: Trail by X% of profit
 input double   PerTradeProfitLock   = 5000.0;  // Close individual positions once profit exceeds this amount
+input double   MinProfitPipsToClose = 20.0;    // NEW: Minimum profit in pips before closing (20+ pips)
+input double   MaxProfitPipsToClose = 100.0;   // NEW: Maximum profit in pips before closing
 
 input group "===== Instant Profit Exit (Profit-Based) ====="
 input bool     UseInstantProfitExit = true;   // FIXED: Enabled for instant profit
@@ -75,6 +78,8 @@ input bool     UseProfitDouble      = true;   // NEW: Close when profit doubles 
 input group "===== Lot Growth Settings ====="
 input double   ProfitStepForLotIncrease= 20.0;     // Increase lot size every X profit
 input double   LotIncrementPerStep     = 0.01;     // Additional lot size per profit step
+input double   BaseLotPercentRisk      = 1.0;      // NEW: Base lot size as % of account balance
+input double   MaxLotPercentRisk       = 5.0;      // NEW: Maximum lot size as % of account balance (after wins)
 
 input group "===== CRITICAL RISK PROTECTION ====="
 input bool     OnlyCloseInProfit      = false;     // CRITICAL FIX: Allow closing losing trades if drawdown too high
@@ -139,6 +144,12 @@ double initialAccountBalance = 0.0;
 double highestAccountBalance = 0.0;
 bool emergencyStopActive = false;
 double dailyLossUSD = 0.0;
+
+// NEW: Dynamic lot sizing based on wins/losses
+int consecutiveWins = 0;
+int consecutiveLossesForLot = 0;
+double currentLotPercent = 1.0;  // Start at 1% risk
+double lastClosedTradePL = 0.0;
 
 // MT5 indicator handles
 int emaFastHandle = INVALID_HANDLE;
@@ -213,9 +224,9 @@ double GetPositionProfitValue(ulong ticket)
 {
    if(!SelectPosition(ticket))
       return 0.0;
+   // In MT5, POSITION_PROFIT already includes commission, only add swap
    return PositionGetDouble(POSITION_PROFIT) +
-          PositionGetDouble(POSITION_SWAP) +
-          PositionGetDouble(POSITION_COMMISSION);
+          PositionGetDouble(POSITION_SWAP);
 }
 
 double GetHistoricalPositionProfit(ulong ticket, datetime openTime)
@@ -312,16 +323,16 @@ int OnInit()
    trade.SetDeviationInPoints(3);
 
    // CRITICAL: Initialize risk protection
-   initialAccountBalance = AccountBalance();
-   highestAccountBalance = AccountBalance();
+   initialAccountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   highestAccountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    emergencyStopActive = false;
    dailyLossUSD = 0.0;
    Print("========================================");
    Print("Strategy: Ultra-Fast Tick-Based Scalping");
-   Print("Symbol: ", Symbol());
+   Print("Symbol: ", _Symbol);
    Print("Timeframe: ", Period());
 
-   if(UseGoldOnly && Symbol() != "XAUUSD")
+   if(UseGoldOnly && _Symbol != "XAUUSD")
    {
       Alert("ERROR: This EA is optimized for XAUUSD only!");
       return(INIT_FAILED);
@@ -343,8 +354,8 @@ int OnInit()
       activeTrades[i].lowWatermark = 0;
    }
 
-   double minStopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   (void)minStopLevel; // Maintain reference (logic unchanged)
+   long minStopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   // minStopLevel available if needed for validation
 
    emaFastHandle = iMA(_Symbol, PERIOD_M1, TrendPeriod, 0, MODE_EMA, PRICE_CLOSE);
    emaSlowHandle = iMA(_Symbol, PERIOD_M1, TrendPeriod * 2, 0, MODE_EMA, PRICE_CLOSE);
@@ -357,6 +368,12 @@ int OnInit()
    }
 
    double initTarget = GetEquityTargetPercent();
+   
+   // Initialize lot sizing variables
+   consecutiveWins = 0;
+   consecutiveLossesForLot = 0;
+   currentLotPercent = BaseLotPercentRisk;
+   lastClosedTradePL = 0.0;
 
    Print("Initialization successful!");
    Print("========================================");
@@ -365,9 +382,12 @@ int OnInit()
          (UseRiskRewardTarget ? "ON" : "OFF"), " (x", DoubleToString(RiskRewardMultiplier, 2),
          ") | Giveback: ", DoubleToString(PeakGivebackPercent, 2), "%");
    Print("Minimum Hold: ", MinimumHoldMS, " ms | Max Spread: ", MaxSpreadPips, " pips");
-   Print("Lot Bounds: Min=", MinLotSize, " | Max=", MaxLotSize,
-         " | Step Growth: +", DoubleToString(LotIncrementPerStep, 2),
-         " per ", DoubleToString(ProfitStepForLotIncrease, 2), " profit");
+   Print("Profit Close Range: ", DoubleToString(MinProfitPipsToClose, 1), "-", DoubleToString(MaxProfitPipsToClose, 1), " pips");
+   Print("Stop Loss: ", DoubleToString(FIXED_STOP_LOSS_PIPS, 1), " pips");
+   Print("Dynamic Lot Sizing: ", DoubleToString(BaseLotPercentRisk, 1), "% to ", DoubleToString(MaxLotPercentRisk, 1), "% of account");
+   Print("Previous Trade Check: Must be +", DoubleToString(MinPreviousTradeProfitPips, 1), " pips before new trade");
+   Print("Max Trades: ", MaxTrades, " (as long as previous is profitable)");
+   Print("Lot Bounds: Min=", MinLotSize, " | Max=", MaxLotSize);
    Print("========================================");
 
    return(INIT_SUCCEEDED);
@@ -423,34 +443,52 @@ void OnTick()
 
 double CalculateDynamicLotSize()
 {
-   double currentBalance = AccountBalance();
-
-   double baseLot = MinLotSize;
-
-   if(currentBalance >= AccountBalance_10K)
+   double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   
+   // NEW: Calculate lot size based on win/loss streak (1% to 5% of account)
+   double riskPercent = currentLotPercent;
+   riskPercent = MathMax(riskPercent, BaseLotPercentRisk);
+   riskPercent = MathMin(riskPercent, MaxLotPercentRisk);
+   
+   // Calculate lot size based on risk percentage
+   // Assuming 1% risk means risking 1% of account balance
+   // For simplicity, we'll use account balance to determine lot size
+   double accountRiskAmount = currentBalance * (riskPercent / 100.0);
+   
+   // Calculate lot size based on stop loss distance
+   double stopLossPips = FIXED_STOP_LOSS_PIPS;
+   double pipValuePerLot = GetPipValuePerLot();
+   
+   double calculatedLot = MinLotSize;
+   if(pipValuePerLot > 0 && stopLossPips > 0)
    {
-      baseLot = MathMax(baseLot, 0.10);
+      calculatedLot = accountRiskAmount / (stopLossPips * pipValuePerLot);
    }
-   else if(currentBalance >= AccountBalance_1500)
+   else
    {
-      baseLot = MathMax(baseLot, 0.08);
-   }
-   else if(currentBalance >= AccountBalance_100)
-   {
-      baseLot = MathMax(baseLot, 0.05);
+      // Fallback calculation based on account balance
+      if(currentBalance >= AccountBalance_10K)
+      {
+         calculatedLot = MathMax(MinLotSize, 0.10 * (riskPercent / BaseLotPercentRisk));
+      }
+      else if(currentBalance >= AccountBalance_1500)
+      {
+         calculatedLot = MathMax(MinLotSize, 0.08 * (riskPercent / BaseLotPercentRisk));
+      }
+      else if(currentBalance >= AccountBalance_100)
+      {
+         calculatedLot = MathMax(MinLotSize, 0.05 * (riskPercent / BaseLotPercentRisk));
+      }
+      else
+      {
+         calculatedLot = MinLotSize * (riskPercent / BaseLotPercentRisk);
+      }
    }
 
-   double progressiveLot = baseLot;
-   if(dailyProfit > 0 && ProfitStepForLotIncrease > 0.0 && LotIncrementPerStep > 0.0)
-   {
-      double steps = MathFloor(dailyProfit / ProfitStepForLotIncrease);
-      progressiveLot += LotIncrementPerStep * steps;
-   }
+   calculatedLot = MathMin(calculatedLot, MaxLotSize);
+   calculatedLot = MathMax(calculatedLot, MinLotSize);
 
-   progressiveLot = MathMin(progressiveLot, MaxLotSize);
-   progressiveLot = MathMax(progressiveLot, MinLotSize);
-
-   return NormalizeDouble(progressiveLot, 2);
+   return NormalizeDouble(calculatedLot, 2);
 }
 
 bool IsSpreadAcceptable()
@@ -704,8 +742,9 @@ void OpenScalpTrade(int orderType)
 
    if(sent)
    {
-      ulong positionTicket = trade.ResultPosition();
-      positionTicket = ResolvePositionTicket(positionTicket, (ENUM_ORDER_TYPE)orderType, price);
+      // In MT5, ResultPosition() doesn't exist in CTrade class
+      // Search for the position that was just opened by matching symbol, direction, and entry price
+      ulong positionTicket = ResolvePositionTicket(0, (ENUM_ORDER_TYPE)orderType, price);
 
       dailyTradeCount++;
       lastTradeTime = TimeCurrent();
@@ -797,9 +836,9 @@ void UpdatePerTradeTrailing(int index, double localPipToPoint)
       return;
 
    // FIXED: Only trail if trade is profitable - never trail losing trades
+   // In MT5, POSITION_PROFIT already includes commission, only add swap
    double tradeProfit = PositionGetDouble(POSITION_PROFIT) +
-                        PositionGetDouble(POSITION_SWAP) +
-                        PositionGetDouble(POSITION_COMMISSION);
+                        PositionGetDouble(POSITION_SWAP);
    if(OnlyCloseInProfit && tradeProfit <= 0.0)
       return;  // Don't trail losing trades
 
@@ -920,9 +959,9 @@ void ManageActiveTrades()
             pipGain = (entry - currentPrice) / localPipToPoint;
       }
 
+      // In MT5, POSITION_PROFIT already includes commission, only add swap
       double tradeProfit = PositionGetDouble(POSITION_PROFIT) +
-                           PositionGetDouble(POSITION_SWAP) +
-                           PositionGetDouble(POSITION_COMMISSION);
+                           PositionGetDouble(POSITION_SWAP);
       double lotSize = PositionGetDouble(POSITION_VOLUME);
       double entryPrice = activeTrades[i].entryPrice;
       double stop = PositionGetDouble(POSITION_SL);
@@ -971,23 +1010,26 @@ void ManageActiveTrades()
          continue;
       }
 
-      // NEW: Instant Profit Exit - using profit percentage instead of pips
-      if(UseInstantProfitExit && tradeProfit > 0.0)
+      // NEW: Only close profits at 20+ pips (prevent premature exits, not based on dollar amount)
+      if(tradeProfit > 0.0 && localPipToPoint > 0.0)
       {
          bool shouldClose = false;
          string closeReason = "";
-
-         if(UseProfitDouble && profitPercent >= 100.0)
+         
+         // Check if profit is at least 20 pips (or up to max range)
+         if(pipGain >= MinProfitPipsToClose && pipGain <= MaxProfitPipsToClose)
          {
             shouldClose = true;
-            closeReason = "Profit doubled (100%): " + DoubleToString(tradeProfit, 2);
+            closeReason = "Profit target reached: " + DoubleToString(pipGain, 1) + " pips | P&L: " + DoubleToString(tradeProfit, 2);
          }
-         else if(InstantProfitPercent > 0.0 && profitPercent >= InstantProfitPercent)
+         // Allow closing if profit exceeds maximum range (don't hold too long)
+         else if(pipGain > MaxProfitPipsToClose)
          {
             shouldClose = true;
-            closeReason = "Instant profit " + DoubleToString(profitPercent, 1) + "%: " + DoubleToString(tradeProfit, 2);
+            closeReason = "Profit exceeded max range: " + DoubleToString(pipGain, 1) + " pips | P&L: " + DoubleToString(tradeProfit, 2);
          }
-
+         // Don't close if below minimum (prevent premature exits)
+         
          if(shouldClose)
          {
             CloseTradeAtIndex(i, closeReason);
@@ -995,17 +1037,11 @@ void ManageActiveTrades()
             continue;
          }
       }
-
-      if(UseTakeProfitPercent && TakeProfitPercent > 0.0 && profitPercent >= TakeProfitPercent)
+      
+      // Keep emergency exit conditions but only for very high profits or losses
+      if(UseTakeProfitPercent && TakeProfitPercent > 0.0 && profitPercent >= TakeProfitPercent && pipGain >= MinProfitPipsToClose)
       {
          CloseTradeAtIndex(i, "Take profit " + DoubleToString(profitPercent, 1) + "%: " + DoubleToString(tradeProfit, 2));
-         i--;
-         continue;
-      }
-
-      if(PerTradeProfitLock > 0.0 && tradeProfit >= PerTradeProfitLock)
-      {
-         CloseTradeAtIndex(i, "Per-trade profit lock +" + DoubleToString(tradeProfit, 2));
          i--;
          continue;
       }
@@ -1034,7 +1070,7 @@ void ManageActiveTrades()
 
    double targetPercent = GetEquityTargetPercent();
    double equityTarget = (targetPercent > 0.0)
-                         ? AccountBalance() * (targetPercent / 100.0)
+                         ? AccountInfoDouble(ACCOUNT_BALANCE) * (targetPercent / 100.0)
                          : 0.0;
    double rrTarget = 0.0;
    if(UseRiskRewardTarget && RiskRewardMultiplier > 0.0)
@@ -1061,7 +1097,7 @@ void ManageActiveTrades()
 
    if(profitReady && dynamicTarget > 0.0 && totalProfit >= dynamicTarget)
    {
-      CloseAllTrades("Dynamic profit target hit: KES " + DoubleToString(totalProfit, 2));
+      CloseAllTrades("Dynamic profit target hit: USD " + DoubleToString(totalProfit, 2));
       return;
    }
 
@@ -1074,7 +1110,7 @@ void ManageActiveTrades()
 
       if(profitReady && highestBasketProfit > 0.0 && giveback > 0.0 && totalProfit <= trailLevel && totalProfit > 0.0)
       {
-        CloseAllTrades("Dynamic peak trail: KES " + DoubleToString(totalProfit, 2));
+        CloseAllTrades("Dynamic peak trail: USD " + DoubleToString(totalProfit, 2));
         return;
       }
    }
@@ -1105,9 +1141,9 @@ void CloseTradeAtIndex(int index, string reason)
       return;
    }
 
+   // In MT5, POSITION_PROFIT already includes commission, only add swap
    double preClosePL = PositionGetDouble(POSITION_PROFIT) +
-                       PositionGetDouble(POSITION_SWAP) +
-                       PositionGetDouble(POSITION_COMMISSION);
+                       PositionGetDouble(POSITION_SWAP);
 
    if(OnlyCloseInProfit && preClosePL <= 0.0)
    {
@@ -1119,27 +1155,63 @@ void CloseTradeAtIndex(int index, string reason)
 
    if(closed)
    {
-      double finalPL = trade.ResultProfit();
-      if(finalPL == 0.0)
-         finalPL = preClosePL;
+      // In MT5, get profit from the deal that was created when closing
+      double finalPL = preClosePL;
+      ulong dealTicket = trade.ResultDeal();
+      if(dealTicket > 0)
+      {
+         if(HistoryDealSelect(dealTicket))
+         {
+            double dealProfit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+            double dealSwap = HistoryDealGetDouble(dealTicket, DEAL_SWAP);
+            double dealCommission = HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
+            finalPL = dealProfit + dealSwap + dealCommission;
+         }
+      }
 
       dailyProfit += finalPL;
+      lastClosedTradePL = finalPL;
 
       UpdateDailyLossTracking(finalPL);
 
+      // NEW: Update lot sizing based on win/loss
       if(finalPL < 0)
       {
          consecutiveLosses++;
-         Print("CONSECUTIVE LOSS #", consecutiveLosses, ": KES ", DoubleToString(finalPL, 2));
+         consecutiveLossesForLot++;
+         consecutiveWins = 0;
+         
+         // After losing trade: keep same or reduce lot size
+         // Don't reduce below base (1%), but reduce incrementally
+         if(consecutiveLossesForLot > 0)
+         {
+            double reductionFactor = 0.95; // Reduce by 5% per loss (but not below base)
+            currentLotPercent = MathMax(BaseLotPercentRisk, currentLotPercent * reductionFactor);
+         }
+         
+         Print("CONSECUTIVE LOSS #", consecutiveLosses, ": USD ", DoubleToString(finalPL, 2), 
+               " | Lot % reduced to: ", DoubleToString(currentLotPercent, 2), "%");
       }
       else
       {
          consecutiveLosses = 0;
+         consecutiveLossesForLot = 0;
+         consecutiveWins++;
          strategyShifted = false;
-         Print("PROFIT - Reset consecutive loss counter and strategy");
+         
+         // After winning trade: increase lot size from 1% to 5%
+         if(consecutiveWins > 0)
+         {
+            // Increase lot size progressively: start at 1%, go up to 5%
+            double increasePerWin = (MaxLotPercentRisk - BaseLotPercentRisk) / 5.0; // Reach max in 5 wins
+            currentLotPercent = MathMin(MaxLotPercentRisk, BaseLotPercentRisk + (increasePerWin * consecutiveWins));
+         }
+         
+         Print("PROFIT #", consecutiveWins, " - Reset consecutive loss counter | Lot % increased to: ", 
+               DoubleToString(currentLotPercent, 2), "%");
       }
 
-      Print("Trade closed: ", reason, " | P&L: KES ", DoubleToString(finalPL, 2));
+      Print("Trade closed: ", reason, " | P&L: USD ", DoubleToString(finalPL, 2));
 
       RemoveActiveTrade(index);
    }
@@ -1160,18 +1232,42 @@ void CleanupClosedTrades()
             double finalPL = GetHistoricalPositionProfit(activeTrades[i].ticket, activeTrades[i].openTime);
             dailyProfit += finalPL;
 
+            lastClosedTradePL = finalPL;
+            
             if(finalPL < 0)
             {
                consecutiveLosses++;
-               Print("CONSECUTIVE LOSS #", consecutiveLosses, ": KES ", DoubleToString(finalPL, 2));
+               consecutiveLossesForLot++;
+               consecutiveWins = 0;
+               
+               // After losing trade: keep same or reduce lot size
+               if(consecutiveLossesForLot > 0)
+               {
+                  double reductionFactor = 0.95;
+                  currentLotPercent = MathMax(BaseLotPercentRisk, currentLotPercent * reductionFactor);
+               }
+               
+               Print("CONSECUTIVE LOSS #", consecutiveLosses, ": USD ", DoubleToString(finalPL, 2),
+                     " | Lot % reduced to: ", DoubleToString(currentLotPercent, 2), "%");
             }
             else
             {
                consecutiveLosses = 0;
+               consecutiveLossesForLot = 0;
+               consecutiveWins++;
                strategyShifted = false;
+               
+               // After winning trade: increase lot size
+               if(consecutiveWins > 0)
+               {
+                  double increasePerWin = (MaxLotPercentRisk - BaseLotPercentRisk) / 5.0;
+                  currentLotPercent = MathMin(MaxLotPercentRisk, BaseLotPercentRisk + (increasePerWin * consecutiveWins));
+               }
+               
+               Print("PROFIT #", consecutiveWins, " | Lot % increased to: ", DoubleToString(currentLotPercent, 2), "%");
             }
 
-            Print("Trade auto-closed: KES ", DoubleToString(finalPL, 2));
+            Print("Trade auto-closed: USD ", DoubleToString(finalPL, 2));
 
             RemoveActiveTrade(i);
          }
@@ -1208,8 +1304,8 @@ bool CheckEmergencyStop()
    if(!EmergencyStopEnabled)
       return false;
 
-   double currentBalance = AccountBalance();
-   double currentEquity = AccountEquity();
+   double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
 
    if(currentBalance > highestAccountBalance)
       highestAccountBalance = currentBalance;
@@ -1260,7 +1356,51 @@ bool HasTerminalTradePermission()
 
 bool CanOpenNewTrade()
 {
-   return totalActiveTrades < MaxTrades && tradingAllowed && dailyTradeCount < MaxDailyTrades;
+   if(!tradingAllowed || dailyTradeCount >= MaxDailyTrades)
+      return false;
+   
+   // NEW: Can take up to MaxTrades (5) as long as ALL previous trades are profitable above 10 pips
+   if(totalActiveTrades >= MaxTrades)
+      return false;
+   
+   // NEW: Must not take trade before ALL previous trades are +10 pips profitable
+   if(totalActiveTrades > 0 && MinPreviousTradeProfitPips > 0.0)
+   {
+      // Check ALL active trades - all must be profitable above 10 pips
+      for(int i = 0; i < totalActiveTrades; i++)
+      {
+         if(activeTrades[i].ticket > 0)
+         {
+            if(SelectPosition(activeTrades[i].ticket))
+            {
+               // In MT5, POSITION_PROFIT already includes commission, only add swap
+               double tradePL = PositionGetDouble(POSITION_PROFIT) +
+                              PositionGetDouble(POSITION_SWAP);
+               
+               ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+               double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+               double currentPrice = (posType == POSITION_TYPE_BUY) ? currentBid : currentAsk;
+               
+               double pipGain = 0.0;
+               if(pipToPoint > 0.0)
+               {
+                  if(posType == POSITION_TYPE_BUY)
+                     pipGain = (currentPrice - entry) / pipToPoint;
+                  else if(posType == POSITION_TYPE_SELL)
+                     pipGain = (entry - currentPrice) / pipToPoint;
+               }
+               
+               // Block new trade if ANY active trade is not profitable or below 10 pips
+               if(tradePL <= 0.0 || pipGain < MinPreviousTradeProfitPips)
+               {
+                  return false;
+               }
+            }
+         }
+      }
+   }
+   
+   return true;
 }
 
 void CloseAllTrades(string reason)
@@ -1290,7 +1430,7 @@ void CloseAllTrades(string reason)
       }
    }
 
-   Print("Basket closed: KES ", DoubleToString(totalPL, 2), " | Profitable: ", profitableTrades, " | Losing (kept): ", losingTrades, " | Reason: ", reason);
+   Print("Basket closed: USD ", DoubleToString(totalPL, 2), " | Profitable: ", profitableTrades, " | Losing (kept): ", losingTrades, " | Reason: ", reason);
 
    highestBasketProfit = 0;
    basketTrailingActive = false;
@@ -1315,7 +1455,7 @@ void CheckDailyReset()
 
    if(currentDay != lastDayReset)
    {
-      Print("Daily reset - Previous P&L: KES ", DoubleToString(dailyProfit, 2), " | Total Trades: ", dailyTradeCount);
+      Print("Daily reset - Previous P&L: USD ", DoubleToString(dailyProfit, 2), " | Total Trades: ", dailyTradeCount);
       dailyProfit = 0;
       dailyTradeCount = 0;
       lastDayReset = currentDay;
@@ -1326,6 +1466,12 @@ void CheckDailyReset()
 
       dailyLossUSD = 0.0;
       emergencyStopActive = false;
+      
+      // Reset lot sizing variables
+      consecutiveWins = 0;
+      consecutiveLossesForLot = 0;
+      currentLotPercent = BaseLotPercentRisk;
+      lastClosedTradePL = 0.0;
 
       if(UseHyperactivityProtection)
       {
@@ -1339,8 +1485,8 @@ void CheckDailyReset()
 
       currentBasketDirection = -1;
 
-      initialAccountBalance = AccountBalance();
-      highestAccountBalance = AccountBalance();
+      initialAccountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      highestAccountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
       emergencyStopActive = false;
       dailyLossUSD = 0.0;
    }
@@ -1349,7 +1495,7 @@ void CheckDailyReset()
 void UpdateDisplay()
 {
    double currentLotSize = CalculateDynamicLotSize();
-   double currentBalance = AccountBalance();
+   double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
 
    double basketProfit = 0;
    for(int i = 0; i < totalActiveTrades; i++)
@@ -1371,15 +1517,15 @@ void UpdateDisplay()
 
    string trailingStatus = "OFF";
    if(basketTrailingActive && lastTrailLevel > 0.0)
-      trailingStatus = "ACTIVE @ KES " + DoubleToString(lastTrailLevel, 2);
+      trailingStatus = "ACTIVE @ USD " + DoubleToString(lastTrailLevel, 2);
 
    int basketsCompleted = (TradesPerBurst > 0) ? dailyTradeCount / TradesPerBurst : dailyTradeCount;
    double effectiveTarget = lastDynamicTarget;
    double displayPercent = GetEquityTargetPercent();
    if(effectiveTarget <= 0.0 && displayPercent > 0.0)
-      effectiveTarget = AccountBalance() * (displayPercent / 100.0);
+      effectiveTarget = AccountInfoDouble(ACCOUNT_BALANCE) * (displayPercent / 100.0);
 
-   string profitInfo = "Dynamic Target: KES " + DoubleToString(effectiveTarget, 2) +
+   string profitInfo = "Dynamic Target: USD " + DoubleToString(effectiveTarget, 2) +
                        " | Peak: " + DoubleToString(highestBasketProfit, 2);
    if(basketTrailingActive && lastTrailLevel > 0.0)
       profitInfo += " | Trail: " + DoubleToString(lastTrailLevel, 2);
@@ -1391,20 +1537,19 @@ void UpdateDisplay()
       emergencyStatus = " | EMERGENCY STOP: ACTIVE";
    }
 
-   string status = StringConcatenate(
-      "==== QuickScalperPro v3.03 (SAFE MODE - Risk Protection) ====\n",
-      "Status: ", (tradingAllowed ? "ACTIVE" : "PAUSED"), emergencyStatus, " | ", trend, " | RSI: ", DoubleToString(rsi, 1), " | Momentum: ", momentum, "\n",
-      "Basket: ", totalActiveTrades, "/", MaxTrades, " | Daily Baskets: ", basketsCompleted, " | Trades: ", dailyTradeCount, "\n",
-      "========================================\n",
-      "BASKET P&L: KES ", DoubleToString(basketProfit, 2), "\n",
-      profitInfo, "\n",
-      "Trailing: ", trailingStatus, "\n",
-      "========================================\n",
-      "Daily P&L: KES ", DoubleToString(dailyProfit, 2), "\n",
-      "Balance: KES ", DoubleToString(currentBalance, 2), "\n",
-      "Spread: ", DoubleToString(GetCurrentSpreadPips(), 1), " pips | Lot: ", DoubleToString(currentLotSize, 2), "\n",
-      "Equity Target: ", DoubleToString(displayPercent, 2), "% | Hold >= ", IntegerToString(MinimumHoldMS), " ms"
-   );
+   // In MT5, use string concatenation with + operator instead of StringConcatenate
+   string status = "==== QuickScalperPro v3.03 (SAFE MODE - Risk Protection) ====\n" +
+      "Status: " + (string)(tradingAllowed ? "ACTIVE" : "PAUSED") + emergencyStatus + " | " + trend + " | RSI: " + DoubleToString(rsi, 1) + " | Momentum: " + momentum + "\n" +
+      "Basket: " + IntegerToString(totalActiveTrades) + "/" + IntegerToString(MaxTrades) + " | Daily Baskets: " + IntegerToString(basketsCompleted) + " | Trades: " + IntegerToString(dailyTradeCount) + "\n" +
+      "========================================\n" +
+      "BASKET P&L: USD " + DoubleToString(basketProfit, 2) + "\n" +
+      profitInfo + "\n" +
+      "Trailing: " + trailingStatus + "\n" +
+      "========================================\n" +
+      "Daily P&L: USD " + DoubleToString(dailyProfit, 2) + "\n" +
+      "Balance: USD " + DoubleToString(currentBalance, 2) + "\n" +
+      "Spread: " + DoubleToString(GetCurrentSpreadPips(), 1) + " pips | Lot: " + DoubleToString(currentLotSize, 2) + "\n" +
+      "Equity Target: " + DoubleToString(displayPercent, 2) + "% | Hold >= " + IntegerToString(MinimumHoldMS) + " ms";
 
    Comment(status);
 }
@@ -1521,9 +1666,9 @@ void TriggerMartingaleRecovery(double currentBasketPL)
       if(activeTrades[i].ticket <= 0) continue;
       if(!SelectPosition(activeTrades[i].ticket)) continue;
 
+      // In MT5, POSITION_PROFIT already includes commission, only add swap
       double tradePL = PositionGetDouble(POSITION_PROFIT) +
-                       PositionGetDouble(POSITION_SWAP) +
-                       PositionGetDouble(POSITION_COMMISSION);
+                       PositionGetDouble(POSITION_SWAP);
       ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
       if(posType == POSITION_TYPE_BUY)
       {

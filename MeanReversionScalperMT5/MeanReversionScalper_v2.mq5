@@ -19,9 +19,14 @@ input int TradingMode = 0;  // 0=Basket TP, 1=Micro TP
 input group "===== Mean Reversion Entry ====="
 input ENUM_TIMEFRAMES EntryTimeframe = PERIOD_M1;  // Entry timeframe (M1 or M5)
 input int      MeanReversionPeriod = 20;           // Period for mean calculation (SMA)
-input double   DeviationMultiplier = 2.0;          // Standard deviation multiplier
-input double   MinDeviationPips = 5.0;             // Minimum deviation to enter
+input double   DeviationMultiplier = 2.5;          // Standard deviation multiplier
+input double   MinDeviationPips = 8.0;             // Minimum deviation to enter
 input int      MaxConcurrentTrades = 5;            // Maximum trades per symbol
+
+input group "===== Trend Filter (Higher Timeframe) ====="
+input bool     UseTrendFilter = true;              // Enable trend filter using higher timeframe
+input ENUM_TIMEFRAMES TrendTimeframe = PERIOD_M15; // Trend filter timeframe (M15 or M30)
+input int      TrendMAPeriod = 50;                 // Trend MA period (50 or 100)
 
 input group "===== Testing / Signal Boost ====="
 input bool     UseFastTestingMode       = false;   // Enable relaxed signal checks for demo/testing
@@ -30,9 +35,9 @@ input double   FastModeMinDeviationPips = 1.0;     // Override minimum deviation
 input bool     FastModeUseLiveCandle    = true;    // Evaluate forming candle instead of waiting for close
 
 input group "===== Quick Entry Booster ====="
-input bool     UseQuickEntryBoost       = true;    // Allow secondary, faster signal sweep
-input double   QuickEntryDeviationScale = 0.6;     // Multiplier vs. active deviation multiplier
-input double   QuickEntryMinDeviationPips = 1.5;   // Floor for quick-entry deviation requirement
+input bool     UseQuickEntryBoost       = false;   // Allow secondary, faster signal sweep
+input double   QuickEntryDeviationScale = 0.7;     // Multiplier vs. active deviation multiplier
+input double   QuickEntryMinDeviationPips = 5.0;   // Floor for quick-entry deviation requirement
 input bool     QuickEntryUseLiveCandle  = true;    // Re-evaluate on forming candle for quick entries
 
 // ===== LOT SIZE (ADDED DYNAMIC MODES) =====
@@ -46,15 +51,16 @@ enum LOT_MODE {
 };
 
 input group "===== Position Sizing ====="
-input int      LotSizingMode = 3;                  // 0=Fixed,1=Risk%,2=Martingale,3=GridStep,4=EquityScale
+input int      LotSizingMode = 0;                  // 0=Fixed,1=Risk%,2=Martingale,3=GridStep,4=EquityScale
 input double   BaseLot      = 0.01;                // Base lot (used by all modes)
 input double   LotSize      = 0.01;                // Fixed lot (if LOT_FIXED)
 input double   RiskPercent  = 0.5;                 // Risk % per trade (LOT_RISK_PERCENT)
-input double   MartingaleFactor = 1.5;             // Multiplier after loss (LOT_MARTINGALE)
+input double   MartingaleFactor = 1.0;             // Multiplier after loss (LOT_MARTINGALE)
 input double   GridLotStep  = 0.01;                // Increment per extra open trade (LOT_GRID_STEP)
 input double   EquityPerLot = 2000.0;              // $ equity required per BaseLot (LOT_EQUITY_SCALE)
 input double   MaxLot       = 1.00;                // Safety cap
 input double   MinLot       = 0.01;                // Safety floor
+input int      MaxBasketDepth = 10;                // Maximum concurrent trades in basket (safety cap)
 
 // ===== BASKET TAKE-PROFIT (Mode A) =====
 
@@ -67,24 +73,25 @@ input bool     UseBasketTimeLimit  = false;        // Enable time-based exit
 // ===== PER-TRADE MICRO TP (Mode B) =====
 
 input group "===== Per-Trade Micro TP Settings ====="
-input double   MicroTPPips        = 3.0;           // Micro take-profit in pips
-input double   BreakEvenPips      = 2.0;           // Move to BE after X pips profit
-input double   TrailingStartPips  = 1.5;           // Start trailing after X pips
-input double   TrailingStepPips   = 0.5;           // Trailing step in pips
-input double   StopLossPips       = 10.0;          // Stop loss in pips
+input double   MicroTPPips        = 6.0;           // Micro take-profit in pips
+input double   BreakEvenPips      = 4.0;           // Move to BE after X pips profit
+input double   TrailingStartPips  = 6.0;           // Start trailing after X pips
+input double   TrailingStepPips   = 2.0;           // Trailing step in pips
+input double   StopLossPips       = 15.0;          // Stop loss in pips
 
 // ===== RISK MANAGEMENT =====
 
 input group "===== Risk Management ====="
 input double   MaxDrawdownPercent = 20.0;          // Maximum equity drawdown % (from start equity)
-input double   MaxSpreadPips      = 5.0;           // Maximum spread filter
+input double   MaxSpreadPips      = 3.0;            // Maximum spread filter
 input bool     UseDrawdownGuard   = true;          // Enable drawdown protection
+input double   MaxBasketLossPercent = 5.0;         // Maximum basket loss % before emergency stop
 
 // ===== SESSION FILTERS =====
 
 input group "===== Session Filters ====="
-input bool     UseSessionFilter   = false;         // Enable session filter
-input int      SessionStartHour   = 8;             // Trading session start (server time)
+input bool     UseSessionFilter   = true;          // Enable session filter
+input int      SessionStartHour   = 7;             // Trading session start (server time)
 input int      SessionEndHour     = 20;            // Trading session end (server time)
 
 // ===== NEWS FILTER =====
@@ -113,6 +120,8 @@ input int      PanelY             = 20;            // Panel Y position
 
 CTrade trade;
 int maHandle = INVALID_HANDLE;
+int trendMAHandle = INVALID_HANDLE;
+int atrHandle = INVALID_HANDLE;
 
 double accountStartBalance = 0;
 double accountStartEquity  = 0;
@@ -218,13 +227,15 @@ double NextLotForDirection(ENUM_POSITION_TYPE direction)
    else if(LotSizingMode == 1){  // LOT_RISK_PERCENT
       lots = ComputeRiskPercentLot(stopPips);
    }
-   else if(LotSizingMode == 2){  // LOT_MARTINGALE
+   else    if(LotSizingMode == 2){  // LOT_MARTINGALE
       // After a losing basket, multiply the last used lot; otherwise reset to BaseLot
       if(IsLosingBasket() && g_LastLotUsed>0){
          lots = g_LastLotUsed * MartingaleFactor;
       }else{
          lots = BaseLot;
       }
+      // Safety cap for martingale
+      if(lots > MaxLot) lots = MaxLot;
    }
    else if(LotSizingMode == 3){  // LOT_GRID_STEP
       // Increase lots with number of same-direction positions currently open
@@ -287,6 +298,25 @@ int OnInit()
       return(INIT_FAILED);
    }
    
+   // Initialize Trend Filter MA handle
+   if(UseTrendFilter)
+   {
+      trendMAHandle = iMA(_Symbol, TrendTimeframe, TrendMAPeriod, 0, MODE_SMA, PRICE_CLOSE);
+      if(trendMAHandle == INVALID_HANDLE)
+      {
+         Print("ERROR: Failed to create Trend MA indicator handle");
+         return(INIT_FAILED);
+      }
+   }
+   
+   // Initialize ATR handle for breakout protection
+   atrHandle = iATR(_Symbol, EntryTimeframe, 14);
+   if(atrHandle == INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to create ATR indicator handle");
+      return(INIT_FAILED);
+   }
+   
    // Set trade parameters
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints((ulong)SlippagePips);
@@ -316,9 +346,13 @@ void OnDeinit(const int reason)
       Comment("");
    }
    
-   // Release indicator handle
+   // Release indicator handles
    if(maHandle != INVALID_HANDLE)
       IndicatorRelease(maHandle);
+   if(trendMAHandle != INVALID_HANDLE)
+      IndicatorRelease(trendMAHandle);
+   if(atrHandle != INVALID_HANDLE)
+      IndicatorRelease(atrHandle);
    
    Print("Mean Reversion Scalper EA Deinitialized. Reason: ", reason);
 }
@@ -342,6 +376,10 @@ void OnTick()
    if(!CheckFilters())
       return;
    
+   // Check basket loss protection (Mode A only)
+   if(TradingMode == 0 && CheckBasketLossProtection())
+      return;
+   
    // Mode-specific management
    if(TradingMode == 0)  // MODE_BASKET
    {
@@ -353,7 +391,7 @@ void OnTick()
    }
    
    // Check for entry signals
-   if(totalOpenTrades < MaxConcurrentTrades)
+   if(totalOpenTrades < MaxConcurrentTrades && totalOpenTrades < MaxBasketDepth)
    {
       CheckMeanReversionEntry();
    }
@@ -421,6 +459,26 @@ ENUM_POSITION_TYPE EvaluateMeanReversionSignal(const int shift, const double dev
    double closePrice = close[0];
    if(closePrice <= 0) return WRONG_VALUE;
 
+   // Breakout/Volatility Protection
+   double atr[];
+   ArraySetAsSeries(atr, true);
+   if(CopyBuffer(atrHandle, 0, 0, 2, atr) <= 0) return WRONG_VALUE;
+   if(atr[0] <= 0) return WRONG_VALUE;
+   
+   // Get high/low of last closed candle
+   double high[], low[];
+   ArraySetAsSeries(high, true);
+   ArraySetAsSeries(low, true);
+   if(CopyHigh(_Symbol, EntryTimeframe, 1, 1, high) <= 0) return WRONG_VALUE;
+   if(CopyLow(_Symbol, EntryTimeframe, 1, 1, low) <= 0) return WRONG_VALUE;
+   
+   double candleRange = high[0] - low[0];
+   if(candleRange > atr[0] * 1.5)
+   {
+      // Last candle is too large - breakout detected, skip entry
+      return WRONG_VALUE;
+   }
+
    // Get MA value
    double ma[];
    ArraySetAsSeries(ma, true);
@@ -439,13 +497,51 @@ ENUM_POSITION_TYPE EvaluateMeanReversionSignal(const int shift, const double dev
    if(deviationPips < minRequiredDeviation)
       return WRONG_VALUE;
 
+   ENUM_POSITION_TYPE direction = WRONG_VALUE;
+   
    if(closePrice < maValue - (stdDev * deviationMultiplier))
-      return POSITION_TYPE_BUY;
+      direction = POSITION_TYPE_BUY;
 
    if(closePrice > maValue + (stdDev * deviationMultiplier))
-      return POSITION_TYPE_SELL;
+      direction = POSITION_TYPE_SELL;
 
-   return WRONG_VALUE;
+   // Trend Filter Check (MOST IMPORTANT)
+   if(UseTrendFilter && direction != WRONG_VALUE)
+   {
+      if(!CheckTrendFilter(direction, closePrice))
+      {
+         return WRONG_VALUE; // Block entry if trend filter violated
+      }
+   }
+
+   return direction;
+}
+
+// ===== TREND FILTER CHECK =====
+
+bool CheckTrendFilter(ENUM_POSITION_TYPE direction, double currentPrice)
+{
+   if(!UseTrendFilter || trendMAHandle == INVALID_HANDLE) return true;
+   
+   double trendMA[];
+   ArraySetAsSeries(trendMA, true);
+   if(CopyBuffer(trendMAHandle, 0, 0, 1, trendMA) <= 0) return false;
+   
+   double trendMAValue = trendMA[0];
+   if(trendMAValue <= 0) return false;
+   
+   // BUY only if price > HTF SMA (uptrend)
+   // SELL only if price < HTF SMA (downtrend)
+   if(direction == POSITION_TYPE_BUY)
+   {
+      if(currentPrice <= trendMAValue) return false; // Block buying in downtrend
+   }
+   else if(direction == POSITION_TYPE_SELL)
+   {
+      if(currentPrice >= trendMAValue) return false; // Block selling in uptrend
+   }
+   
+   return true;
 }
 
 // ===== CALCULATE STANDARD DEVIATION =====
@@ -557,6 +653,41 @@ void ManageBasketMode()
          return;
       }
    }
+}
+
+// ===== CHECK BASKET LOSS PROTECTION =====
+
+bool CheckBasketLossProtection()
+{
+   if(totalOpenTrades == 0) return false;
+   
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double maxBasketLoss = balance * (MaxBasketLossPercent / 100.0);
+   
+   // Recalculate total floating profit
+   double currentFloating = 0;
+   for(int i = 0; i < totalOpenTrades; i++)
+   {
+      if(openTrades[i].ticket > 0)
+      {
+         if(PositionSelectByTicket(openTrades[i].ticket))
+         {
+            currentFloating += PositionGetDouble(POSITION_PROFIT) + 
+                               PositionGetDouble(POSITION_SWAP) + 
+                               PositionGetDouble(POSITION_COMMISSION);
+         }
+      }
+   }
+   
+   if(currentFloating < -maxBasketLoss)
+   {
+      Print("BASKET LOSS PROTECTION TRIGGERED: Loss = $", DoubleToString(currentFloating, 2), 
+            " (Max allowed: $", DoubleToString(-maxBasketLoss, 2), ")");
+      CloseAllTrades("Basket Emergency Stop - Max Loss Exceeded");
+      return true;
+   }
+   
+   return false;
 }
 
 // ===== MICRO TP MODE MANAGEMENT =====

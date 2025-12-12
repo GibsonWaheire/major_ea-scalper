@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Script to copy NAS100HybridSniperFlipper.mq5 to MetaTrader 5 Experts folder
-# Usage: ./copy_nas100_sniper_to_mt5.sh
+# Script to copy PureMomentumScalperMT5.mq5 (ICT Strategy) to MetaTrader 5 Experts folder
+# Usage: ./copy_puremomentum_ict_to_mt5.sh
 
 # Colors for output
 GREEN='\033[0;32m'
@@ -10,7 +10,7 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 # Source file
-SOURCE_FILE="NAS100HybridSniperFlipper/NAS100HybridSniperFlipper.mq5"
+SOURCE_FILE="PureMomentumScalperMT5/PureMomentumScalperMT5.mq5"
 
 # Common MetaTrader 5 destination paths (macOS)
 MT5_PATHS=(
@@ -20,7 +20,7 @@ MT5_PATHS=(
 )
 
 echo "=========================================="
-echo "NAS100 Hybrid Sniper Flipper - MetaTrader 5 Copy Script"
+echo "Pure Momentum Scalper (ICT Strategy) - MetaTrader 5 Copy Script"
 echo "=========================================="
 echo ""
 
@@ -56,7 +56,7 @@ if [ -z "$MT5_EXPERTS_DIR" ]; then
         echo ""
         echo "Please manually copy the file:"
         echo "  From: $(pwd)/$SOURCE_FILE"
-        echo "  To:   [Your MT5 Installation]/MQL5/Experts/NAS100HybridSniperFlipper.mq5"
+        echo "  To:   [Your MT5 Installation]/MQL5/Experts/PureMomentumScalperMT5.mq5"
         echo ""
         echo "Common locations:"
         for path in "${MT5_PATHS[@]}"; do
@@ -66,7 +66,7 @@ if [ -z "$MT5_EXPERTS_DIR" ]; then
     fi
 fi
 
-DEST_FILE="$MT5_EXPERTS_DIR/NAS100HybridSniperFlipper.mq5"
+DEST_FILE="$MT5_EXPERTS_DIR/PureMomentumScalperMT5.mq5"
 
 echo "Found MetaTrader 5 directory:"
 echo "  $MT5_EXPERTS_DIR"
@@ -92,29 +92,18 @@ if [ $? -eq 0 ]; then
     echo "Next steps:"
     echo "1. Open MetaTrader 5"
     echo "2. Press F4 to open MetaEditor"
-    echo "3. Find 'NAS100HybridSniperFlipper.mq5' in the Navigator (under Experts)"
+    echo "3. Find 'PureMomentumScalperMT5.mq5' in the Navigator (under Experts)"
     echo "4. Press F7 to compile"
-    echo "5. Drag the EA onto a NAS100 chart to use it"
+    echo "5. Drag the EA onto a USDJPY chart (M1 or M5 recommended)"
+    echo ""
+    echo "ICT Strategy Features:"
+    echo "  - HTF Bias Detection (M15/H1)"
+    echo "  - Order Block + FVG Confluence Entry"
+    echo "  - Liquidity-Based TP"
+    echo "  - Session Filter (London + NY)"
     echo ""
     echo -e "${GREEN}Done!${NC}"
 else
     echo -e "${RED}ERROR: Failed to copy file!${NC}"
     exit 1
 fi
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

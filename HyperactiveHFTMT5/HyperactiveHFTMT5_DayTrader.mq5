@@ -31,8 +31,10 @@ input ENUM_TIMEFRAMES SignalTF = PERIOD_M5;     // Entry precision timeframe
 input int      EMAPeriod = 50;                  // Trend filter EMA period
 input int      SignalEMAPeriod = 14;            // Signal EMA period
 input double   PullbackPercent = 0.30;          // Pullback depth % of last swing
-input double   BreakoutBufferPoints = 50;       // Confirm trend continuation
+input double   BreakoutBufferPoints = 50;       // Confirm trend continuation (0 = no breakout required)
 input int      SwingLookbackBars = 30;          // Bars to search swings on SignalTF
+input bool     RequireBreakout = false;         // Require breakout confirmation (false = enter on pullback completion)
+input bool     UseEMABounceEntry = true;        // Enter when price bounces from EMA (alternative to breakout)
 
 // ===== Exit Settings =====
 input group "===== Exit Settings ====="
@@ -71,6 +73,11 @@ input group "===== Partial Exit ====="
 input bool     UsePartialExit = true;           // Enable partial exit
 input double   PartialExitProfitPoints = 700.0; // Close 50% at X points profit
 input double   PartialExitPercent = 50.0;       // Percentage to close (50% = half position)
+
+// ===== Debug & Test Mode =====
+input group "===== Debug & Test Mode ====="
+input bool     EnableDebugLogging = true;       // Enable detailed debug logging
+input bool     TestModeSimpleEntry = false;     // Test mode: Simple trend-following entry (bypasses pullback/breakout)
 
 // =====================================================================================================
 // STRUCTURES & GLOBALS
@@ -112,6 +119,11 @@ int trendDirection = 0;          // 1=uptrend, -1=downtrend
 double lastSwingHigh = 0.0;
 double lastSwingLow = 0.0;
 datetime lastSignalBarTime = 0;  // Prevent multiple entries per bar
+datetime lastTrendCheckTime = 0;  // Cache trend check to avoid performance issues
+
+// Indicator handles (cached for performance)
+int trendEMAHandle = INVALID_HANDLE;
+int signalEMAHandle = INVALID_HANDLE;
 
 // =====================================================================================================
 // FORWARD DECLARATIONS
@@ -122,6 +134,7 @@ bool   CheckTrendDirection();
 bool   RefreshSwingLevels();
 bool   CheckPullback();
 bool   CheckBreakout();
+bool   CheckEMABounce();
 int    GetDayTradingSignal();
 bool   ShouldOpenTrade(int direction);
 bool   OpenTrade(int direction);
@@ -148,7 +161,15 @@ int OnInit()
    
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(MaxSlippagePoints);
-   trade.SetTypeFilling(ORDER_FILLING_FOK);
+   
+   // Set appropriate filling mode for Strategy Tester compatibility
+   ENUM_ORDER_TYPE_FILLING fillingMode = (ENUM_ORDER_TYPE_FILLING)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   if(fillingMode == ORDER_FILLING_FOK || fillingMode == (ORDER_FILLING_FOK | ORDER_FILLING_IOC))
+      trade.SetTypeFilling(ORDER_FILLING_FOK);
+   else if(fillingMode == ORDER_FILLING_IOC || fillingMode == (ORDER_FILLING_FOK | ORDER_FILLING_IOC))
+      trade.SetTypeFilling(ORDER_FILLING_IOC);
+   else
+      trade.SetTypeFilling(ORDER_FILLING_RETURN);
    
    // Determine trade symbol
    if(TradeSymbol == "" || TradeSymbol == NULL)
@@ -179,9 +200,38 @@ int OnInit()
    lastDayReset = TimeCurrent();
    tradingStopped = false;
    
+   // Initialize indicator handles
+   trendEMAHandle = iMA(tradeSymbol, TrendTF, EMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   signalEMAHandle = iMA(tradeSymbol, SignalTF, SignalEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   
+   if(trendEMAHandle == INVALID_HANDLE || signalEMAHandle == INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to create indicator handles!");
+      if(trendEMAHandle != INVALID_HANDLE) IndicatorRelease(trendEMAHandle);
+      if(signalEMAHandle != INVALID_HANDLE) IndicatorRelease(signalEMAHandle);
+      return(INIT_FAILED);
+   }
+   
    Print("Trade Symbol: ", tradeSymbol);
    Print("Lot Mode: ", (UseFixedLot ? "FIXED" : "DYNAMIC"));
    Print("Fixed Lot: ", FixedLotSize);
+   Print("Trend TF: ", EnumToString(TrendTF), " | Signal TF: ", EnumToString(SignalTF));
+   Print("Strategy Tester Mode: ", (MQLInfoInteger(MQL_TESTER) ? "YES" : "NO"));
+   Print("Test Mode (Simple Entry): ", (TestModeSimpleEntry ? "ENABLED" : "DISABLED"));
+   Print("Debug Logging: ", (EnableDebugLogging ? "ENABLED" : "DISABLED"));
+   Print("Entry Mode: ", (RequireBreakout ? "BREAKOUT REQUIRED" : (UseEMABounceEntry ? "EMA BOUNCE" : "PULLBACK COMPLETION")));
+   Print("Breakout Buffer: ", BreakoutBufferPoints, " points (0 = disabled)");
+   
+   // Check if we have enough bars
+   int trendBars = Bars(tradeSymbol, TrendTF);
+   int signalBars = Bars(tradeSymbol, SignalTF);
+   Print("Available bars - Trend TF: ", trendBars, " | Signal TF: ", signalBars);
+   
+   if(trendBars < EMAPeriod + 10 || signalBars < SwingLookbackBars + 10)
+   {
+      Print("WARNING: Insufficient bars for analysis. Need at least ", EMAPeriod + 10, " bars on Trend TF and ", SwingLookbackBars + 10, " bars on Signal TF.");
+   }
+   
    Print("========================================");
    
    return(INIT_SUCCEEDED);
@@ -189,6 +239,18 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
+   // Release indicator handles
+   if(trendEMAHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(trendEMAHandle);
+      trendEMAHandle = INVALID_HANDLE;
+   }
+   if(signalEMAHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(signalEMAHandle);
+      signalEMAHandle = INVALID_HANDLE;
+   }
+   
    Print("Hyperactive Day Trader deinitialized. Reason: ", reason);
 }
 
@@ -198,12 +260,19 @@ void OnDeinit(const int reason)
 
 void OnTick()
 {
+   // Prevent errors from stopping the backtest
    if(!UpdateMarketData())
+   {
+      if(EnableDebugLogging)
+         Print("DEBUG: UpdateMarketData failed");
       return;
+   }
    
+   // Check risk management (but don't let it stop Strategy Tester)
    CheckRiskManagement();
    
-   if(tradingStopped)
+   // In Strategy Tester, ignore tradingStopped flag to allow full backtest
+   if(tradingStopped && !MQLInfoInteger(MQL_TESTER))
    {
       UpdateDisplay();
       return;
@@ -215,9 +284,36 @@ void OnTick()
    if(!hasActiveTrade && !tradingStopped)
    {
       int direction = GetDayTradingSignal();
-      if(direction != 0 && ShouldOpenTrade(direction))
+      if(direction != 0)
       {
-         OpenTrade(direction);
+         if(EnableDebugLogging)
+            Print("DEBUG: Signal received: ", (direction == 1 ? "BUY" : "SELL"), " - Checking ShouldOpenTrade...");
+         
+         if(ShouldOpenTrade(direction))
+         {
+            if(EnableDebugLogging)
+               Print("DEBUG: All checks passed, attempting to open trade...");
+            
+            if(OpenTrade(direction))
+            {
+               Print("✓ Trade opened successfully!");
+            }
+            else
+            {
+               Print("✗ Trade open failed. Retcode: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+            }
+         }
+         else
+         {
+            if(EnableDebugLogging)
+            {
+               string reason = "";
+               if(hasActiveTrade) reason += "Has active trade; ";
+               if(tradingStopped) reason += "Trading stopped; ";
+               if(currentSpread > MaxSpreadPoints) reason += "Spread too high (" + DoubleToString(currentSpread, 1) + " > " + DoubleToString(MaxSpreadPoints, 1) + "); ";
+               Print("DEBUG: ShouldOpenTrade returned false. Reasons: ", reason);
+            }
+         }
       }
    }
    
@@ -230,14 +326,39 @@ void OnTick()
 
 bool UpdateMarketData()
 {
-   if(!SymbolInfoTick(tradeSymbol, currentTick))
+   // In Strategy Tester, try multiple methods to get tick data
+   if(MQLInfoInteger(MQL_TESTER))
+   {
+      // In tester, use SymbolInfoTick first, fallback to Bid/Ask
+      if(SymbolInfoTick(tradeSymbol, currentTick))
+      {
+         currentBid = currentTick.bid;
+         currentAsk = currentTick.ask;
+      }
+      else
+      {
+         // Fallback for Strategy Tester
+         currentBid = SymbolInfoDouble(tradeSymbol, SYMBOL_BID);
+         currentAsk = SymbolInfoDouble(tradeSymbol, SYMBOL_ASK);
+         currentTick.bid = currentBid;
+         currentTick.ask = currentAsk;
+      }
+   }
+   else
+   {
+      // Live/Demo mode
+      if(!SymbolInfoTick(tradeSymbol, currentTick))
+         return false;
+      currentBid = currentTick.bid;
+      currentAsk = currentTick.ask;
+   }
+   
+   if(currentBid <= 0.0 || currentAsk <= 0.0)
       return false;
    
-   currentBid = currentTick.bid;
-   currentAsk = currentTick.ask;
    currentSpread = (currentAsk - currentBid) / point;
    
-   return (currentBid > 0.0 && currentAsk > 0.0);
+   return true;
 }
 
 // =====================================================================================================
@@ -259,27 +380,31 @@ void CheckRiskManagement()
       lastDayReset = currentTime;
    }
    
-   // Check drawdown
-   if(UseDrawdownProtection)
+   // Check drawdown (disable in Strategy Tester to allow full backtest)
+   if(UseDrawdownProtection && !MQLInfoInteger(MQL_TESTER))
    {
       double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
       if(currentEquity > highestBalance)
          highestBalance = currentEquity;
       
-      double drawdown = ((highestBalance - currentEquity) / highestBalance) * 100.0;
-      
-      if(drawdown >= MaxDrawdownPercent)
+      // Prevent division by zero
+      if(highestBalance > 0.0)
       {
-         tradingStopped = true;
-         Print("TRADING STOPPED: Drawdown ", DoubleToString(drawdown, 2), "% exceeds limit ", DoubleToString(MaxDrawdownPercent, 1), "%");
+         double drawdown = ((highestBalance - currentEquity) / highestBalance) * 100.0;
          
-         if(hasActiveTrade)
-            CloseTrade("Drawdown limit reached");
+         if(drawdown >= MaxDrawdownPercent)
+         {
+            tradingStopped = true;
+            Print("TRADING STOPPED: Drawdown ", DoubleToString(drawdown, 2), "% exceeds limit ", DoubleToString(MaxDrawdownPercent, 1), "%");
+            
+            if(hasActiveTrade)
+               CloseTrade("Drawdown limit reached");
+         }
       }
    }
    
-   // Check daily profit target
-   if(DailyProfitTarget > 0.0)
+   // Check daily profit target (disable in Strategy Tester to allow full backtest)
+   if(DailyProfitTarget > 0.0 && !MQLInfoInteger(MQL_TESTER))
    {
       double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
       dailyProfit = currentBalance - initialBalance;
@@ -301,14 +426,56 @@ void CheckRiskManagement()
 
 double GetEMA(string symbol, ENUM_TIMEFRAMES tf, int period)
 {
-   // Use previous closed candle to avoid repaint
-   return iMA(symbol, tf, period, 0, MODE_EMA, PRICE_CLOSE, 1);
+   // Use cached handle for performance
+   int handle = INVALID_HANDLE;
+   if(tf == TrendTF && period == EMAPeriod)
+      handle = trendEMAHandle;
+   else if(tf == SignalTF && period == SignalEMAPeriod)
+      handle = signalEMAHandle;
+   
+   if(handle == INVALID_HANDLE)
+   {
+      // Fallback: create temporary handle if needed
+      handle = iMA(symbol, tf, period, 0, MODE_EMA, PRICE_CLOSE);
+      if(handle == INVALID_HANDLE)
+         return 0.0;
+   }
+   
+   double buffer[1];
+   ArraySetAsSeries(buffer, true);
+   if(CopyBuffer(handle, 0, 1, 1, buffer) <= 0)
+   {
+      // Only release if it was a temporary handle
+      if(handle != trendEMAHandle && handle != signalEMAHandle)
+         IndicatorRelease(handle);
+      return 0.0;
+   }
+   
+   // Only release if it was a temporary handle
+   if(handle != trendEMAHandle && handle != signalEMAHandle)
+      IndicatorRelease(handle);
+   
+   return buffer[0];
 }
 
 bool CheckTrendDirection()
 {
+   // Ensure we have enough bars
+   if(Bars(tradeSymbol, TrendTF) < EMAPeriod + 5)
+   {
+      trendDirection = 0;
+      return false;
+   }
+   
    double ema = GetEMA(tradeSymbol, TrendTF, EMAPeriod);
-   double closePrice = iClose(tradeSymbol, TrendTF, 1);
+   
+   double closeBuffer[1];
+   if(CopyClose(tradeSymbol, TrendTF, 1, 1, closeBuffer) <= 0)
+   {
+      trendDirection = 0;
+      return false;
+   }
+   double closePrice = closeBuffer[0];
    
    if(ema <= 0.0 || closePrice <= 0.0)
    {
@@ -331,14 +498,25 @@ bool RefreshSwingLevels()
    if(Bars(tradeSymbol, SignalTF) < SwingLookbackBars + 5)
       return false;
    
-   int highIndex = iHighest(tradeSymbol, SignalTF, MODE_HIGH, SwingLookbackBars, 1);
-   int lowIndex  = iLowest(tradeSymbol, SignalTF, MODE_LOW, SwingLookbackBars, 1);
+   double highBuffer[];
+   double lowBuffer[];
+   
+   ArrayResize(highBuffer, SwingLookbackBars);
+   ArrayResize(lowBuffer, SwingLookbackBars);
+   
+   if(CopyHigh(tradeSymbol, SignalTF, 1, SwingLookbackBars, highBuffer) <= 0)
+      return false;
+   if(CopyLow(tradeSymbol, SignalTF, 1, SwingLookbackBars, lowBuffer) <= 0)
+      return false;
+   
+   int highIndex = ArrayMaximum(highBuffer, 0, SwingLookbackBars);
+   int lowIndex  = ArrayMinimum(lowBuffer, 0, SwingLookbackBars);
    
    if(highIndex < 0 || lowIndex < 0)
       return false;
    
-   lastSwingHigh = iHigh(tradeSymbol, SignalTF, highIndex);
-   lastSwingLow  = iLow(tradeSymbol, SignalTF, lowIndex);
+   lastSwingHigh = highBuffer[highIndex];
+   lastSwingLow  = lowBuffer[lowIndex];
    
    return (lastSwingHigh > 0.0 && lastSwingLow > 0.0);
 }
@@ -351,7 +529,11 @@ bool CheckPullback()
    if(!RefreshSwingLevels())
       return false;
    
-   double signalClose = iClose(tradeSymbol, SignalTF, 1);
+   double closeBuffer[1];
+   if(CopyClose(tradeSymbol, SignalTF, 1, 1, closeBuffer) <= 0)
+      return false;
+   double signalClose = closeBuffer[0];
+   
    double signalEMA = GetEMA(tradeSymbol, SignalTF, SignalEMAPeriod);
    
    if(signalClose <= 0.0 || signalEMA <= 0.0)
@@ -377,7 +559,14 @@ bool CheckPullback()
 
 bool CheckBreakout()
 {
-   double signalClose = iClose(tradeSymbol, SignalTF, 1);
+   if(BreakoutBufferPoints <= 0.0)
+      return true; // Breakout not required
+   
+   double closeBuffer[1];
+   if(CopyClose(tradeSymbol, SignalTF, 1, 1, closeBuffer) <= 0)
+      return false;
+   double signalClose = closeBuffer[0];
+   
    if(signalClose <= 0.0 || lastSwingHigh <= 0.0 || lastSwingLow <= 0.0)
       return false;
    
@@ -391,12 +580,78 @@ bool CheckBreakout()
    return false;
 }
 
+bool CheckEMABounce()
+{
+   if(!UseEMABounceEntry)
+      return false;
+   
+   double closeBuffer[2];
+   if(CopyClose(tradeSymbol, SignalTF, 1, 2, closeBuffer) < 2)
+      return false;
+   
+   double signalEMA = GetEMA(tradeSymbol, SignalTF, SignalEMAPeriod);
+   if(signalEMA <= 0.0)
+      return false;
+   
+   double currentClose = closeBuffer[0];
+   double prevClose = closeBuffer[1];
+   
+   // Check for bounce: price was below/at EMA, now moving back up (for uptrend)
+   // or price was above/at EMA, now moving back down (for downtrend)
+   if(trendDirection == 1)
+   {
+      // Uptrend: look for bounce from EMA (price touched or went below EMA, now above)
+      bool wasAtOrBelowEMA = (prevClose <= signalEMA);
+      bool nowAboveEMA = (currentClose > signalEMA);
+      bool priceRising = (currentClose > prevClose);
+      return (wasAtOrBelowEMA && nowAboveEMA && priceRising);
+   }
+   else if(trendDirection == -1)
+   {
+      // Downtrend: look for bounce from EMA (price touched or went above EMA, now below)
+      bool wasAtOrAboveEMA = (prevClose >= signalEMA);
+      bool nowBelowEMA = (currentClose < signalEMA);
+      bool priceFalling = (currentClose < prevClose);
+      return (wasAtOrAboveEMA && nowBelowEMA && priceFalling);
+   }
+   
+   return false;
+}
+
 int GetDayTradingSignal()
 {
    // One decision per closed SignalTF candle
-   datetime barTime = iTime(tradeSymbol, SignalTF, 1);
-   if(barTime == 0 || barTime == lastSignalBarTime)
+   datetime timeBuffer[1];
+   if(CopyTime(tradeSymbol, SignalTF, 1, 1, timeBuffer) <= 0)
+   {
+      if(EnableDebugLogging)
+         Print("DEBUG: Failed to get bar time");
       return 0;
+   }
+   datetime barTime = timeBuffer[0];
+   
+   if(barTime == 0 || barTime == lastSignalBarTime)
+   {
+      if(EnableDebugLogging && barTime != 0)
+         Print("DEBUG: Same bar time, skipping: ", barTime);
+      return 0;
+   }
+   
+   // In Strategy Tester, ensure we're using closed bar data
+   if(MQLInfoInteger(MQL_TESTER))
+   {
+      // Wait for bar to close in tester
+      datetime currentBarTime[1];
+      if(CopyTime(tradeSymbol, SignalTF, 0, 1, currentBarTime) > 0)
+      {
+         if(currentBarTime[0] == barTime)
+         {
+            if(EnableDebugLogging)
+               Print("DEBUG: Current bar not closed yet");
+            return 0; // Current bar not closed yet
+         }
+      }
+   }
    
    // Check session filter
    if(UseSessionFilter)
@@ -405,6 +660,8 @@ int GetDayTradingSignal()
       TimeToStruct(TimeCurrent(), dt);
       if(dt.hour < SessionStartHour || dt.hour >= SessionEndHour)
       {
+         if(EnableDebugLogging)
+            Print("DEBUG: Outside session hours: ", dt.hour, " (allowed: ", SessionStartHour, "-", SessionEndHour, ")");
          lastSignalBarTime = barTime;
          return 0;
       }
@@ -412,25 +669,137 @@ int GetDayTradingSignal()
    
    if(currentSpread > MaxSpreadPoints)
    {
+      if(EnableDebugLogging)
+         Print("DEBUG: Spread too high: ", DoubleToString(currentSpread, 1), " > ", MaxSpreadPoints);
       lastSignalBarTime = barTime;
       return 0;
    }
    
+   // TEST MODE: Simple trend-following entry
+   if(TestModeSimpleEntry)
+   {
+      if(CheckTrendDirection())
+      {
+         if(EnableDebugLogging)
+            Print("DEBUG: TEST MODE - Signal generated: ", (trendDirection == 1 ? "BUY" : "SELL"));
+         lastSignalBarTime = barTime;
+         return trendDirection;
+      }
+      else
+      {
+         if(EnableDebugLogging)
+            Print("DEBUG: TEST MODE - No trend direction");
+         lastSignalBarTime = barTime;
+         return 0;
+      }
+   }
+   
+   // NORMAL MODE: Full conditions
    if(!CheckTrendDirection())
    {
+      if(EnableDebugLogging)
+         Print("DEBUG: No trend direction detected");
       lastSignalBarTime = barTime;
       return 0;
    }
+   
+   if(EnableDebugLogging)
+      Print("DEBUG: Trend direction: ", (trendDirection == 1 ? "UP" : "DOWN"));
    
    if(!CheckPullback())
    {
+      if(EnableDebugLogging)
+      {
+         double closeBuffer[1];
+         double signalEMA = GetEMA(tradeSymbol, SignalTF, SignalEMAPeriod);
+         if(CopyClose(tradeSymbol, SignalTF, 1, 1, closeBuffer) > 0)
+         {
+            double swingRange = lastSwingHigh - lastSwingLow;
+            if(swingRange > 0)
+            {
+               double pullbackDepth = (trendDirection == 1) 
+                  ? (lastSwingHigh - closeBuffer[0]) / swingRange 
+                  : (closeBuffer[0] - lastSwingLow) / swingRange;
+               Print("DEBUG: Pullback check failed - Depth: ", DoubleToString(pullbackDepth * 100, 2), 
+                     "% (needed: ", DoubleToString(PullbackPercent * 100, 2), "%), Near EMA: ", 
+                     (trendDirection == 1 ? (closeBuffer[0] <= signalEMA) : (closeBuffer[0] >= signalEMA)));
+            }
+         }
+      }
       lastSignalBarTime = barTime;
       return 0;
    }
    
+   if(EnableDebugLogging)
+      Print("DEBUG: Pullback condition met");
+   
    int direction = 0;
-   if(CheckBreakout())
-      direction = trendDirection;
+   
+   // Entry logic: Check if breakout is required or if we can enter on pullback completion
+   if(RequireBreakout)
+   {
+      // Original logic: require breakout
+      bool breakout = CheckBreakout();
+      if(breakout)
+      {
+         direction = trendDirection;
+         if(EnableDebugLogging)
+            Print("DEBUG: Breakout confirmed - Signal: ", (direction == 1 ? "BUY" : "SELL"));
+      }
+      else
+      {
+         if(EnableDebugLogging)
+         {
+            double closeBuffer[1];
+            if(CopyClose(tradeSymbol, SignalTF, 1, 1, closeBuffer) > 0)
+            {
+               if(BreakoutBufferPoints > 0.0)
+               {
+                  double buffer = BreakoutBufferPoints * point;
+                  if(trendDirection == 1)
+                  {
+                     double needed = lastSwingHigh + buffer;
+                     Print("DEBUG: Breakout failed - Close: ", closeBuffer[0], " (needed > ", needed, ")");
+                  }
+                  else
+                  {
+                     double needed = lastSwingLow - buffer;
+                     Print("DEBUG: Breakout failed - Close: ", closeBuffer[0], " (needed < ", needed, ")");
+                  }
+               }
+            }
+         }
+      }
+   }
+   else
+   {
+      // New logic: Enter on pullback completion (no breakout required)
+      // Option 1: Enter immediately when pullback is complete
+      // Option 2: Enter on EMA bounce (price bouncing from EMA)
+      
+      if(UseEMABounceEntry)
+      {
+         bool emaBounce = CheckEMABounce();
+         if(emaBounce)
+         {
+            direction = trendDirection;
+            if(EnableDebugLogging)
+               Print("DEBUG: EMA bounce entry - Signal: ", (direction == 1 ? "BUY" : "SELL"));
+         }
+         else
+         {
+            if(EnableDebugLogging)
+               Print("DEBUG: Pullback complete but no EMA bounce yet");
+         }
+      }
+      else
+      {
+         // Enter immediately on pullback completion (no breakout or bounce required)
+         direction = trendDirection;
+         if(EnableDebugLogging)
+            Print("DEBUG: Pullback entry (no breakout required) - Signal: ", (direction == 1 ? "BUY" : "SELL"));
+      }
+   }
    
    lastSignalBarTime = barTime;
    return direction;
@@ -523,7 +892,9 @@ bool OpenTrade(int direction)
          retries++;
          if(retries < OrderRetries)
          {
-            Sleep(50);
+            // In Strategy Tester, Sleep() is ignored, so we just refresh tick data
+            if(!MQLInfoInteger(MQL_TESTER))
+               Sleep(50);
             SymbolInfoTick(tradeSymbol, currentTick);
             currentBid = currentTick.bid;
             currentAsk = currentTick.ask;
@@ -850,14 +1221,101 @@ void UpdateDisplay()
    
    status += "Spread: " + DoubleToString(currentSpread, 1) + " pts";
    if(currentSpread > MaxSpreadPoints)
-      status += " [HIGH]";
+      status += " [HIGH - BLOCKING TRADES]";
    status += "\n";
    
-   // Trend view
-   CheckTrendDirection();
+   // Trend view (cache to avoid multiple calls in display)
+   datetime currentTime = TimeCurrent();
+   
+   // Only check trend every 5 seconds to avoid performance issues
+   if(currentTime - lastTrendCheckTime >= 5 || lastTrendCheckTime == 0)
+   {
+      CheckTrendDirection();
+      lastTrendCheckTime = currentTime;
+   }
+   
    status += "Trend TF: " + EnumToString(TrendTF) + " | ";
-   status += (trendDirection == 1 ? "UP" : (trendDirection == -1 ? "DOWN" : "FLAT")) + "\n";
+   status += (trendDirection == 1 ? "UP" : (trendDirection == -1 ? "DOWN" : "FLAT"));
+   if(trendDirection == 0)
+      status += " [NO TREND - BLOCKING]";
+   status += "\n";
    status += "Signal TF: " + EnumToString(SignalTF) + "\n";
+   
+   // Show why trades aren't being taken
+   if(!hasActiveTrade && !tradingStopped)
+   {
+      status += "\n--- Signal Analysis ---\n";
+      
+      // Check each condition
+      if(currentSpread > MaxSpreadPoints)
+         status += "✗ Spread too high\n";
+      else
+         status += "✓ Spread OK\n";
+      
+      if(trendDirection == 0)
+         status += "✗ No trend direction\n";
+      else
+         status += "✓ Trend: " + (trendDirection == 1 ? "UP" : "DOWN") + "\n";
+      
+      if(!TestModeSimpleEntry)
+      {
+         bool pullbackOK = false;
+         bool breakoutOK = false;
+         
+         if(trendDirection != 0)
+         {
+            if(RefreshSwingLevels())
+            {
+               double closeBuffer[1];
+               if(CopyClose(tradeSymbol, SignalTF, 1, 1, closeBuffer) > 0)
+               {
+                  double signalEMA = GetEMA(tradeSymbol, SignalTF, SignalEMAPeriod);
+                  double swingRange = lastSwingHigh - lastSwingLow;
+                  
+                  if(swingRange > 0 && signalEMA > 0)
+                  {
+                     double pullbackDepth = (trendDirection == 1) 
+                        ? (lastSwingHigh - closeBuffer[0]) / swingRange 
+                        : (closeBuffer[0] - lastSwingLow) / swingRange;
+                     bool nearEMA = (trendDirection == 1) ? (closeBuffer[0] <= signalEMA) : (closeBuffer[0] >= signalEMA);
+                     pullbackOK = (pullbackDepth >= PullbackPercent && nearEMA);
+                     
+         if(pullbackOK)
+         {
+            if(RequireBreakout && BreakoutBufferPoints > 0.0)
+            {
+               double buffer = BreakoutBufferPoints * point;
+               if(trendDirection == 1)
+                  breakoutOK = (closeBuffer[0] > (lastSwingHigh + buffer));
+               else
+                  breakoutOK = (closeBuffer[0] < (lastSwingLow - buffer));
+            }
+            else
+            {
+               // No breakout required - entry on pullback completion
+               breakoutOK = true;
+            }
+         }
+                  }
+               }
+            }
+         }
+         
+         if(pullbackOK)
+            status += "✓ Pullback condition met\n";
+         else
+            status += "✗ Pullback condition NOT met\n";
+         
+         if(breakoutOK)
+            status += "✓ Breakout confirmed\n";
+         else
+            status += "✗ Breakout NOT confirmed\n";
+      }
+      else
+      {
+         status += "TEST MODE: Simple trend entry\n";
+      }
+   }
    
    if(tradingStopped)
    {
