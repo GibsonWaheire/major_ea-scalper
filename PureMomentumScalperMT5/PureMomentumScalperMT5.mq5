@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
-//|         Pure Momentum Scalper V2 - Optimized for JPY Pairs        |
-//|          EMA + RSI + MACD + Multi-TF + Partial TP Strategy        |
+//|         Pure Momentum Scalper - Trend Following for JPY Pairs   |
+//|          EMA + RSI + MACD Momentum Strategy                      |
 //|          Optimized for USDJPY/EURJPY/GBPJPY - Asian Session      |
-//|                       © Gibson 2025                                |
+//|                       © Gibson 2025                               |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, Advanced Trading Systems"
 #property link      "https://www.mcgibsdigitalsolutions.com"
-#property version   "4.00"
+#property version   "3.00"
 
 #include <Trade\Trade.mqh>
 CTrade trade;
@@ -17,7 +17,6 @@ input ENUM_TIMEFRAMES HTF_Timeframe = PERIOD_M15;  // Trend timeframe (M15 or H1
 input ENUM_TIMEFRAMES EntryTimeframe = PERIOD_M5;  // Entry timeframe (M5 recommended)
 input bool UseSessionFilter = true;                // Trade Asian/Tokyo session only (22:00-9:00 GMT)
 input double MaxSpreadPips = 5.0;                  // Maximum spread filter
-input bool UseVolatilityFilter = true;             // Block entries when ATR > 1.8× average (BOJ spike protection)
 
 input group "===== Indicator Settings ====="
 input int FastEMA_Period = 12;                     // Fast EMA period
@@ -29,26 +28,21 @@ input int MACD_Fast = 12;                          // MACD fast EMA
 input int MACD_Slow = 26;                          // MACD slow EMA
 input int MACD_Signal = 9;                         // MACD signal line
 
-input group "===== Entry/Exit Settings ====="
-input double ATR_Multiplier_SL = 4.0;              // ATR multiplier for stop loss
+input group "===== Entry/Exit Settings (Longer Holds) ====="
+input double ATR_Multiplier_SL = 4.0;              // ATR multiplier for stop loss (wider = more flexible)
+input double ATR_Multiplier_TP = 8.0;              // ATR multiplier for take profit (higher = longer holds)
 input bool UseTakeProfit = false;                  // Use fixed TP (false = let trailing stop handle exits)
-input double ATR_Multiplier_TP = 8.0;              // ATR multiplier for take profit (if enabled)
 input bool UseTrailingStop = true;                 // Enable trailing stop (recommended for longer holds)
-input double TrailingStop_ATR = 2.5;               // Trailing stop ATR multiplier
-input double TrailingStep_ATR = 1.0;               // Trailing step ATR multiplier
+input double TrailingStop_ATR = 2.5;               // Trailing stop ATR multiplier (wider = let trades breathe)
+input double TrailingStep_ATR = 1.0;                // Trailing step ATR multiplier (bigger step = less frequent updates)
 input bool UseBreakeven = true;                    // Move SL to breakeven after profit threshold
 input double Breakeven_ATR_Profit = 2.0;           // Move to breakeven after this ATR profit
-input bool UsePartialClose = true;                 // Close 30-50% at +1.5 ATR profit
-input double PartialClose_Percent = 40.0;          // Percentage to close (30-50%)
-input double PartialClose_ATR = 1.5;               // ATR multiplier for partial close
-input bool UseReversalProtection = true;           // Protect against HTF trend reversals
-input bool ReversalTightenTrailing = true;         // True=tighten trailing, False=exit immediately
 input int MinBarsAfterEntry = 5;                   // Minimum bars before allowing new entry
 
 input group "===== Risk Management ====="
-input int    MagicNumber   = 202501;               // Magic Number
-input double RiskPercent   = 0.5;                  // Risk % per trade (keep as is)
-input double MinLotSize    = 0.1;                  // Minimum lot size (reduced from 0.5 for smoother drawdowns)
+input int    MagicNumber = 202501;                 // Magic Number
+input double RiskPercent = 0.5;                    // Risk % per trade
+input double MinLotSize = 0.5;                     // Minimum lot size (0.5 lots for JPY pairs)
 input bool DebugMode = true;                       // Enable detailed logging
 
 //===================== INTERNAL STATE =====================//
@@ -59,8 +53,6 @@ double currentTP = 0;
 double highestProfit = 0;
 datetime lastEntryTime = 0;
 datetime lastBarTime = 0;
-bool partialTPClosed = false;                     // Track if partial TP was closed
-double originalLotSize = 0;                       // Track original lot size for partial close
 
 // Indicator handles
 int atrHandle = INVALID_HANDLE;
@@ -193,43 +185,6 @@ bool IsTrendBearish_HTF()
    return (trendBearish && strengthening);
 }
 
-//===================== VOLATILITY SAFETY FILTER =====================//
-
-bool IsVolatilityOK()
-{
-   if(!UseVolatilityFilter) return true;
-   if(atrHandle == INVALID_HANDLE) return true;
-   
-   double atr[];
-   ArraySetAsSeries(atr, true);
-   if(CopyBuffer(atrHandle, 0, 0, 20, atr) < 20) return true;
-   
-   // Calculate 20-period ATR average
-   double atrSum = 0;
-   for(int i = 0; i < 20; i++) atrSum += atr[i];
-   double atrAverage = atrSum / 20.0;
-   double currentATR = atr[0];
-   
-   // Block if ATR > 1.8× average (BOJ spikes / fake breakouts)
-   double threshold = atrAverage * 1.8;
-   
-   if(currentATR > threshold)
-   {
-      if(DebugMode)
-      {
-         static datetime lastLog = 0;
-         if(TimeCurrent() - lastLog > 300)
-         {
-            Print("❌ Entry blocked: Volatility too high (ATR=", currentATR, " > 1.8× avg=", threshold, ")");
-            lastLog = TimeCurrent();
-         }
-      }
-      return false;
-   }
-   
-   return true;
-}
-
 //===================== MOMENTUM CONFIRMATION (Entry TF) =====================//
 
 bool CheckRSI_Bullish()
@@ -333,7 +288,6 @@ bool CheckEntrySignal(ENUM_POSITION_TYPE &dir)
    // 1. Basic filters
    if(!IsValidSession()) return false;
    if(!IsSpreadOK()) return false;
-   if(!IsVolatilityOK()) return false; // Volatility safety filter
    
    // 2. Check minimum bars since last entry
    if(lastEntryTime > 0)
@@ -397,7 +351,6 @@ void CalculateSLTP(double entry, bool isBuy, double &sl, double &tp)
    {
       sl = 0;
       tp = 0;
-      partialTP = 0;
       return;
    }
    
@@ -407,14 +360,13 @@ void CalculateSLTP(double entry, bool isBuy, double &sl, double &tp)
    {
       sl = 0;
       tp = 0;
-      partialTP = 0;
       return;
    }
    
    double atrValue = atr[0];
    double pipPoint = PipPoint();
    
-   // Calculate stop loss
+   // Calculate stop loss (wider for flexibility)
    if(isBuy)
    {
       sl = entry - (atrValue * ATR_Multiplier_SL);
@@ -463,12 +415,8 @@ ulong OpenTrade(ENUM_POSITION_TYPE dir)
    }
    
    ulong ticket = trade.ResultOrder();
-   originalLotSize = lot; // Store for partial close
-   partialTPClosed = false; // Reset partial close flag
-   
    string tpStr = (tp > 0) ? DoubleToString(tp, 5) : "None (trailing stop exit)";
-   Print("✅ Trade opened: ", (dir == POSITION_TYPE_BUY ? "BUY" : "SELL"),
-         " Ticket: ", ticket, " Lot: ", lot, " Entry: ", entry, " SL: ", sl, " TP: ", tpStr);
+   Print("✅ Trade opened: ", (dir == POSITION_TYPE_BUY ? "BUY" : "SELL"), " Ticket: ", ticket, " Lot: ", lot, " Entry: ", entry, " SL: ", sl, " TP: ", tpStr);
    
    return ticket;
 }
@@ -500,10 +448,7 @@ void UpdateBreakevenStop()
    if(!SymbolInfoTick(_Symbol, tick)) return;
    
    double currentPrice = (posType == POSITION_TYPE_BUY) ? tick.bid : tick.ask;
-   double profit = (posType == POSITION_TYPE_BUY) ? 
-                   (currentPrice - posPriceOpen) : 
-                   (posPriceOpen - currentPrice);
-   
+   double profit = (posType == POSITION_TYPE_BUY) ? (currentPrice - posPriceOpen) : (posPriceOpen - currentPrice);
    double atrValue = atr[0];
    double breakevenThreshold = atrValue * Breakeven_ATR_Profit;
    
@@ -513,7 +458,6 @@ void UpdateBreakevenStop()
       // Move SL to breakeven (entry price + small buffer for spread)
       double spreadBuffer = 3.0 * pipPoint; // Small buffer for spread
       double newSL = 0;
-      
       if(posType == POSITION_TYPE_BUY)
          newSL = posPriceOpen + spreadBuffer; // Slightly above entry
       else
@@ -521,183 +465,17 @@ void UpdateBreakevenStop()
       
       // Only update if new SL is better than current SL
       bool shouldUpdate = false;
-      if(posType == POSITION_TYPE_BUY && newSL > posSL)
-         shouldUpdate = true;
-      else if(posType == POSITION_TYPE_SELL && (newSL < posSL || posSL == 0))
-         shouldUpdate = true;
+      if(posType == POSITION_TYPE_BUY && newSL > posSL) shouldUpdate = true;
+      else if(posType == POSITION_TYPE_SELL && (newSL < posSL || posSL == 0)) shouldUpdate = true;
       
       if(shouldUpdate)
       {
          int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
          newSL = NormalizeDouble(newSL, digits);
-         
          if(trade.PositionModify(currentTicket, newSL, posTP))
          {
             if(DebugMode)
                Print("🔒 Breakeven stop set: Ticket=", currentTicket, " SL=", newSL, " (Entry=", posPriceOpen, ")");
-         }
-      }
-   }
-}
-
-//===================== PARTIAL PROFIT TAKING =====================//
-
-void CheckPartialClose()
-{
-   if(!UsePartialClose || currentTicket == 0 || partialTPClosed) return;
-   if(!PositionSelectByTicket(currentTicket)) return;
-   
-   if(atrHandle == INVALID_HANDLE) return;
-   
-   double atr[];
-   ArraySetAsSeries(atr, true);
-   if(CopyBuffer(atrHandle, 0, 0, 1, atr) <= 0) return;
-   
-   double posVolume = PositionGetDouble(POSITION_VOLUME);
-   double posPriceOpen = PositionGetDouble(POSITION_PRICE_OPEN);
-   ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-   
-   MqlTick tick;
-   if(!SymbolInfoTick(_Symbol, tick)) return;
-   
-   double currentPrice = (posType == POSITION_TYPE_BUY) ? tick.bid : tick.ask;
-   double profit = (posType == POSITION_TYPE_BUY) ? 
-                   (currentPrice - posPriceOpen) : 
-                   (posPriceOpen - currentPrice);
-   
-   double atrValue = atr[0];
-   double partialCloseThreshold = atrValue * PartialClose_ATR; // +1.5 ATR
-   
-   // Check if profit reached +1.5 ATR
-   if(profit >= partialCloseThreshold)
-   {
-      // Close 30-50% of position (configurable)
-      double closePercent = MathMax(30.0, MathMin(50.0, PartialClose_Percent)) / 100.0;
-      double closeVolume = NormalizeDouble(posVolume * closePercent, 2);
-      
-      // Ensure we close at least minimum lot size
-      double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-      if(closeVolume < minLot) closeVolume = minLot;
-      
-      // Don't close more than current position
-      if(closeVolume >= posVolume) closeVolume = NormalizeDouble(posVolume * 0.9, 2); // Close 90% max
-      
-      if(trade.PositionClosePartial(currentTicket, closeVolume))
-      {
-         partialTPClosed = true;
-         if(DebugMode)
-            Print("💰 Partial close: ", closeVolume, " lots (", DoubleToString(closePercent * 100, 1), "%) at +", DoubleToString(partialCloseThreshold / PipPoint(), 1), " pips profit");
-      }
-   }
-}
-
-//===================== REVERSAL PROTECTION =====================//
-
-void CheckReversalProtection()
-{
-   if(!UseReversalProtection || currentTicket == 0) return;
-   if(!PositionSelectByTicket(currentTicket)) return;
-   
-   ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-   
-   // Check if HTF trend has flipped
-   bool htfBullish = IsTrendBullish_HTF();
-   bool htfBearish = IsTrendBearish_HTF();
-   
-   bool trendFlipped = false;
-   bool priceClosedAgainstTrend = false;
-   
-   // For BUY position, check if trend flipped to bearish
-   if(posType == POSITION_TYPE_BUY && htfBearish)
-   {
-      trendFlipped = true;
-      
-      // Check if price closed against HTF trend (below fast EMA)
-      double fastEMA[];
-      ArraySetAsSeries(fastEMA, true);
-      if(CopyBuffer(fastEMA_HTF, 0, 0, 1, fastEMA) >= 1)
-      {
-         double close[];
-         ArraySetAsSeries(close, true);
-         if(CopyClose(_Symbol, HTF_Timeframe, 0, 1, close) >= 1)
-         {
-            if(close[0] < fastEMA[0])
-               priceClosedAgainstTrend = true;
-         }
-      }
-   }
-   
-   // For SELL position, check if trend flipped to bullish
-   if(posType == POSITION_TYPE_SELL && htfBullish)
-   {
-      trendFlipped = true;
-      
-      // Check if price closed against HTF trend (above fast EMA)
-      double fastEMA[];
-      ArraySetAsSeries(fastEMA, true);
-      if(CopyBuffer(fastEMA_HTF, 0, 0, 1, fastEMA) >= 1)
-      {
-         double close[];
-         ArraySetAsSeries(close, true);
-         if(CopyClose(_Symbol, HTF_Timeframe, 0, 1, close) >= 1)
-         {
-            if(close[0] > fastEMA[0])
-               priceClosedAgainstTrend = true;
-         }
-      }
-   }
-   
-   if(trendFlipped)
-   {
-      if(ReversalTightenTrailing)
-      {
-         // Tighten trailing stop aggressively (reduce to 1.0 ATR)
-         if(atrHandle != INVALID_HANDLE)
-         {
-            double atr[];
-            ArraySetAsSeries(atr, true);
-            if(CopyBuffer(atrHandle, 0, 0, 1, atr) > 0)
-            {
-               double atrValue = atr[0];
-               double tightTrailingDistance = atrValue * 1.0; // Much tighter
-               
-               MqlTick tick;
-               if(SymbolInfoTick(_Symbol, tick))
-               {
-                  double currentPrice = (posType == POSITION_TYPE_BUY) ? tick.bid : tick.ask;
-                  double posSL = PositionGetDouble(POSITION_SL);
-                  double posTP = PositionGetDouble(POSITION_TP);
-                  double newSL = 0;
-                  
-                  if(posType == POSITION_TYPE_BUY)
-                     newSL = currentPrice - tightTrailingDistance;
-                  else
-                     newSL = currentPrice + tightTrailingDistance;
-                  
-                  // Only tighten if new SL is better
-                  if((posType == POSITION_TYPE_BUY && newSL > posSL) ||
-                     (posType == POSITION_TYPE_SELL && (posSL == 0 || newSL < posSL)))
-                  {
-                     int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-                     newSL = NormalizeDouble(newSL, digits);
-                     
-                     if(trade.PositionModify(currentTicket, newSL, posTP))
-                     {
-                        if(DebugMode)
-                           Print("⚠️ Reversal protection: Tightened trailing stop (HTF trend flipped)");
-                     }
-                  }
-               }
-            }
-         }
-      }
-      else if(priceClosedAgainstTrend)
-      {
-         // Exit immediately if price closed against HTF trend
-         if(trade.PositionClose(currentTicket))
-         {
-            if(DebugMode)
-               Print("⚠️ Reversal protection: Exiting position (HTF trend flipped + price closed against trend)");
          }
       }
    }
@@ -725,9 +503,7 @@ void UpdateTrailingStop()
    if(!SymbolInfoTick(_Symbol, tick)) return;
    
    double currentPrice = (posType == POSITION_TYPE_BUY) ? tick.bid : tick.ask;
-   double profit = (posType == POSITION_TYPE_BUY) ? 
-                   (currentPrice - posPriceOpen) : 
-                   (posPriceOpen - currentPrice);
+   double profit = (posType == POSITION_TYPE_BUY) ? (currentPrice - posPriceOpen) : (posPriceOpen - currentPrice);
    
    if(profit <= 0) return; // Only trail when in profit
    
@@ -742,15 +518,13 @@ void UpdateTrailingStop()
    {
       newSL = currentPrice - trailingDistance;
       // Only update if new SL is significantly better (prevents overtightening)
-      if(newSL > posSL + trailingStep)
-         shouldUpdate = true;
+      if(newSL > posSL + trailingStep) shouldUpdate = true;
    }
    else
    {
       newSL = currentPrice + trailingDistance;
       // Only update if new SL is significantly better
-      if(posSL == 0 || newSL < posSL - trailingStep)
-         shouldUpdate = true;
+      if(posSL == 0 || newSL < posSL - trailingStep) shouldUpdate = true;
    }
    
    if(shouldUpdate && newSL > 0)
@@ -760,14 +534,11 @@ void UpdateTrailingStop()
       double slDistanceFromEntry = MathAbs(newSL - posPriceOpen) / pipPoint;
       double entryDistance = 5.0 * pipPoint; // Small buffer
       
-      if(posType == POSITION_TYPE_BUY && newSL < posPriceOpen - entryDistance)
-         return; // Don't move below entry
-      if(posType == POSITION_TYPE_SELL && newSL > posPriceOpen + entryDistance)
-         return; // Don't move above entry
+      if(posType == POSITION_TYPE_BUY && newSL < posPriceOpen - entryDistance) return; // Don't move below entry
+      if(posType == POSITION_TYPE_SELL && newSL > posPriceOpen + entryDistance) return; // Don't move above entry
       
       int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
       newSL = NormalizeDouble(newSL, digits);
-      
       if(trade.PositionModify(currentTicket, newSL, posTP))
       {
          if(DebugMode)
@@ -803,8 +574,6 @@ void SyncPositionState()
       currentSL = 0;
       currentTP = 0;
       highestProfit = 0;
-      partialTPClosed = false;
-      originalLotSize = 0;
       return;
    }
    
@@ -821,12 +590,6 @@ void SyncPositionState()
          currentDirection = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
          currentSL = PositionGetDouble(POSITION_SL);
          currentTP = PositionGetDouble(POSITION_TP);
-         
-         // Check if partial TP was already closed by comparing volume
-         double currentVolume = PositionGetDouble(POSITION_VOLUME);
-         if(originalLotSize > 0 && currentVolume < originalLotSize * 0.6)
-            partialTPClosed = true;
-         
          break;
       }
    }
@@ -859,8 +622,7 @@ int OnInit()
    macdHandle = iMACD(_Symbol, EntryTimeframe, MACD_Fast, MACD_Slow, MACD_Signal, PRICE_CLOSE);
    
    if(atrHandle == INVALID_HANDLE || fastEMA_HTF == INVALID_HANDLE || slowEMA_HTF == INVALID_HANDLE ||
-      fastEMA_Entry == INVALID_HANDLE || slowEMA_Entry == INVALID_HANDLE || rsiHandle == INVALID_HANDLE ||
-      macdHandle == INVALID_HANDLE)
+      fastEMA_Entry == INVALID_HANDLE || slowEMA_Entry == INVALID_HANDLE || rsiHandle == INVALID_HANDLE || macdHandle == INVALID_HANDLE)
    {
       Print("❌ ERROR: Failed to create indicators");
       return INIT_FAILED;
@@ -873,26 +635,19 @@ int OnInit()
    highestProfit = 0;
    lastEntryTime = 0;
    lastBarTime = 0;
-   partialTPClosed = false;
-   originalLotSize = 0;
    
    SyncPositionState();
    
    Print("========================================");
-   Print("Momentum Strategy EA V2 for JPY Pairs v4.00");
-   Print("Strategy: EMA + RSI + MACD (Prop-Firm Optimized)");
+   Print("Momentum Strategy EA for JPY Pairs v3.00");
+   Print("Strategy: EMA + RSI + MACD (Longer Holds)");
    Print("HTF: ", EnumToString(HTF_Timeframe));
    Print("Entry TF: ", EnumToString(EntryTimeframe));
    Print("Session: ", (UseSessionFilter ? "Asian (22:00-9:00 GMT)" : "All"));
-   Print("Min Lot: ", MinLotSize, " (reduced for smoother drawdowns)");
-   Print("Risk: ", RiskPercent, "% per trade");
-   Print("Volatility Filter: ", (UseVolatilityFilter ? "ON (blocks ATR > 1.8× avg)" : "OFF"));
-   Print("SL: ATR × ", ATR_Multiplier_SL);
-   Print("TP: ", (UseTakeProfit ? "ATR × " + DoubleToString(ATR_Multiplier_TP, 1) : "Disabled (trailing stop exit)"));
-   Print("Partial Close: ", (UsePartialClose ? "ON (" + DoubleToString(PartialClose_Percent, 1) + "% at +" + DoubleToString(PartialClose_ATR, 1) + " ATR)" : "OFF"));
+   Print("Min Lot: ", MinLotSize);
+   Print("SL: ATR × ", ATR_Multiplier_SL, " | TP: ", (UseTakeProfit ? "ATR × " + DoubleToString(ATR_Multiplier_TP, 1) : "Disabled (trailing stop exit)"));
    Print("Trailing Stop: ", (UseTrailingStop ? "ON (ATR × " + DoubleToString(TrailingStop_ATR, 1) + ")" : "OFF"));
    Print("Breakeven: ", (UseBreakeven ? "ON (after ATR × " + DoubleToString(Breakeven_ATR_Profit, 1) + " profit)" : "OFF"));
-   Print("Reversal Protection: ", (UseReversalProtection ? (ReversalTightenTrailing ? "ON (tighten trailing)" : "ON (exit immediately)") : "OFF"));
    Print("========================================");
    
    return INIT_SUCCEEDED;
@@ -908,7 +663,7 @@ void OnDeinit(const int reason)
    if(rsiHandle != INVALID_HANDLE) IndicatorRelease(rsiHandle);
    if(macdHandle != INVALID_HANDLE) IndicatorRelease(macdHandle);
    
-   Print("EA V2 deinitialized. Reason: ", reason);
+   Print("EA deinitialized. Reason: ", reason);
 }
 
 //===================== ONTICK =====================//
@@ -925,11 +680,8 @@ void OnTick()
    // Manage existing position
    if(currentTicket > 0 && PositionSelectByTicket(currentTicket))
    {
-      // Manage position: breakeven, partial close, reversal protection, trailing stop
-      UpdateBreakevenStop();     // First move to breakeven when profit threshold reached
-      CheckPartialClose();        // Check if partial close threshold hit (30-50% at +1.5 ATR)
-      CheckReversalProtection();  // Protect against HTF trend reversals
-      UpdateTrailingStop();       // Then trail the stop to lock in profits
+      UpdateBreakevenStop(); // First move to breakeven when profit threshold reached
+      UpdateTrailingStop();  // Then trail the stop to lock in profits
       return; // Don't open new trades while one is open
    }
    
@@ -937,7 +689,6 @@ void OnTick()
    if(isNewBar && !HasExistingPosition())
    {
       lastBarTime = currentBarTime;
-      
       ENUM_POSITION_TYPE dir = WRONG_VALUE;
       if(CheckEntrySignal(dir))
       {
@@ -951,5 +702,4 @@ void OnTick()
       }
    }
 }
-
 //+------------------------------------------------------------------+

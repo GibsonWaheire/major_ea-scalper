@@ -309,3 +309,4 @@ This EA is for educational purposes. Trading forex involves substantial risk. Al
 
 
 
+

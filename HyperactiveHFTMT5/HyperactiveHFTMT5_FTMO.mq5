@@ -1,6 +1,6 @@
 #property copyright "Copyright 2025, Hyperactive HFT MT5 Scalper"
 #property link      "https://www.mcgibsdigitalsolutions.com"
-#property version   "2.00"
+#property version   "2.00_FTMO"
 
 #include <Trade/Trade.mqh>
 
@@ -33,14 +33,14 @@ input double   MinLotSize          = 0.01;     // Minimum lot size (safety limit
 input group "===== Momentum Breakout Entry ====="
 input int      MomentumPeriod      = 18;       // Period for momentum calculation (ticks) - Reduced from 30 for more opportunities
 input double   BreakoutThreshold   = 0.00035;  // Minimum price movement for breakout (reduced for more entries)
-input int      MinTickSpeed        = 3;        // Minimum ticks per second for entry (reduced from 5)
+input int      MinTickSpeed        = 5;        // Minimum ticks per second for entry (FTMO safe: 5-6 to reduce message count)
 input bool     UseTickSpeedFilter  = true;     // Enable tick speed filter
 input double   StrongBreakoutMultiplier = 1.8; // Enter immediately if breakout >= threshold * multiplier (bypass pullback)
 
 // ===== Exit Settings =====
 input group "===== Profit Exit Settings ====="
 input double   MinProfitPoints     = 10.0;     // Minimum profit in points to exit
-input int      MaxProfitHoldSeconds = 200;     // Maximum seconds to hold profitable trade
+input int      MaxProfitHoldSeconds = 60;      // Maximum seconds to hold profitable trade (FTMO safe: 60)
 input bool     ExitImmediatelyOnProfit = true; // Exit immediately when profit target reached
 
 input group "===== Loss Protection Settings ====="
@@ -59,8 +59,8 @@ input double   TrailingStepPoints  = 10.0;     // Trailing step in points (tight
 // ===== Spread & Slippage =====
 input group "===== Spread & Execution ====="
 input double   MaxSpreadPoints     = 50.0;     // Maximum spread in points
-input int      MaxSlippagePoints   = 10;       // Maximum slippage in points
-input int      OrderRetries        = 3;        // Number of order retries
+input int      MaxSlippagePoints   = 5;        // Maximum slippage in points (FTMO safe: 5 to avoid bad fills)
+input int      OrderRetries        = 1;        // Number of order retries (FTMO safe: 1 to avoid server spam)
 
 // ===== Risk Management =====
 input group "===== Risk Management ====="
@@ -161,6 +161,7 @@ double highestBalance = 0.0;
 double dailyProfit = 0.0;
 datetime lastDayReset = 0;
 bool tradingStopped = false;
+int dailyTradeCount = 0;  // FTMO Safety: Count trades per day to avoid server hyperactivity ban
 
 // Pullback tracking
 double breakoutPeakPrice = 0.0;
@@ -187,8 +188,8 @@ double averageSpread = 0.0;
 int OnInit()
 {
    Print("========================================");
-   Print("Hyperactive HFT MT5 Scalper V2.00");
-   Print("Ultra-fast momentum breakout scalping with advanced filters");
+   Print("Hyperactive HFT MT5 Scalper V2.00_FTMO");
+   Print("FTMO-Safe Version: Ultra-fast momentum breakout scalping with daily trade limit");
    Print("========================================");
    
    trade.SetExpertMagicNumber(MagicNumber);
@@ -223,6 +224,7 @@ int OnInit()
    dailyProfit = 0.0;
    lastDayReset = TimeCurrent();
    tradingStopped = false;
+   dailyTradeCount = 0;  // FTMO Safety: Initialize daily trade count
    
    // Initialize arrays
    for(int i = 0; i < 50; i++)
@@ -601,6 +603,7 @@ void CheckRiskManagement()
    if(dt.day != lastDt.day || dt.mon != lastDt.mon || dt.year != lastDt.year)
    {
       dailyProfit = 0.0;
+      dailyTradeCount = 0;  // FTMO Safety: Reset daily trade count
       lastDayReset = currentTime;
    }
    
@@ -914,6 +917,14 @@ bool OpenTrade(int direction)
    if(hasActiveTrade)
       return false;
    
+   // FTMO Safety: Check daily trade limit to avoid server hyperactivity ban
+   if(dailyTradeCount >= 200)
+   {
+      Print("FTMO Safety: Daily trade limit reached (200 trades). Trading stopped to avoid server hyperactivity ban.");
+      tradingStopped = true;
+      return false;
+   }
+   
    double lotSize = CalculateLotSize();
    double price = (direction == 1) ? currentAsk : currentBid;
    
@@ -1016,8 +1027,10 @@ bool OpenTrade(int direction)
          breakoutDirection = 0;
          breakoutTime = 0;
          
+         dailyTradeCount++;  // FTMO Safety: Increment daily trade count
          Print("TRADE OPENED: ", (direction == 1 ? "BUY" : "SELL"), 
-               " | Lot: ", lotSize, " | Price: ", actualEntryPrice, " | SL: ", sl);
+               " | Lot: ", lotSize, " | Price: ", actualEntryPrice, " | SL: ", sl,
+               " | Daily Trades: ", dailyTradeCount, "/200");
          return true;
       }
    }
@@ -1271,7 +1284,7 @@ void CloseTrade(string reason)
 
 void UpdateDisplay()
 {
-   string status = "\n=== Hyperactive HFT MT5 Scalper V2.00 ===\n";
+   string status = "\n=== Hyperactive HFT MT5 Scalper V2.00_FTMO ===\n";
    status += "Symbol: " + tradeSymbol + "\n";
    status += "Lot Mode: " + (UseFixedLot ? "FIXED" : "DYNAMIC") + "\n";
    if(UseFixedLot)
@@ -1381,6 +1394,11 @@ void UpdateDisplay()
       status += "Daily Profit: $" + DoubleToString(dailyProfit, 2);
       status += " / $" + DoubleToString(DailyProfitTarget, 2) + "\n";
    }
+   
+   // FTMO Safety: Show daily trade count
+   status += "Daily Trades: " + IntegerToString(dailyTradeCount) + "/200 (FTMO Limit)\n";
+   if(dailyTradeCount >= 200)
+      status += "TRADING STOPPED: Daily trade limit reached\n";
    
    Comment(status);
 }

@@ -1,21 +1,22 @@
 //+------------------------------------------------------------------+
-//|         Pure Momentum Scalper - Trend Following for JPY Pairs    |
-//|          EMA + RSI + MACD Momentum Strategy                       |
+//|         Pure Momentum Scalper FTMO Challenge v4.2                  |
+//|          EMA + RSI + MACD Strategy - Controlled Aggression        |
+//|          FTMO Challenge Version - Optimized for Passing           |
 //|          Optimized for USDJPY/EURJPY/GBPJPY - Asian Session      |
 //|                       © Gibson 2025                                |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, Advanced Trading Systems"
 #property link      "https://www.mcgibsdigitalsolutions.com"
-#property version   "3.00"
+#property version   "4.20"  // FTMO Challenge Version - Controlled Aggression
 
 #include <Trade\Trade.mqh>
 CTrade trade;
 
 //===================== STRATEGY INPUTS =====================//
-input group "===== Momentum Strategy Settings (JPY Pairs) ====="
+// NOTE: FTMO-safe rules are HARD-LOCKED (UseSessionFilter, UseVolatilityFilter, UsePartialClose, UseReversalProtection)
+input group "===== Momentum Strategy Settings (JPY Pairs) - FTMO Safe ====="
 input ENUM_TIMEFRAMES HTF_Timeframe = PERIOD_M15;  // Trend timeframe (M15 or H1)
 input ENUM_TIMEFRAMES EntryTimeframe = PERIOD_M5;  // Entry timeframe (M5 recommended)
-input bool UseSessionFilter = true;                // Trade Asian/Tokyo session only (22:00-9:00 GMT)
 input double MaxSpreadPips = 5.0;                  // Maximum spread filter
 
 input group "===== Indicator Settings ====="
@@ -28,21 +29,33 @@ input int MACD_Fast = 12;                          // MACD fast EMA
 input int MACD_Slow = 26;                          // MACD slow EMA
 input int MACD_Signal = 9;                         // MACD signal line
 
-input group "===== Entry/Exit Settings (Longer Holds) ====="
-input double ATR_Multiplier_SL = 4.0;              // ATR multiplier for stop loss (wider = more flexible)
-input double ATR_Multiplier_TP = 8.0;              // ATR multiplier for take profit (higher = longer holds)
+input group "===== Entry/Exit Settings v4.2 (Controlled Aggression) ====="
+input double ATR_Multiplier_SL = 3.0;              // ATR multiplier for stop loss (v4.2: tightened from 4.0)
 input bool UseTakeProfit = false;                  // Use fixed TP (false = let trailing stop handle exits)
+input double ATR_Multiplier_TP = 8.0;              // ATR multiplier for take profit (if enabled)
 input bool UseTrailingStop = true;                 // Enable trailing stop (recommended for longer holds)
-input double TrailingStop_ATR = 2.5;               // Trailing stop ATR multiplier (wider = let trades breathe)
-input double TrailingStep_ATR = 1.0;               // Trailing step ATR multiplier (bigger step = less frequent updates)
+input double TrailingStop_ATR = 2.5;               // Trailing stop ATR multiplier
+input double TrailingStep_ATR = 1.0;               // Trailing step ATR multiplier
 input bool UseBreakeven = true;                    // Move SL to breakeven after profit threshold
 input double Breakeven_ATR_Profit = 2.0;           // Move to breakeven after this ATR profit
-input int MinBarsAfterEntry = 5;                   // Minimum bars before allowing new entry
+input double PartialClose_Percent = 40.0;          // Percentage to close (30-50%)
+input double PartialClose_ATR = 2.2;               // ATR multiplier for partial close (v4.2: delayed from 1.5)
+input bool ReversalTightenTrailing = false;        // v4.2: Exit only (not tighten trailing)
+input int MinBarsAfterEntry = 10;                  // Minimum bars before allowing new entry (v4.2: increased from 5)
 
-input group "===== Risk Management ====="
+// FTMO-safe rules are HARD-LOCKED (cannot be disabled)
+#define FTMO_USE_SESSION_FILTER true
+#define FTMO_USE_VOLATILITY_FILTER true
+#define FTMO_USE_PARTIAL_CLOSE true
+#define FTMO_USE_REVERSAL_PROTECTION true
+#define FTMO_ALLOW_MULTIPLE_TRADES false
+
+input group "===== Risk Management v4.2 (Controlled Aggression) ====="
 input int    MagicNumber   = 202501;               // Magic Number
-input double RiskPercent   = 0.5;                  // Risk % per trade
-input double MinLotSize    = 0.5;                  // Minimum lot size (0.5 lots for JPY pairs)
+input double RiskPercent   = 0.45;                 // Risk % per trade (v4.2: increased from 0.25 for challenge)
+input double MinLotSize    = 0.05;                 // Minimum lot size (FTMO: reduced from 0.1 for smoother drawdowns)
+input double DailyLossLimitPercent = 3.5;          // Daily equity drawdown limit % (blocks new trades if exceeded)
+input double MaxTotalDDPercent = 8.0;              // Max total drawdown % from balance peak (blocks new trades if exceeded)
 input bool DebugMode = true;                       // Enable detailed logging
 
 //===================== INTERNAL STATE =====================//
@@ -53,6 +66,16 @@ double currentTP = 0;
 double highestProfit = 0;
 datetime lastEntryTime = 0;
 datetime lastBarTime = 0;
+bool partialTPClosed = false;                     // Track if partial TP was closed
+double originalLotSize = 0;                       // Track original lot size for partial close
+
+// FTMO Safety State
+double dailyStartEquity = 0;                      // Equity at start of day
+datetime lastDayReset = 0;                        // Last day reset timestamp
+double balancePeak = 0;                           // Peak balance/equity since EA start
+bool dailyLossLimitHit = false;                   // Daily loss limit reached
+bool maxDDLimitHit = false;                       // Max drawdown limit reached
+string allowedSymbol = "";                        // Only trade this symbol (chart symbol)
 
 // Indicator handles
 int atrHandle = INVALID_HANDLE;
@@ -105,11 +128,118 @@ double CalcLot(double slDistancePips)
    return NormalizeDouble(lot, 2);
 }
 
+//===================== FTMO SAFETY GUARDS =====================//
+
+void CheckDailyReset()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   datetime currentDay = StringToTime(IntegerToString(dt.year) + "." + 
+                                      IntegerToString(dt.mon) + "." + 
+                                      IntegerToString(dt.day));
+   
+   // Reset daily tracking at start of new day
+   if(currentDay != lastDayReset)
+   {
+      dailyStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      dailyLossLimitHit = false;
+      lastDayReset = currentDay;
+      
+      if(DebugMode)
+         Print("📅 Daily reset: Start equity = ", dailyStartEquity);
+   }
+}
+
+bool CheckDailyLossLimit()
+{
+   if(dailyLossLimitHit) return false; // Already hit, stay blocked
+   
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double dailyDrawdown = dailyStartEquity - currentEquity;
+   double dailyDrawdownPercent = (dailyDrawdown / dailyStartEquity) * 100.0;
+   
+   if(dailyDrawdownPercent >= DailyLossLimitPercent)
+   {
+      dailyLossLimitHit = true;
+      if(DebugMode)
+         Print("⚠️ FTMO Daily Loss Limit Hit: ", DoubleToString(dailyDrawdownPercent, 2), "% (Limit: ", DailyLossLimitPercent, "%) - Blocking new trades for rest of day");
+      return false;
+   }
+   
+   return true;
+}
+
+void UpdateBalancePeak()
+{
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double currentPeak = MathMax(currentEquity, currentBalance);
+   
+   if(currentPeak > balancePeak)
+   {
+      balancePeak = currentPeak;
+      maxDDLimitHit = false; // Reset if we reach new peak
+   }
+}
+
+bool CheckMaxDrawdownLimit()
+{
+   if(maxDDLimitHit) return false; // Already hit, stay blocked
+   
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double currentValue = MathMax(currentEquity, currentBalance);
+   
+   if(balancePeak > 0)
+   {
+      double drawdown = balancePeak - currentValue;
+      double drawdownPercent = (drawdown / balancePeak) * 100.0;
+      
+      if(drawdownPercent >= MaxTotalDDPercent)
+      {
+         maxDDLimitHit = true;
+         if(DebugMode)
+            Print("⚠️ FTMO Max Drawdown Limit Hit: ", DoubleToString(drawdownPercent, 2), "% from peak (Limit: ", MaxTotalDDPercent, "%) - Blocking new trades permanently");
+         return false;
+      }
+   }
+   
+   return true;
+}
+
+bool CheckSymbolLimiter()
+{
+   // Only trade the chart symbol (prevent multi-pair FTMO violations)
+   if(allowedSymbol == "")
+   {
+      allowedSymbol = _Symbol; // Set on first call
+      if(DebugMode)
+         Print("🔒 FTMO Symbol Limiter: Trading only ", allowedSymbol);
+   }
+   
+   if(_Symbol != allowedSymbol)
+   {
+      if(DebugMode)
+      {
+         static datetime lastLog = 0;
+         if(TimeCurrent() - lastLog > 3600)
+         {
+            Print("❌ Entry blocked: Symbol limiter active. EA trades only ", allowedSymbol, " (current: ", _Symbol, ")");
+            lastLog = TimeCurrent();
+         }
+      }
+      return false;
+   }
+   
+   return true;
+}
+
 //===================== SESSION FILTER =====================//
 
 bool IsValidSession()
 {
-   if(!UseSessionFilter) return true;
+   // FTMO: Hard-locked to true
+   if(!FTMO_USE_SESSION_FILTER) return true;
    
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
@@ -183,6 +313,44 @@ bool IsTrendBearish_HTF()
    bool strengthening = (fastEMA[0] < fastEMA[1] && slowEMA[0] < slowEMA[1]);
    
    return (trendBearish && strengthening);
+}
+
+//===================== VOLATILITY SAFETY FILTER =====================//
+
+bool IsVolatilityOK()
+{
+   // FTMO: Hard-locked to true
+   if(!FTMO_USE_VOLATILITY_FILTER) return true;
+   if(atrHandle == INVALID_HANDLE) return true;
+   
+   double atr[];
+   ArraySetAsSeries(atr, true);
+   if(CopyBuffer(atrHandle, 0, 0, 20, atr) < 20) return true;
+   
+   // Calculate 20-period ATR average
+   double atrSum = 0;
+   for(int i = 0; i < 20; i++) atrSum += atr[i];
+   double atrAverage = atrSum / 20.0;
+   double currentATR = atr[0];
+   
+   // Block if ATR > 1.8× average (BOJ spikes / fake breakouts)
+   double threshold = atrAverage * 1.8;
+   
+   if(currentATR > threshold)
+   {
+      if(DebugMode)
+      {
+         static datetime lastLog = 0;
+         if(TimeCurrent() - lastLog > 300)
+         {
+            Print("❌ Entry blocked: Volatility too high (ATR=", currentATR, " > 1.8× avg=", threshold, ")");
+            lastLog = TimeCurrent();
+         }
+      }
+      return false;
+   }
+   
+   return true;
 }
 
 //===================== MOMENTUM CONFIRMATION (Entry TF) =====================//
@@ -285,9 +453,15 @@ bool CheckEMA_Bearish_Entry()
 
 bool CheckEntrySignal(ENUM_POSITION_TYPE &dir)
 {
-   // 1. Basic filters
+   // FTMO Safety Checks First (before strategy logic)
+   if(!CheckSymbolLimiter()) return false;
+   if(!CheckDailyLossLimit()) return false;
+   if(!CheckMaxDrawdownLimit()) return false;
+   
+   // 1. Basic filters (FTMO-safe rules hard-locked)
    if(!IsValidSession()) return false;
    if(!IsSpreadOK()) return false;
+   if(!IsVolatilityOK()) return false; // Volatility safety filter
    
    // 2. Check minimum bars since last entry
    if(lastEntryTime > 0)
@@ -366,7 +540,7 @@ void CalculateSLTP(double entry, bool isBuy, double &sl, double &tp)
    double atrValue = atr[0];
    double pipPoint = PipPoint();
    
-   // Calculate stop loss (wider for flexibility)
+   // Calculate stop loss
    if(isBuy)
    {
       sl = entry - (atrValue * ATR_Multiplier_SL);
@@ -415,6 +589,9 @@ ulong OpenTrade(ENUM_POSITION_TYPE dir)
    }
    
    ulong ticket = trade.ResultOrder();
+   originalLotSize = lot; // Store for partial close
+   partialTPClosed = false; // Reset partial close flag
+   
    string tpStr = (tp > 0) ? DoubleToString(tp, 5) : "None (trailing stop exit)";
    Print("✅ Trade opened: ", (dir == POSITION_TYPE_BUY ? "BUY" : "SELL"),
          " Ticket: ", ticket, " Lot: ", lot, " Entry: ", entry, " SL: ", sl, " TP: ", tpStr);
@@ -484,6 +661,171 @@ void UpdateBreakevenStop()
          {
             if(DebugMode)
                Print("🔒 Breakeven stop set: Ticket=", currentTicket, " SL=", newSL, " (Entry=", posPriceOpen, ")");
+         }
+      }
+   }
+}
+
+//===================== PARTIAL PROFIT TAKING =====================//
+
+void CheckPartialClose()
+{
+   // FTMO: Hard-locked to true
+   if(!FTMO_USE_PARTIAL_CLOSE || currentTicket == 0 || partialTPClosed) return;
+   if(!PositionSelectByTicket(currentTicket)) return;
+   
+   if(atrHandle == INVALID_HANDLE) return;
+   
+   double atr[];
+   ArraySetAsSeries(atr, true);
+   if(CopyBuffer(atrHandle, 0, 0, 1, atr) <= 0) return;
+   
+   double posVolume = PositionGetDouble(POSITION_VOLUME);
+   double posPriceOpen = PositionGetDouble(POSITION_PRICE_OPEN);
+   ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick)) return;
+   
+   double currentPrice = (posType == POSITION_TYPE_BUY) ? tick.bid : tick.ask;
+   double profit = (posType == POSITION_TYPE_BUY) ? 
+                   (currentPrice - posPriceOpen) : 
+                   (posPriceOpen - currentPrice);
+   
+   double atrValue = atr[0];
+   double partialCloseThreshold = atrValue * PartialClose_ATR; // +1.5 ATR
+   
+   // Check if profit reached +1.5 ATR
+   if(profit >= partialCloseThreshold)
+   {
+      // Close 30-50% of position (configurable)
+      double closePercent = MathMax(30.0, MathMin(50.0, PartialClose_Percent)) / 100.0;
+      double closeVolume = NormalizeDouble(posVolume * closePercent, 2);
+      
+      // Ensure we close at least minimum lot size
+      double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      if(closeVolume < minLot) closeVolume = minLot;
+      
+      // Don't close more than current position
+      if(closeVolume >= posVolume) closeVolume = NormalizeDouble(posVolume * 0.9, 2); // Close 90% max
+      
+      if(trade.PositionClosePartial(currentTicket, closeVolume))
+      {
+         partialTPClosed = true;
+         if(DebugMode)
+            Print("💰 Partial close: ", closeVolume, " lots (", DoubleToString(closePercent * 100, 1), "%) at +", DoubleToString(partialCloseThreshold / PipPoint(), 1), " pips profit");
+      }
+   }
+}
+
+//===================== REVERSAL PROTECTION =====================//
+
+void CheckReversalProtection()
+{
+   // FTMO: Hard-locked to true
+   if(!FTMO_USE_REVERSAL_PROTECTION || currentTicket == 0) return;
+   if(!PositionSelectByTicket(currentTicket)) return;
+   
+   ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   
+   // Check if HTF trend has flipped
+   bool htfBullish = IsTrendBullish_HTF();
+   bool htfBearish = IsTrendBearish_HTF();
+   
+   bool trendFlipped = false;
+   bool priceClosedAgainstTrend = false;
+   
+   // For BUY position, check if trend flipped to bearish
+   if(posType == POSITION_TYPE_BUY && htfBearish)
+   {
+      trendFlipped = true;
+      
+      // Check if price closed against HTF trend (below fast EMA)
+      double fastEMA[];
+      ArraySetAsSeries(fastEMA, true);
+      if(CopyBuffer(fastEMA_HTF, 0, 0, 1, fastEMA) >= 1)
+      {
+         double close[];
+         ArraySetAsSeries(close, true);
+         if(CopyClose(_Symbol, HTF_Timeframe, 0, 1, close) >= 1)
+         {
+            if(close[0] < fastEMA[0])
+               priceClosedAgainstTrend = true;
+         }
+      }
+   }
+   
+   // For SELL position, check if trend flipped to bullish
+   if(posType == POSITION_TYPE_SELL && htfBullish)
+   {
+      trendFlipped = true;
+      
+      // Check if price closed against HTF trend (above fast EMA)
+      double fastEMA[];
+      ArraySetAsSeries(fastEMA, true);
+      if(CopyBuffer(fastEMA_HTF, 0, 0, 1, fastEMA) >= 1)
+      {
+         double close[];
+         ArraySetAsSeries(close, true);
+         if(CopyClose(_Symbol, HTF_Timeframe, 0, 1, close) >= 1)
+         {
+            if(close[0] > fastEMA[0])
+               priceClosedAgainstTrend = true;
+         }
+      }
+   }
+   
+   if(trendFlipped)
+   {
+      if(ReversalTightenTrailing)
+      {
+         // Tighten trailing stop aggressively (reduce to 1.0 ATR)
+         if(atrHandle != INVALID_HANDLE)
+         {
+            double atr[];
+            ArraySetAsSeries(atr, true);
+            if(CopyBuffer(atrHandle, 0, 0, 1, atr) > 0)
+            {
+               double atrValue = atr[0];
+               double tightTrailingDistance = atrValue * 1.0; // Much tighter
+               
+               MqlTick tick;
+               if(SymbolInfoTick(_Symbol, tick))
+               {
+                  double currentPrice = (posType == POSITION_TYPE_BUY) ? tick.bid : tick.ask;
+                  double posSL = PositionGetDouble(POSITION_SL);
+                  double posTP = PositionGetDouble(POSITION_TP);
+                  double newSL = 0;
+                  
+                  if(posType == POSITION_TYPE_BUY)
+                     newSL = currentPrice - tightTrailingDistance;
+                  else
+                     newSL = currentPrice + tightTrailingDistance;
+                  
+                  // Only tighten if new SL is better
+                  if((posType == POSITION_TYPE_BUY && newSL > posSL) ||
+                     (posType == POSITION_TYPE_SELL && (posSL == 0 || newSL < posSL)))
+                  {
+                     int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+                     newSL = NormalizeDouble(newSL, digits);
+                     
+                     if(trade.PositionModify(currentTicket, newSL, posTP))
+                     {
+                        if(DebugMode)
+                           Print("⚠️ Reversal protection: Tightened trailing stop (HTF trend flipped)");
+                     }
+                  }
+               }
+            }
+         }
+      }
+      else if(priceClosedAgainstTrend)
+      {
+         // Exit immediately if price closed against HTF trend
+         if(trade.PositionClose(currentTicket))
+         {
+            if(DebugMode)
+               Print("⚠️ Reversal protection: Exiting position (HTF trend flipped + price closed against trend)");
          }
       }
    }
@@ -589,6 +931,8 @@ void SyncPositionState()
       currentSL = 0;
       currentTP = 0;
       highestProfit = 0;
+      partialTPClosed = false;
+      originalLotSize = 0;
       return;
    }
    
@@ -605,6 +949,12 @@ void SyncPositionState()
          currentDirection = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
          currentSL = PositionGetDouble(POSITION_SL);
          currentTP = PositionGetDouble(POSITION_TP);
+         
+         // Check if partial TP was already closed by comparing volume
+         double currentVolume = PositionGetDouble(POSITION_VOLUME);
+         if(originalLotSize > 0 && currentVolume < originalLotSize * 0.6)
+            partialTPClosed = true;
+         
          break;
       }
    }
@@ -651,19 +1001,62 @@ int OnInit()
    highestProfit = 0;
    lastEntryTime = 0;
    lastBarTime = 0;
+   partialTPClosed = false;
+   originalLotSize = 0;
+   
+   // Initialize FTMO safety state
+   allowedSymbol = _Symbol;
+   balancePeak = AccountInfoDouble(ACCOUNT_BALANCE);
+   dailyStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(dailyStartEquity > balancePeak) balancePeak = dailyStartEquity;
+   lastDayReset = 0;
+   dailyLossLimitHit = false;
+   maxDDLimitHit = false;
+   CheckDailyReset(); // Initialize daily tracking
+   UpdateBalancePeak(); // Initialize peak tracking
    
    SyncPositionState();
    
    Print("========================================");
-   Print("Momentum Strategy EA for JPY Pairs v3.00");
-   Print("Strategy: EMA + RSI + MACD (Longer Holds)");
+   Print("Momentum Strategy EA FTMO Challenge v4.2");
+   Print("FTMO Challenge Version - Controlled Aggression");
+   Print("Strategy: EMA + RSI + MACD (Core Logic Unchanged)");
+   Print("========================================");
+   Print("FTMO SAFETY FEATURES (Hard-Locked):");
+   Print("  ✓ Session Filter: ALWAYS ON");
+   Print("  ✓ Volatility Filter: ALWAYS ON");
+   Print("  ✓ Partial Close: ALWAYS ON");
+   Print("  ✓ Reversal Protection: ALWAYS ON (Exit Only Mode)");
+   Print("  ✓ Single Position Only: ALWAYS");
+   Print("  ✓ Symbol Limiter: Trading only ", allowedSymbol);
+   Print("========================================");
+   Print("V4.2 CONTROLLED AGGRESSION CHANGES:");
+   Print("  • Risk: ", RiskPercent, "% (v4.2: increased from 0.25%)");
+   Print("  • SL: ATR × ", ATR_Multiplier_SL, " (v4.2: tightened from 4.0)");
+   Print("  • Partial Close: +", DoubleToString(PartialClose_ATR, 1), " ATR (v4.2: delayed from 1.5)");
+   Print("  • Min Bars After Entry: ", MinBarsAfterEntry, " (v4.2: increased from 5)");
+   Print("  • Reversal: Exit only (v4.2: not tighten trailing)");
+   Print("========================================");
+   Print("TRADING SETTINGS:");
    Print("HTF: ", EnumToString(HTF_Timeframe));
    Print("Entry TF: ", EnumToString(EntryTimeframe));
-   Print("Session: ", (UseSessionFilter ? "Asian (22:00-9:00 GMT)" : "All"));
    Print("Min Lot: ", MinLotSize);
-   Print("SL: ATR × ", ATR_Multiplier_SL, " | TP: ", (UseTakeProfit ? "ATR × " + DoubleToString(ATR_Multiplier_TP, 1) : "Disabled (trailing stop exit)"));
+   Print("SL: ATR × ", ATR_Multiplier_SL);
+   Print("TP: ", (UseTakeProfit ? "ATR × " + DoubleToString(ATR_Multiplier_TP, 1) : "Disabled (trailing stop exit)"));
+   Print("Partial Close: ON (", DoubleToString(PartialClose_Percent, 1), "% at +", DoubleToString(PartialClose_ATR, 1), " ATR)");
    Print("Trailing Stop: ", (UseTrailingStop ? "ON (ATR × " + DoubleToString(TrailingStop_ATR, 1) + ")" : "OFF"));
    Print("Breakeven: ", (UseBreakeven ? "ON (after ATR × " + DoubleToString(Breakeven_ATR_Profit, 1) + " profit)" : "OFF"));
+   Print("Reversal Protection: Exit only on HTF candle close against trend");
+   Print("========================================");
+   Print("FTMO SAFETY LIMITS:");
+   Print("  Daily Loss Limit: ", DailyLossLimitPercent, "% (blocks new trades if exceeded)");
+   Print("  Max Drawdown Limit: ", MaxTotalDDPercent, "% from peak (blocks new trades if exceeded)");
+   Print("  Starting Equity: ", dailyStartEquity);
+   Print("  Balance Peak: ", balancePeak);
+   Print("========================================");
+   Print("V4.2 GOAL METRICS:");
+   Print("  Target: Profit Factor ≥ 1.25, Expected Payoff ≥ 0.8");
+   Print("  Target: Max DD ≤ 4%, Trades/year: 900-1300");
    Print("========================================");
    
    return INIT_SUCCEEDED;
@@ -679,13 +1072,17 @@ void OnDeinit(const int reason)
    if(rsiHandle != INVALID_HANDLE) IndicatorRelease(rsiHandle);
    if(macdHandle != INVALID_HANDLE) IndicatorRelease(macdHandle);
    
-   Print("EA deinitialized. Reason: ", reason);
+   Print("EA FTMO Challenge v4.2 deinitialized. Reason: ", reason);
 }
 
 //===================== ONTICK =====================//
 
 void OnTick()
 {
+   // FTMO Safety: Update daily tracking and balance peak
+   CheckDailyReset(); // Check for new day and reset daily tracking
+   UpdateBalancePeak(); // Update peak balance/equity
+   
    // Check for new bar (entry signals only on new bar)
    datetime currentBarTime = iTime(_Symbol, EntryTimeframe, 0);
    bool isNewBar = (currentBarTime != lastBarTime);
@@ -696,8 +1093,11 @@ void OnTick()
    // Manage existing position
    if(currentTicket > 0 && PositionSelectByTicket(currentTicket))
    {
-      UpdateBreakevenStop(); // First move to breakeven when profit threshold reached
-      UpdateTrailingStop();  // Then trail the stop to lock in profits
+      // Manage position: breakeven, partial close, reversal protection, trailing stop
+      UpdateBreakevenStop();     // First move to breakeven when profit threshold reached
+      CheckPartialClose();        // Check if partial close threshold hit (30-50% at +1.5 ATR)
+      CheckReversalProtection();  // Protect against HTF trend reversals
+      UpdateTrailingStop();       // Then trail the stop to lock in profits
       return; // Don't open new trades while one is open
    }
    
