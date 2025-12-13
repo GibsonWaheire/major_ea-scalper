@@ -397,7 +397,6 @@ void CalculateSLTP(double entry, bool isBuy, double &sl, double &tp)
    {
       sl = 0;
       tp = 0;
-      partialTP = 0;
       return;
    }
    
@@ -407,7 +406,6 @@ void CalculateSLTP(double entry, bool isBuy, double &sl, double &tp)
    {
       sl = 0;
       tp = 0;
-      partialTP = 0;
       return;
    }
    
