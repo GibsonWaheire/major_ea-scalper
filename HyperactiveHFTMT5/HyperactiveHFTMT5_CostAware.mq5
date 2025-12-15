@@ -1,14 +1,14 @@
-#property copyright "Copyright 2025, Hyperactive HFT MT5 Scalper"
+#property copyright "Copyright 2025, Hyperactive HFT MT5 Scalper - Cost Aware"
 #property link      "https://www.mcgibsdigitalsolutions.com"
-#property version   "2.10"
+#property version   "2.01"
 
 #include <Trade/Trade.mqh>
 
 CTrade trade;
 
 // =====================================================================================================
-// HYPERACTIVE HFT MT5 SCALPER
-// Strategy: Ultra-fast momentum breakout scalping
+// HYPERACTIVE HFT MT5 SCALPER - COST AWARE VERSION
+// Strategy: Ultra-fast momentum breakout scalping with cost-aware exit logic
 // - One trade at a time
 // - Dynamic profit exit (close immediately when profit, hold up to 20 seconds)
 // - Loss protection (max 100 points, close after 10 seconds if losing)
@@ -16,7 +16,7 @@ CTrade trade;
 // - Fast execution (quick open/close)
 // - Dynamic or fixed lot sizing
 // - Multi-instrument support
-// MODIFIED: Fewer trades, longer holds
+// - COST-AWARE: Exit logic accounts for spread + commission to ensure net profitability
 // =====================================================================================================
 
 // ===== Core Trading Settings =====
@@ -32,25 +32,21 @@ input double   MinLotSize          = 0.01;     // Minimum lot size (safety limit
 
 // ===== Entry Settings =====
 input group "===== Momentum Breakout Entry ====="
-input int      MomentumPeriod      = 30;       // Period for momentum calculation (ticks) - Increased for fewer trades
-input double   BreakoutThreshold   = 0.0005;   // Minimum price movement for breakout - Increased for fewer trades
-input int      MinTickSpeed        = 5;        // Minimum ticks per second for entry - Increased for fewer trades
+input int      MomentumPeriod      = 18;       // Period for momentum calculation (ticks) - Reduced from 30 for more opportunities
+input double   BreakoutThreshold   = 0.00035;  // Minimum price movement for breakout (reduced for more entries)
+input int      MinTickSpeed        = 3;        // Minimum ticks per second for entry (reduced from 5)
 input bool     UseTickSpeedFilter  = true;     // Enable tick speed filter
-input double   StrongBreakoutMultiplier = 2.0; // Enter immediately if breakout >= threshold * multiplier - Increased for fewer trades
+input double   StrongBreakoutMultiplier = 1.8; // Enter immediately if breakout >= threshold * multiplier (bypass pullback)
 
 // ===== Exit Settings =====
 input group "===== Profit Exit Settings ====="
-input double   MinProfitPoints     = 30.0;     // (legacy) not used for BTCUSD equity exits
-input int      MaxProfitHoldSeconds = 400;     // Maximum seconds to hold profitable trade - Increased for longer holds
-input bool     ExitImmediatelyOnProfit = false; // Exit immediately when profit target reached - Disabled for longer holds
-input double   ProfitBufferPoints  = 20.0;     // (legacy) not used for BTCUSD equity exits
-input double   MinProfitUSD        = 1.50;     // Equity-based profit target for BTCUSD
-input double   TrailingUSD         = 1.20;     // Equity-based trailing amount for BTCUSD
-input double   MaxLossUSD          = 5.00;     // Fixed loss cap in account currency
+input double   MinProfitPoints     = 10.0;     // Minimum profit in points to exit
+input int      MaxProfitHoldSeconds = 200;     // Maximum seconds to hold profitable trade
+input bool     ExitImmediatelyOnProfit = true; // Exit immediately when profit target reached
 
 input group "===== Loss Protection Settings ====="
 input double   MaxLossPoints       = 250.0;    // Maximum loss in points (stop loss) - Reduced from 100
-input int      MaxLossHoldSeconds  = 150;      // Close losing trade after N seconds - Increased for longer holds
+input int      MaxLossHoldSeconds  = 100;      // Close losing trade after N seconds
 input bool     UseTimeBasedLossExit = true;    // Enable time-based loss exit
 
 // ===== Stop Loss Settings =====
@@ -58,14 +54,19 @@ input group "===== Stop Loss Settings ====="
 input bool     UseStopLoss         = false;    // Use hard stop loss
 input double   StopLossPoints      = 250.0;    // Stop loss in points (if UseStopLoss = true) - Reduced from 100
 input bool     UseTrailingStop     = true;     // Use trailing stop loss
-input double   TrailingStartPoints = 60.0;     // Start trailing after X points profit (increased to account for costs)
-input double   TrailingStepPoints  = 20.0;     // Trailing step in points (increased to avoid premature exits)
+input double   TrailingStartPoints = 44.0;     // Start trailing after X points profit
+input double   TrailingStepPoints  = 10.0;     // Trailing step in points (tighter for HFT)
 
 // ===== Spread & Slippage =====
 input group "===== Spread & Execution ====="
 input double   MaxSpreadPoints     = 50.0;     // Maximum spread in points
 input int      MaxSlippagePoints   = 10;       // Maximum slippage in points
 input int      OrderRetries        = 3;        // Number of order retries
+
+// ===== Cost-Aware Settings =====
+input group "===== Cost-Aware Exit Settings ====="
+input double   CommissionPerLotPerSide = 3.5;  // Commission per lot per side (USD) - Typical: $3.5 per lot per side
+input double   CostBufferPoints = 2.0;         // Additional buffer in points to overcome execution costs (loosened exit)
 
 // ===== Risk Management =====
 input group "===== Risk Management ====="
@@ -82,15 +83,13 @@ input int      SessionEndHour      = 20;        // Session end hour (GMT)
 // ===== Pullback Entry Filter =====
 input group "===== Pullback Entry Filter ====="
 input bool     UsePullbackFilter  = true;       // Enable micro-pullback filter
-input double   PullbackPoints     = 2.5;        // Retrace points after breakout - Increased for fewer trades
-input int      PullbackTimeoutSeconds = 10;     // Timeout for pullback wait - Increased for fewer trades
+input double   PullbackPoints     = 1.5;        // Retrace points after breakout (reduced from 2.5 for faster entries)
+input int      PullbackTimeoutSeconds = 6;      // Timeout for pullback wait (reduced from 10 for faster reset)
 
 // ===== Volatility Cycle Filter =====
 input group "===== Volatility Cycle Filter ====="
 input bool     UseVolatilityCycleFilter = true; // Enable volatility cycle filter
-input int      VolatilityCycleSeconds = 4;      // Tick speed must be rising for N seconds - Increased for fewer trades
-input bool     UseHybridTimeTickConfirmation = true; // Visual-safe: Use hybrid time + tick confirmation (fallback when tick data incomplete)
-input int      EntryDelayToleranceMs = 500;     // Execution tolerance: Allow delayed entry if momentum still valid (milliseconds)
+input int      VolatilityCycleSeconds = 2;      // Tick speed must be rising for N seconds (reduced from 4 for more entries)
 
 // ===== Spread Normalized Filter =====
 input group "===== Spread Normalized Filter ====="
@@ -108,13 +107,13 @@ input int      BlockEndHour2 = 0;               // Second blocked period end
 // ===== Dynamic Breakeven =====
 input group "===== Dynamic Breakeven ====="
 input bool     UseDynamicBreakeven = true;      // Enable dynamic breakeven
-input double   BreakevenTriggerPoints = 15.0;   // Move SL when profit > X points (increased to account for costs)
-input double   BreakevenOffsetPoints = 5.0;     // Move SL to entry - X points (increased buffer)
+input double   BreakevenTriggerPoints = 2.0;    // Move SL when profit > X points
+input double   BreakevenOffsetPoints = 2.0;     // Move SL to entry - X points
 
 // ===== Partial Exit =====
 input group "===== Partial Exit ====="
-input bool     UsePartialExit = false;          // Disable partial exit for BTCUSD (spreads too large)
-input double   PartialExitProfitPoints = 50.0;  // Close 50% at X points profit (increased to account for costs)
+input bool     UsePartialExit = true;           // Enable partial exit
+input double   PartialExitProfitPoints = 30.0; // Close 50% at X points profit
 input double   PartialExitPercent = 50.0;      // Percentage to close (50% = half position)
 
 // =====================================================================================================
@@ -187,19 +186,6 @@ int spreadHistoryIndex = 0;
 int spreadHistoryCount = 0;
 double averageSpread = 0.0;
 
-// Track max equity profit for trailing (equity-based)
-double maxProfitSeen = 0.0;
-
-// Pending entry tracking for execution tolerance
-struct PendingEntry {
-   int direction;
-   datetime signalTime;
-   double signalPrice;
-   bool isValid;
-};
-
-PendingEntry pendingEntry;
-
 // =====================================================================================================
 // INITIALIZATION
 // =====================================================================================================
@@ -207,9 +193,8 @@ PendingEntry pendingEntry;
 int OnInit()
 {
    Print("========================================");
-   Print("Hyperactive HFT MT5 Scalper V2.10");
-   Print("Ultra-fast momentum breakout scalping - VISUAL MODE & RANDOM DELAY COMPATIBLE");
-   Print("FIXED: Visual-safe entry, reduced filter stacking, latency-robust exits");
+   Print("Hyperactive HFT MT5 Scalper V2.01 - COST AWARE");
+   Print("Ultra-fast momentum breakout scalping with cost-aware exit logic");
    Print("========================================");
    
    trade.SetExpertMagicNumber(MagicNumber);
@@ -283,21 +268,14 @@ int OnInit()
    spreadHistoryCount = 0;
    averageSpread = 0.0;
    
-   // Reset equity trailing tracker
-   maxProfitSeen = 0.0;
-
-   // Initialize pending entry tracking
-   pendingEntry.direction = 0;
-   pendingEntry.signalTime = 0;
-   pendingEntry.signalPrice = 0.0;
-   pendingEntry.isValid = false;
-   
    Print("Trade Symbol: ", tradeSymbol);
    Print("Lot Mode: ", (UseFixedLot ? "FIXED" : "DYNAMIC"));
    Print("Fixed Lot: ", FixedLotSize);
    Print("Max Loss Points: ", MaxLossPoints);
    Print("Max Loss Hold: ", MaxLossHoldSeconds, " seconds");
    Print("Max Profit Hold: ", MaxProfitHoldSeconds, " seconds");
+   Print("Commission: $", CommissionPerLotPerSide, " per lot per side (round-turn: $", (CommissionPerLotPerSide * 2.0), ")");
+   Print("Cost Buffer: ", CostBufferPoints, " points");
    Print("========================================");
    
    return(INIT_SUCCEEDED);
@@ -305,7 +283,70 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
-   Print("Hyperactive HFT MT5 Scalper deinitialized. Reason: ", reason);
+   Print("Hyperactive HFT MT5 Scalper (Cost Aware) deinitialized. Reason: ", reason);
+}
+
+// =====================================================================================================
+// COST CALCULATION FUNCTIONS
+// =====================================================================================================
+
+// Calculate commission in points for a given lot size
+// Commission is per lot per side, so round-turn = 2 * CommissionPerLotPerSide
+double CalculateCommissionInPoints(double lotSize)
+{
+   // Total commission for round-turn (open + close) in account currency (USD)
+   double totalCommissionUSD = CommissionPerLotPerSide * 2.0 * lotSize;
+   
+   // Get symbol properties for conversion
+   double tickValue = SymbolInfoDouble(tradeSymbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(tradeSymbol, SYMBOL_TRADE_TICK_SIZE);
+   
+   if(tickSize <= 0.0 || tickValue <= 0.0)
+      return 0.0;
+   
+   // Calculate how many points equal one tick
+   double tickSizeInPoints = tickSize;
+   if(point > 0.0)
+      tickSizeInPoints = tickSize / point;
+   
+   // Calculate value of 1 point movement for the given lot size
+   // tickValue is the profit/loss for 1 tick movement per lot
+   // So: pointValue = tickValue * (point / tickSize) * lotSize
+   double pointValue = 0.0;
+   if(tickSizeInPoints > 0.0)
+      pointValue = tickValue * (1.0 / tickSizeInPoints) * lotSize;
+   
+   if(pointValue <= 0.0)
+      return 0.0;
+   
+   // Convert commission (USD) to points
+   // commissionPoints = totalCommissionUSD / pointValue
+   double commissionPoints = totalCommissionUSD / pointValue;
+   
+   return commissionPoints;
+}
+
+// Calculate minimum profit threshold in points (spread + commission + buffer)
+double CalculateMinimumProfitThreshold(double lotSize)
+{
+   // Spread cost (already in points)
+   double spreadCost = currentSpread;
+   
+   // Commission cost (convert to points)
+   double commissionCost = CalculateCommissionInPoints(lotSize);
+   
+   // Total minimum threshold
+   double minThreshold = spreadCost + commissionCost + CostBufferPoints;
+   
+   return minThreshold;
+}
+
+// Calculate net profit in points (gross profit - costs)
+double CalculateNetProfitPoints(double grossProfitPoints, double lotSize)
+{
+   double minThreshold = CalculateMinimumProfitThreshold(lotSize);
+   double netProfit = grossProfitPoints - minThreshold;
+   return netProfit;
 }
 
 // =====================================================================================================
@@ -699,68 +740,12 @@ int GetMomentumBreakoutSignal()
          return 0;
    }
    
-   // FIX B: Reduce filter stacking - Max 2 blocking filters
-   // Use EITHER TickSpeed OR VolatilityCycle, not both (visual-safe)
-   int blockingFiltersCount = 0;
-   bool tickSpeedOK = true;
-   bool volatilityCycleOK = true;
+   // Check tick speed
+   if(UseTickSpeedFilter && ticksPerSecond < MinTickSpeed)
+      return 0;
    
-   // Check tick speed (with fallback for visual mode)
-   if(UseTickSpeedFilter)
-   {
-      // Visual-safe: Allow entry if tick speed data is incomplete or unavailable
-      if(ticksPerSecond <= 0.0 || lastTickSpeedCheck == 0)
-      {
-         // Tick speed data not available - use hybrid time confirmation
-         if(UseHybridTimeTickConfirmation)
-         {
-            // Allow entry if we have sufficient time-based confirmation
-            // Check if we have enough ticks in the buffer (time-based fallback)
-            datetime oldestTickTime = tickTimes[MomentumPeriod - 1];
-            datetime newestTickTime = tickTimes[0];
-            int timeWindowSeconds = (int)(newestTickTime - oldestTickTime);
-            
-            // If time window is reasonable (not too long = not stale), allow entry
-            if(timeWindowSeconds > 60 || timeWindowSeconds <= 0)
-            {
-               tickSpeedOK = false;  // Data too stale or invalid
-               blockingFiltersCount++;
-            }
-            // Otherwise allow (hybrid confirmation passed)
-         }
-         else
-         {
-            tickSpeedOK = false;  // No fallback, block entry
-            blockingFiltersCount++;
-         }
-      }
-      else if(ticksPerSecond < MinTickSpeed)
-      {
-         tickSpeedOK = false;
-         blockingFiltersCount++;
-      }
-   }
-   
-   // Check volatility cycle filter (only if tick speed passed OR not using tick speed)
-   if(UseVolatilityCycleFilter && tickSpeedOK)  // Only check if tick speed already passed
-   {
-      if(!CheckVolatilityCycle())
-      {
-         volatilityCycleOK = false;
-         blockingFiltersCount++;
-      }
-   }
-   else if(UseVolatilityCycleFilter && !UseTickSpeedFilter)  // If tick speed disabled, check volatility cycle
-   {
-      if(!CheckVolatilityCycle())
-      {
-         volatilityCycleOK = false;
-         blockingFiltersCount++;
-      }
-   }
-   
-   // Max 2 blocking filters allowed (spread check counts as one)
-   if(blockingFiltersCount > 1)
+   // Check volatility cycle filter
+   if(!CheckVolatilityCycle())
       return 0;
    
    // Check spread
@@ -785,11 +770,11 @@ int GetMomentumBreakoutSignal()
       if(momentumDirection == 1 && priceChange >= breakoutThreshold)
       {
          // Bullish breakout detected
-         if(consecutiveMomentumTicks >= 2)  // Increased to 2 for fewer trades
+         if(consecutiveMomentumTicks >= 1)  // Reduced from 2 to 1 for more entries
          {
             // Check for strong breakout - enter immediately if momentum is very strong
             double strongBreakoutThreshold = breakoutThreshold * StrongBreakoutMultiplier;
-            bool isStrongBreakout = (priceChange >= strongBreakoutThreshold && consecutiveMomentumTicks >= 3);  // Increased to 3
+            bool isStrongBreakout = (priceChange >= strongBreakoutThreshold && consecutiveMomentumTicks >= 2);
             
             if(isStrongBreakout)
             {
@@ -800,18 +785,6 @@ int GetMomentumBreakoutSignal()
             
             if(UsePullbackFilter)
             {
-               // FIX C: Pullback filter must have timeout that allows direct entry
-               datetime now = TimeCurrent();
-               int pullbackAgeSeconds = (int)(now - breakoutTime);
-               
-               // If timeout exceeded, allow direct entry (don't wait indefinitely)
-               if(breakoutDetected && breakoutDirection == 1 && pullbackAgeSeconds > PullbackTimeoutSeconds)
-               {
-                  // Timeout reached - allow direct entry
-                  breakoutDetected = false;
-                  return 1;  // BUY - timeout allows direct entry
-               }
-               
                // Track breakout peak
                if(!breakoutDetected || breakoutDirection != 1)
                {
@@ -862,11 +835,11 @@ int GetMomentumBreakoutSignal()
       else if(momentumDirection == -1 && priceChange <= -breakoutThreshold)
       {
          // Bearish breakout detected
-         if(consecutiveMomentumTicks >= 2)  // Increased to 2 for fewer trades
+         if(consecutiveMomentumTicks >= 1)  // Reduced from 2 to 1 for more entries
          {
             // Check for strong breakout - enter immediately if momentum is very strong
             double strongBreakoutThreshold = breakoutThreshold * StrongBreakoutMultiplier;
-            bool isStrongBreakout = (priceChange <= -strongBreakoutThreshold && consecutiveMomentumTicks >= 3);  // Increased to 3
+            bool isStrongBreakout = (priceChange <= -strongBreakoutThreshold && consecutiveMomentumTicks >= 2);
             
             if(isStrongBreakout)
             {
@@ -877,18 +850,6 @@ int GetMomentumBreakoutSignal()
             
             if(UsePullbackFilter)
             {
-               // FIX C: Pullback filter must have timeout that allows direct entry
-               datetime now = TimeCurrent();
-               int pullbackAgeSeconds = (int)(now - breakoutTime);
-               
-               // If timeout exceeded, allow direct entry (don't wait indefinitely)
-               if(breakoutDetected && breakoutDirection == -1 && pullbackAgeSeconds > PullbackTimeoutSeconds)
-               {
-                  // Timeout reached - allow direct entry
-                  breakoutDetected = false;
-                  return -1;  // SELL - timeout allows direct entry
-               }
-               
                // Track breakout peak (lowest point for SELL)
                if(!breakoutDetected || breakoutDirection != -1)
                {
@@ -970,61 +931,9 @@ bool ShouldOpenTrade(int direction)
          return false;  // Spread too high relative to average
    }
    
-   // FIX D: Execution tolerance - Allow delayed entry if momentum still valid
-   datetime now = TimeCurrent();
-   
-   // Check if we have a pending entry signal
-   if(pendingEntry.isValid)
-   {
-      int ageMs = (int)((now - pendingEntry.signalTime) * 1000);
-      
-      // If signal is still within tolerance window, allow entry
-      if(ageMs <= EntryDelayToleranceMs && pendingEntry.direction == direction)
-      {
-         // Verify momentum is still valid (slippage-aware confirmation)
-         double currentMidPrice = (currentBid + currentAsk) / 2.0;
-         double priceChange = MathAbs(currentMidPrice - pendingEntry.signalPrice);
-         
-         // Allow entry if price hasn't moved too far (momentum still valid)
-         double maxPriceDrift = BreakoutThreshold * 0.5;  // Allow 50% drift
-         if(priceChange <= maxPriceDrift)
-         {
-            return true;  // Delayed entry allowed - momentum still valid
-         }
-         else
-         {
-            // Price drifted too far, invalidate signal
-            pendingEntry.isValid = false;
-         }
-      }
-      else if(ageMs > EntryDelayToleranceMs)
-      {
-         // Signal expired
-         pendingEntry.isValid = false;
-      }
-   }
-   
-   // Check tick speed (with visual-safe fallback)
-   if(UseTickSpeedFilter)
-   {
-      // Visual-safe: Allow if tick speed unavailable or incomplete
-      if(ticksPerSecond <= 0.0 || lastTickSpeedCheck == 0)
-      {
-         // Use hybrid time confirmation instead
-         if(!UseHybridTimeTickConfirmation)
-            return false;  // No fallback, block entry
-      }
-      else if(ticksPerSecond < MinTickSpeed)
-      {
-         return false;
-      }
-   }
-   
-   // Store entry signal for delayed execution tolerance
-   pendingEntry.direction = direction;
-   pendingEntry.signalTime = now;
-   pendingEntry.signalPrice = (currentBid + currentAsk) / 2.0;
-   pendingEntry.isValid = true;
+   // Check tick speed
+   if(UseTickSpeedFilter && ticksPerSecond < MinTickSpeed)
+      return false;
    
    return true;
 }
@@ -1094,7 +1003,7 @@ bool OpenTrade(int direction)
    // No take profit (using dynamic exit)
    double tp = 0.0;
    
-   string comment = "HyperHFT_" + (direction == 1 ? "BUY" : "SELL");
+   string comment = "HyperHFT_CA_" + (direction == 1 ? "BUY" : "SELL");
    
    ENUM_ORDER_TYPE orderType = (direction == 1) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
    
@@ -1178,9 +1087,6 @@ bool OpenTrade(int direction)
          breakoutDirection = 0;
          breakoutTime = 0;
          
-         // Reset pending entry signal
-         pendingEntry.isValid = false;
-         
          Print("TRADE OPENED: ", (direction == 1 ? "BUY" : "SELL"), 
                " | Lot: ", lotSize, " | Price: ", actualEntryPrice, " | SL: ", sl);
          return true;
@@ -1195,7 +1101,7 @@ bool OpenTrade(int direction)
 }
 
 // =====================================================================================================
-// MANAGE TRADE (EXIT LOGIC)
+// MANAGE TRADE (EXIT LOGIC) - COST-AWARE
 // =====================================================================================================
 
 void ManageTrade()
@@ -1211,63 +1117,239 @@ void ManageTrade()
       return;
    }
    
-   // Get current position data - use real profit only (includes commission/spread)
-   double netProfit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+   // Get current position data
+   double positionProfit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
    datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
    int holdSeconds = (int)(TimeCurrent() - openTime);
    
-   // Update max equity profit for trailing
-   if(netProfit > maxProfitSeen)
-      maxProfitSeen = netProfit;
+   // Get current lot size (may have changed after partial exit)
+   double currentLots = PositionGetDouble(POSITION_VOLUME);
+   
+   // Calculate profit/loss in points
+   double currentPrice = (currentTrade.direction == 1) ? currentBid : currentAsk;
+   double priceDiff = currentPrice - currentTrade.entryPrice;
+   if(currentTrade.direction == -1)
+      priceDiff = -priceDiff;  // For SELL, reverse the difference
+   
+   double grossProfitPoints = priceDiff / point;
+   double lossPoints = (grossProfitPoints < 0) ? MathAbs(grossProfitPoints) : 0.0;
+   
+   // Calculate minimum profit threshold (spread + commission + buffer)
+   double minProfitThreshold = CalculateMinimumProfitThreshold(currentLots);
+   
+   // Calculate net profit (gross - costs)
+   double netProfitPoints = CalculateNetProfitPoints(grossProfitPoints, currentLots);
+   
+   // Update highest profit tracking (use gross for tracking, but check net for exits)
+   if(grossProfitPoints > currentTrade.highestProfitPoints)
+   {
+      currentTrade.highestProfitPoints = grossProfitPoints;
+      if(grossProfitPoints > 0.0)
+         currentTrade.wasProfitable = true;
+   }
    
    // =====================================================================
-   // EXIT CONDITION 1: Maximum loss (USD-based)
+   // EXIT CONDITION 1: Maximum loss points (hard stop) - UNCHANGED
    // =====================================================================
-   if(netProfit <= -MaxLossUSD)
+   if(lossPoints >= MaxLossPoints)
    {
-      CloseTrade("Maximum loss reached ($" + DoubleToString(netProfit, 2) + ")");
+      CloseTrade("Maximum loss points reached (" + DoubleToString(lossPoints, 1) + " pts)");
       return;
    }
    
    // =====================================================================
-   // FIX 3: Delay ALL exits until real profit exists
+   // EXIT CONDITION 2: Time-based loss exit - UNCHANGED
    // =====================================================================
-   if(netProfit <= 0.0)
-      return;
-   
-   // =====================================================================
-   // EXIT CONDITION 3: Immediate profit exit (equity-based)
-   // =====================================================================
-   if(ExitImmediatelyOnProfit && netProfit >= MinProfitUSD)
+   if(UseTimeBasedLossExit && positionProfit < 0.0 && holdSeconds >= MaxLossHoldSeconds)
    {
-      CloseTrade("Profit target reached (Net: $" + DoubleToString(netProfit, 2) + ")");
+      CloseTrade("Loss timeout (" + IntegerToString(holdSeconds) + " seconds)");
       return;
    }
    
    // =====================================================================
-   // EXIT CONDITION 4: Maximum profit hold time (equity-based)
+   // EXIT CONDITION 3: Immediate profit exit - COST-AWARE
+   // Only exit if net profit (after costs) > 0 AND gross profit >= minimum threshold
    // =====================================================================
-   if(netProfit >= MinProfitUSD && holdSeconds >= MaxProfitHoldSeconds)
+   if(ExitImmediatelyOnProfit && positionProfit > 0.0)
    {
-      CloseTrade("Maximum profit hold time reached (Net: $" + DoubleToString(netProfit, 2) + ")");
-      return;
-   }
-   
-   // =====================================================================
-   // EXIT CONDITION 5: Equity-based trailing stop
-   // =====================================================================
-   if(UseTrailingStop)
-   {
-      double drawdownFromPeak = maxProfitSeen - netProfit;
-      if(drawdownFromPeak >= TrailingUSD && maxProfitSeen >= MinProfitUSD)
+      // Check if gross profit meets minimum threshold
+      if(grossProfitPoints >= (MinProfitPoints + minProfitThreshold))
       {
-         CloseTrade("Equity trailing hit (peak $" + DoubleToString(maxProfitSeen, 2) + ", net $" + DoubleToString(netProfit, 2) + ")");
+         // Check if net profit is positive (ensures we're profitable after all costs)
+         if(netProfitPoints > 0.0)
+         {
+            CloseTrade("Profit target reached (Gross: " + DoubleToString(grossProfitPoints, 1) + 
+                       " pts, Net: " + DoubleToString(netProfitPoints, 1) + " pts after costs)");
+            return;
+         }
+      }
+   }
+   
+   // =====================================================================
+   // EXIT CONDITION 4: Maximum profit hold time - COST-AWARE
+   // Only close if net profit > 0 (profitable after costs)
+   // =====================================================================
+   if(positionProfit > 0.0 && holdSeconds >= MaxProfitHoldSeconds)
+   {
+      // Only close if we have net profit after costs
+      if(netProfitPoints > 0.0)
+      {
+         CloseTrade("Maximum profit hold time reached (Net: " + DoubleToString(netProfitPoints, 1) + " pts after costs)");
          return;
+      }
+      // Otherwise, let it continue (trade is profitable but costs haven't been covered yet)
+   }
+   
+   // =====================================================================
+   // EXIT CONDITION 5: Dynamic Breakeven - LOOSENED
+   // Trigger slightly later to account for costs
+   // =====================================================================
+   if(UseDynamicBreakeven && !currentTrade.breakevenMoved)
+   {
+      // Loosen trigger: require profit to cover costs before moving to breakeven
+      double breakevenTrigger = BreakevenTriggerPoints + (minProfitThreshold * 0.5);  // Add 50% of cost threshold
+      if(grossProfitPoints >= breakevenTrigger)
+      {
+         MoveToBreakeven();
+      }
+   }
+   
+   // =====================================================================
+   // EXIT CONDITION 6: Partial Exit - COST-AWARE & LOOSENED
+   // Only execute if net profit after costs is positive
+   // Loosen threshold slightly to account for costs
+   // =====================================================================
+   if(UsePartialExit && !currentTrade.partialExitDone)
+   {
+      // Loosen partial exit threshold: add cost buffer
+      double partialExitThreshold = PartialExitProfitPoints + (minProfitThreshold * 0.5);  // Add 50% of cost threshold
+      
+      if(grossProfitPoints >= partialExitThreshold)
+      {
+         // Only execute partial exit if net profit is positive
+         if(netProfitPoints > 0.0)
+         {
+            ExecutePartialExit();
+         }
+      }
+   }
+   
+   // =====================================================================
+   // EXIT CONDITION 7: Trailing stop - COST-AWARE
+   // Only trigger if net profit after costs is positive
+   // =====================================================================
+   if(UseTrailingStop && currentTrade.highestProfitPoints >= TrailingStartPoints)
+   {
+      // Use tighter trailing after partial exit
+      double trailingStep = currentTrade.partialExitDone ? (TrailingStepPoints * 0.5) : TrailingStepPoints;
+      double trailingStopLevel = currentTrade.highestProfitPoints - trailingStep;
+      
+      // Only close if trailing stop is hit AND net profit is still positive
+      if(grossProfitPoints < trailingStopLevel)
+      {
+         // Check if we still have net profit after costs
+         if(netProfitPoints > 0.0)
+         {
+            CloseTrade("Trailing stop hit (Net: " + DoubleToString(netProfitPoints, 1) + " pts after costs)");
+            return;
+         }
+         // Otherwise, let it continue (costs haven't been covered yet)
       }
    }
 }
 
-// Breakeven and partial exit disabled for BTCUSD (equity-based exits only)
+// =====================================================================================================
+// MOVE TO BREAKEVEN
+// =====================================================================================================
+
+void MoveToBreakeven()
+{
+   if(!hasActiveTrade || currentTrade.ticket == 0)
+      return;
+   
+   if(!PositionSelectByTicket(currentTrade.ticket))
+      return;
+   
+   double newSL = 0.0;
+   
+   if(currentTrade.direction == 1)  // BUY
+   {
+      newSL = currentTrade.entryPrice - (BreakevenOffsetPoints * point);
+   }
+   else  // SELL
+   {
+      newSL = currentTrade.entryPrice + (BreakevenOffsetPoints * point);
+   }
+   
+   newSL = NormalizeDouble(newSL, symbolDigits);
+   
+   double currentSL = PositionGetDouble(POSITION_SL);
+   double currentTP = PositionGetDouble(POSITION_TP);
+   
+   // Only modify if new SL is better than current (closer to entry for profit protection)
+   bool shouldModify = false;
+   if(currentTrade.direction == 1)  // BUY
+   {
+      shouldModify = (currentSL == 0.0 || newSL > currentSL);
+   }
+   else  // SELL
+   {
+      shouldModify = (currentSL == 0.0 || newSL < currentSL);
+   }
+   
+   if(shouldModify)
+   {
+      if(trade.PositionModify(currentTrade.ticket, newSL, currentTP))
+      {
+         currentTrade.breakevenMoved = true;
+         Print("Breakeven moved: SL set to ", DoubleToString(newSL, symbolDigits), " (entry - ", BreakevenOffsetPoints, " points)");
+      }
+   }
+}
+
+// =====================================================================================================
+// EXECUTE PARTIAL EXIT
+// =====================================================================================================
+
+void ExecutePartialExit()
+{
+   if(!hasActiveTrade || currentTrade.ticket == 0)
+      return;
+   
+   if(!PositionSelectByTicket(currentTrade.ticket))
+      return;
+   
+   double currentLots = PositionGetDouble(POSITION_VOLUME);
+   double partialLots = currentLots * (PartialExitPercent / 100.0);
+   
+   // Normalize partial lots
+   double lotStep = SymbolInfoDouble(tradeSymbol, SYMBOL_VOLUME_STEP);
+   if(lotStep > 0.0)
+      partialLots = MathFloor(partialLots / lotStep) * lotStep;
+   
+   // Ensure partial lots is at least minimum lot
+   double minLot = SymbolInfoDouble(tradeSymbol, SYMBOL_VOLUME_MIN);
+   if(partialLots < minLot)
+      partialLots = minLot;
+   
+   // Ensure we don't close more than available
+   if(partialLots >= currentLots)
+      partialLots = currentLots * 0.5;  // Default to 50% if calculation is off
+   
+   partialLots = NormalizeDouble(partialLots, 2);
+   
+   // Close partial position
+   if(trade.PositionClosePartial(currentTrade.ticket, partialLots))
+   {
+      currentTrade.partialExitDone = true;
+      currentTrade.lotSize = currentLots - partialLots;  // Update remaining lot size
+      Print("Partial exit executed: Closed ", DoubleToString(partialLots, 2), " lots (", DoubleToString(PartialExitPercent, 1), "%)");
+   }
+   else
+   {
+      Print("Partial exit failed: ", trade.ResultRetcode(), " -> ", trade.ResultRetcodeDescription());
+   }
+}
 
 // =====================================================================================================
 // CLOSE TRADE
@@ -1311,8 +1393,7 @@ void CloseTrade(string reason)
 
 void UpdateDisplay()
 {
-   string status = "\n=== Hyperactive HFT MT5 Scalper V2.10 ===\n";
-   status += "VISUAL MODE & RANDOM DELAY COMPATIBLE\n";
+   string status = "\n=== Hyperactive HFT MT5 Scalper V2.01 - COST AWARE ===\n";
    status += "Symbol: " + tradeSymbol + "\n";
    status += "Lot Mode: " + (UseFixedLot ? "FIXED" : "DYNAMIC") + "\n";
    if(UseFixedLot)
@@ -1385,18 +1466,24 @@ void UpdateDisplay()
          double priceDiff = currentPrice - currentTrade.entryPrice;
          if(currentTrade.direction == -1)
             priceDiff = -priceDiff;
-         double profitPoints = priceDiff / point;
+         double grossProfitPoints = priceDiff / point;
+         
+         double currentLots = PositionGetDouble(POSITION_VOLUME);
+         double minProfitThreshold = CalculateMinimumProfitThreshold(currentLots);
+         double netProfitPoints = CalculateNetProfitPoints(grossProfitPoints, currentLots);
          
          status += "\n--- Active Trade ---\n";
          status += "Direction: " + (currentTrade.direction == 1 ? "BUY" : "SELL") + "\n";
          status += "P&L: $" + DoubleToString(profit, 2) + "\n";
-         status += "Points: " + DoubleToString(profitPoints, 1);
-         if(profitPoints < 0)
+         status += "Gross Points: " + DoubleToString(grossProfitPoints, 1);
+         if(grossProfitPoints < 0)
             status += " / SL: " + DoubleToString(MaxLossPoints, 0) + "\n";
          else
             status += " (Profit)\n";
+         status += "Net Points (after costs): " + DoubleToString(netProfitPoints, 1) + "\n";
+         status += "Min Threshold: " + DoubleToString(minProfitThreshold, 1) + " pts (spread + commission + buffer)\n";
          status += "Hold Time: " + IntegerToString(holdSeconds) + " seconds\n";
-         if(profitPoints > 0)
+         if(grossProfitPoints > 0)
             status += "Max Hold: " + IntegerToString(MaxProfitHoldSeconds) + " seconds\n";
          else
             status += "Max Hold: " + IntegerToString(MaxLossHoldSeconds) + " seconds\n";
@@ -1425,4 +1512,3 @@ void UpdateDisplay()
    
    Comment(status);
 }
-

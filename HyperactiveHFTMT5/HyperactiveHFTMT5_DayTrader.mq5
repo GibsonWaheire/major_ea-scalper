@@ -87,7 +87,7 @@ struct TradeInfo {
    ulong    ticket;
    double   entryPrice;
    datetime openTime;
-   int      direction;  // 1=BUY, -1=SELL
+   int      direction;  // 1=BUY, -1=SELL, 0=BUY&SELL; 
    double   lotSize;
    double   highestProfitPoints;
    bool     wasProfitable;
@@ -172,7 +172,7 @@ int OnInit()
       trade.SetTypeFilling(ORDER_FILLING_RETURN);
    
    // Determine trade symbol
-   if(TradeSymbol == "" || TradeSymbol == NULL)
+   if(TradeSymbol == "" || TradeSymbol == NULL) 
       tradeSymbol = _Symbol;
    else
       tradeSymbol = TradeSymbol;
@@ -1370,4 +1370,5 @@ void UpdateDisplay()
    
    Comment(status);
 }
+
 

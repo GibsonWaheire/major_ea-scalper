@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Script to copy HyperTickHF_Scalper_V1_0.mq5 to MetaTrader 5 Experts folder
-# Usage: ./copy_hypertickhf_to_mt5.sh
+# Script to copy HyperactiveHFTMT5_CostAware.mq5 to MetaTrader 5 Experts folder
+# Usage: ./copy_hyperactivehft_costaware_to_mt5.sh
 
 # Colors for output
 GREEN='\033[0;32m'
@@ -10,7 +10,7 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 # Source file
-SOURCE_FILE="HyperTickHF/HyperTickHF_Scalper_V1_0.mq5"
+SOURCE_FILE="HyperactiveHFTMT5/HyperactiveHFTMT5_CostAware.mq5"
 
 # Common MetaTrader 5 destination paths (macOS)
 MT5_PATHS=(
@@ -20,7 +20,7 @@ MT5_PATHS=(
 )
 
 echo "=========================================="
-echo "HyperTickHF Scalper - MetaTrader 5 Copy Script"
+echo "HyperactiveHFTMT5_CostAware - MetaTrader 5 Copy Script"
 echo "=========================================="
 echo ""
 
@@ -56,7 +56,7 @@ if [ -z "$MT5_EXPERTS_DIR" ]; then
         echo ""
         echo "Please manually copy the file:"
         echo "  From: $(pwd)/$SOURCE_FILE"
-        echo "  To:   [Your MT5 Installation]/MQL5/Experts/HyperTickHF_Scalper_V1_0.mq5"
+        echo "  To:   [Your MT5 Installation]/MQL5/Experts/HyperactiveHFTMT5_CostAware.mq5"
         echo ""
         echo "Common locations:"
         for path in "${MT5_PATHS[@]}"; do
@@ -66,7 +66,7 @@ if [ -z "$MT5_EXPERTS_DIR" ]; then
     fi
 fi
 
-DEST_FILE="$MT5_EXPERTS_DIR/HyperTickHF_Scalper_V1_0.mq5"
+DEST_FILE="$MT5_EXPERTS_DIR/HyperactiveHFTMT5_CostAware.mq5"
 
 echo "Found MetaTrader 5 directory:"
 echo "  $MT5_EXPERTS_DIR"
@@ -92,7 +92,7 @@ if [ $? -eq 0 ]; then
     echo "Next steps:"
     echo "1. Open MetaTrader 5"
     echo "2. Press F4 to open MetaEditor"
-    echo "3. Find 'HyperTickHF_Scalper_V1_0.mq5' in the Navigator (under Experts)"
+    echo "3. Find 'HyperactiveHFTMT5_CostAware.mq5' in the Navigator (under Experts)"
     echo "4. Press F7 to compile"
     echo "5. Drag the EA onto a chart to use it"
     echo ""
@@ -101,26 +101,3 @@ else
     echo -e "${RED}ERROR: Failed to copy file!${NC}"
     exit 1
 fi
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
