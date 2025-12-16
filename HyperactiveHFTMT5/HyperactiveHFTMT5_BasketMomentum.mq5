@@ -112,8 +112,15 @@ input double   PartialExitPercent = 50.0;      // Percentage to close (50% = hal
 // ===== Basket Trading Settings =====
 input group "===== Basket Trading Settings ====="
 input int      MaxBasketTrades        = 2;        // Maximum simultaneous trades in basket (FX safe)
-input double   BasketProfitPercent    = 2.0;      // Basket TP as % of basketStartEquity (FX optimized)
+input double   BasketProfitPercent    = 1.2;      // Basket TP as % of basketStartEquity (reduced for faster exits)
 input double   BasketMaxLossPercent   = 4.0;      // Basket SL as % of basketStartEquity (FX optimized)
+input double   BasketCloseBufferUSD   = 0.3;      // Safety buffer to absorb spread & latency
+input int      MinHoldMilliseconds   = 800;      // Minimum hold time before allowing exits (scalp protection)
+input double   BasketConfirmUSD      = 0.5;      // Required profit before allowing invalidation/exits
+input int      BasketMaxHoldSeconds    = 300;      // Maximum hold time for profitable basket (5 minutes)
+input bool     UseBasketTrailingStop  = true;     // Enable basket trailing stop
+input double   BasketTrailingStartUSD = 1.0;      // Start trailing after $1 profit
+input double   BasketTrailingStepUSD  = 0.3;      // Trail by $0.30
 
 // =====================================================================================================
 // STRUCTURES & GLOBALS
@@ -122,6 +129,8 @@ input double   BasketMaxLossPercent   = 4.0;      // Basket SL as % of basketSta
 // ===== Basket Trading Globals =====
 double basketStartEquity = 0.0;          // Equity when first trade of basket opens
 double basketTotalProfitUSD = 0.0;
+ulong basketOpenTimeMS = 0;          // Timestamp when first trade opened (milliseconds)
+double basketMaxProfitUSD = 0.0;       // Maximum profit seen for trailing stop
 
 // Tick tracking for momentum
 double tickPrices[50];
@@ -396,6 +405,8 @@ void CloseAllBasketTrades()
     breakoutOriginPrice = 0.0;
     momentumLegUsed = false;
     lastMomentumLegDirection = 0;
+    basketOpenTimeMS = 0;  // Reset basket open time
+    basketMaxProfitUSD = 0.0;  // Reset trailing stop tracking
 }
 
 // Execution delay to simulate VPS + broker latency
@@ -1104,6 +1115,8 @@ bool OpenTrade(int direction)
       // breakoutOriginPrice already captured at breakout detection
       momentumLegUsed = true;           // Mark this momentum leg as used
       lastMomentumLegDirection = direction;
+      basketOpenTimeMS = GetTickCount64();  // Record basket open time
+      basketMaxProfitUSD = 0.0;  // Reset trailing stop tracking
       Print("BASKET ENTRY: Direction = ", (direction == 1 ? "BUY" : "SELL"), 
             " | Origin Price = ", DoubleToString(breakoutOriginPrice, symbolDigits));
    }
@@ -1204,58 +1217,124 @@ void ManageBasket()
    // Calculate basket total profit
    basketTotalProfitUSD = CalculateBasketProfit();
    
-   // ===== INVALIDATION RULE 1: Momentum Flip Invalidation =====
-   if(basketTotalProfitUSD < 0.0 && basketEntryDirection != 0)
+   // ===== PHASE 1: SCALP PROTECTION =====
+   if(basketOpenTimeMS > 0)
    {
-      if(momentumFlipCount >= 2)
+      ulong currentTimeMS = GetTickCount64();
+      ulong elapsedMS = currentTimeMS - basketOpenTimeMS;
+      
+      if(elapsedMS < (ulong)MinHoldMilliseconds)
+      {
+         return;  // Too early - prevent any exits during scalp protection period
+      }
+   }
+   
+   // ===== PHASE 2: BASKET CONFIRMATION =====
+   bool basketConfirmed = (basketTotalProfitUSD >= BasketConfirmUSD);
+   
+   // ===== TIME-BASED PROFIT EXIT =====
+   if(basketTotalProfitUSD > 0.0 && basketOpenTimeMS > 0)
+   {
+      ulong currentTimeMS = GetTickCount64();
+      ulong elapsedMS = currentTimeMS - basketOpenTimeMS;
+      ulong elapsedSeconds = elapsedMS / 1000;
+      
+      if(elapsedSeconds >= (ulong)BasketMaxHoldSeconds)
       {
          DelayExecution();
          CloseAllBasketTrades();
-         Print("BASKET INVALIDATED: Momentum flipped twice | Flips: ", momentumFlipCount, 
-               " | Loss: $", DoubleToString(basketTotalProfitUSD, 2));
+         Print("BASKET CLOSED: Maximum hold time reached | Profit: $", DoubleToString(basketTotalProfitUSD, 2), 
+               " | Hold Time: ", IntegerToString(elapsedSeconds), " seconds");
          return;
       }
    }
    
-   // ===== INVALIDATION RULE 2: Breakout Failure Invalidation =====
-   if(basketTotalProfitUSD < 0.0 && breakoutOriginPrice > 0.0)
+   // ===== BASKET TRAILING STOP =====
+   if(UseBasketTrailingStop && basketTotalProfitUSD > 0.0)
    {
-      double midPrice = (currentBid + currentAsk) / 2.0;
-      bool breakoutFailed = false;
-      
-      if(basketEntryDirection == 1)  // BUY basket
+      // Update maximum profit seen
+      if(basketTotalProfitUSD > basketMaxProfitUSD)
       {
-         // Breakout failed if price returns below origin
-         if(midPrice < breakoutOriginPrice)
-         {
-            breakoutFailed = true;
-         }
-      }
-      else if(basketEntryDirection == -1)  // SELL basket
-      {
-         // Breakout failed if price returns above origin
-         if(midPrice > breakoutOriginPrice)
-         {
-            breakoutFailed = true;
-         }
+         basketMaxProfitUSD = basketTotalProfitUSD;
       }
       
-      if(breakoutFailed)
+      // Check if profit has dropped by trailing step from peak
+      if(basketMaxProfitUSD >= BasketTrailingStartUSD)
       {
-         DelayExecution();
-         CloseAllBasketTrades();
-         Print("BASKET INVALIDATED: Breakout failure | Price returned to origin | Origin: ", 
-               DoubleToString(breakoutOriginPrice, symbolDigits), " | Current: ", 
-               DoubleToString(midPrice, symbolDigits), " | Loss: $", 
-               DoubleToString(basketTotalProfitUSD, 2));
-         return;
+         double trailingStopLevel = basketMaxProfitUSD - BasketTrailingStepUSD;
+         
+         if(basketTotalProfitUSD <= trailingStopLevel)
+         {
+            DelayExecution();
+            CloseAllBasketTrades();
+            Print("BASKET CLOSED: Trailing stop hit | Profit: $", DoubleToString(basketTotalProfitUSD, 2), 
+                  " | Peak: $", DoubleToString(basketMaxProfitUSD, 2), 
+                  " | Trailing Level: $", DoubleToString(trailingStopLevel, 2));
+            return;
+         }
+      }
+   }
+   
+   // ===== INVALIDATION RULE 1: Momentum Flip Invalidation =====
+   // Only allow invalidation if basket is confirmed OR basket is deeply negative
+   if(basketConfirmed || basketTotalProfitUSD < -BasketConfirmUSD)
+   {
+      if(basketTotalProfitUSD < 0.0 && basketEntryDirection != 0)
+      {
+         if(momentumFlipCount >= 2)
+         {
+            DelayExecution();
+            CloseAllBasketTrades();
+            Print("BASKET INVALIDATED: Momentum flipped twice | Flips: ", momentumFlipCount, 
+                  " | Loss: $", DoubleToString(basketTotalProfitUSD, 2));
+            return;
+         }
+      }
+   }
+   
+   // ===== INVALIDATION RULE 2: Breakout Failure Invalidation =====
+   // Only allow invalidation if basket is confirmed OR basket is deeply negative
+   if(basketConfirmed || basketTotalProfitUSD < -BasketConfirmUSD)
+   {
+      if(basketTotalProfitUSD < 0.0 && breakoutOriginPrice > 0.0)
+      {
+         double midPrice = (currentBid + currentAsk) / 2.0;
+         bool breakoutFailed = false;
+         
+         if(basketEntryDirection == 1)  // BUY basket
+         {
+            // Breakout failed if price returns below origin
+            if(midPrice < breakoutOriginPrice)
+            {
+               breakoutFailed = true;
+            }
+         }
+         else if(basketEntryDirection == -1)  // SELL basket
+         {
+            // Breakout failed if price returns above origin
+            if(midPrice > breakoutOriginPrice)
+            {
+               breakoutFailed = true;
+            }
+         }
+         
+         if(breakoutFailed)
+         {
+            DelayExecution();
+            CloseAllBasketTrades();
+            Print("BASKET INVALIDATED: Breakout failure | Price returned to origin | Origin: ", 
+                  DoubleToString(breakoutOriginPrice, symbolDigits), " | Current: ", 
+                  DoubleToString(midPrice, symbolDigits), " | Loss: $", 
+                  DoubleToString(basketTotalProfitUSD, 2));
+            return;
+         }
       }
    }
    
    // Basket Take Profit (PRIMARY EXIT)
    double basketTargetUSD = basketStartEquity * (BasketProfitPercent / 100.0);
    
-   if(basketTotalProfitUSD >= basketTargetUSD)
+   if(basketTotalProfitUSD >= (basketTargetUSD + BasketCloseBufferUSD))
    {
       DelayExecution();
       CloseAllBasketTrades();
@@ -1384,3 +1463,4 @@ void UpdateDisplay()
    
    Comment(status);
 }
+
