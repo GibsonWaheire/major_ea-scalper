@@ -1,33 +1,36 @@
-#property copyright "Copyright 2025, Hyperactive HFT MT5 Scalper"
+#property copyright "Copyright 2025, Superpower EA"
 #property link      "https://www.mcgibsdigitalsolutions.com"
-#property version   "2.10"
+#property version   "1.01"
 
 #include <Trade/Trade.mqh>
 
 CTrade trade;
 
 // =====================================================================================================
-// HYPERACTIVE HFT MT5 SCALPER V2.1
-// Strategy: Momentum breakout with information-based exits
+// SUPERPOWER EA V1.1 - IMPULSE ENTRY
+// Real-Market Momentum Scalper with Dual-Mode Entry System
 // 
-// EXIT PHILOSOPHY: Entry=fast, Exit=slow, Loss=quick, Profit=patient
+// PHILOSOPHY: Entry=selective, Exit=patient, Loss=quick, Profit=patient
 // 
-// Unified Exit Controller (evaluated in order):
-// 1. Hard Max Loss (safety cap - non-negotiable)
-// 2. Momentum Invalidation (market proves you wrong, not time)
-// 3. Velocity Decay (exit when momentum dies, not when profit appears)
-// 4. Trailing Stop (profit protection after meaningful move)
+// DUAL-MODE ENTRY SYSTEM:
+// MODE A: EARLY IMPULSE ENTRY (Priority) - Catch start of real momentum, NO pullback
+// MODE B: PULLBACK ENTRY (Secondary) - Only if Mode A did NOT trigger
+//
+// EXIT CONTROLLER (UNCHANGED):
+// 1. Hard Max Loss (symbol-aware safety cap)
+// 2. Momentum Invalidation (market proves you wrong)
+// 3. Velocity Decay (exit when momentum dies)
+// 4. Trailing Stop (profit protection)
 //
 // Features:
-// - Multiple simultaneous trades (1-5)
-// - Momentum breakout entry with filters
+// - Real-market optimized entries (fewer, higher quality)
+// - Symbol-aware risk parameters
 // - No time-based exits - information-based only
-// - Asymmetric loss protection (realistic caps)
 // =====================================================================================================
 
 // ===== Core Trading Settings =====
 input group "===== Core Trading Settings ====="
-input int      MagicNumber         = 202510;
+input int      MagicNumber         = 202511;
 input string   TradeSymbol         = "";      // Symbol to trade (empty = current chart symbol)
 input bool     UseFixedLot         = true;     // Use fixed lot size (false = dynamic)
 input double   FixedLotSize        = 0.1;      // Fixed lot size (if UseFixedLot = true)
@@ -40,35 +43,35 @@ input int      MaxSimultaneousTrades = 1;     // Maximum simultaneous trades (1-
 // ===== Entry Settings =====
 input group "===== Momentum Breakout Entry ====="
 input int      MomentumPeriod      = 18;       // Period for momentum calculation (ticks) - Reduced from 30 for more opportunities
-input double   BreakoutThreshold   = 50.0;     // Minimum price movement for breakout (BTCUSD: ~$50 move)
+input double   BreakoutThreshold   = 0.00035;  // Minimum price movement for breakout (reduced for more entries)
 input int      MinTickSpeed        = 3;        // Minimum ticks per second for entry (reduced from 5)
 input bool     UseTickSpeedFilter  = true;     // Enable tick speed filter
 input double   StrongBreakoutMultiplier = 1.8; // Enter immediately if breakout >= threshold * multiplier (bypass pullback)
 
 // ===== Unified Exit Settings =====
 input group "===== Hard Loss Protection ====="
-input double   MaxLossPoints       = 5000.0;   // Maximum loss in points (BTCUSD: ~$50 on 0.01 lot)
+input double   MaxLossPoints       = 50.0;     // Maximum loss in points (hard safety cap)
 input bool     UseStopLoss         = false;    // Use hard stop loss on broker side
 
 input group "===== Momentum Invalidation Exit ====="
 input int      MomentumFlipsToExit = 2;        // Exit unprofitable trade after N momentum flips against
 input bool     ExitProfitableOnFlip = false;   // DISABLED: Exit if was profitable and momentum flips against
 input int      FlipConfirmationTicks = 2;      // Ticks to confirm momentum flip (prevents noise)
-input int      MinTradeMaturitySeconds = 8;    // No exits (except hard loss) before trade matures
+input int      MinTradeMaturitySeconds = 5;    // No exits (except hard loss) before trade matures
 
 input group "===== Velocity Decay Exit ====="
 input double   VelocityDecayRatio  = 0.6;      // Exit when tick speed < peak * this ratio
-input double   VelocityDecayMinProfit = 2000.0; // Minimum profit points before velocity decay (BTCUSD)
+input double   VelocityDecayMinProfit = 25.0;  // Minimum profit points before velocity decay (FX=25, Gold=40)
 
 input group "===== Trailing Stop Settings ====="
 input bool     UseTrailingStop     = true;     // Use trailing stop loss
-input double   TrailingStartPoints = 3000.0;   // Start trailing after X points profit (BTCUSD)
-input double   TrailingStepPoints  = 1500.0;   // Trailing step in points (BTCUSD)
+input double   TrailingStartPoints = 35.0;     // Start trailing after X points profit (FX-friendly)
+input double   TrailingStepPoints  = 18.0;     // Trailing step in points (FX-friendly)
 
 // ===== Spread & Slippage =====
 input group "===== Spread & Execution ====="
-input double   MaxSpreadPoints     = 50000.0;  // Maximum spread in points (BTCUSD has wider spreads)
-input int      MaxSlippagePoints   = 300;      // Maximum slippage in points
+input double   MaxSpreadPoints     = 50.0;     // Maximum spread in points
+input int      MaxSlippagePoints   = 10;       // Maximum slippage in points
 input int      OrderRetries        = 3;        // Number of order retries
 
 // ===== Risk Management =====
@@ -85,8 +88,8 @@ input int      SessionEndHour      = 20;        // Session end hour (GMT)
 
 // ===== Pullback Entry Filter =====
 input group "===== Pullback Entry Filter ====="
-input bool     UsePullbackFilter  = true;       // Enable micro-pullback filter
-input double   PullbackPoints     = 200.0;      // Retrace points after breakout (BTCUSD)
+input bool     UsePullbackFilter  = true;       // Enable micro-pullback filter (MODE B only)
+input double   PullbackPoints     = 1.5;        // Retrace points after breakout (reduced from 2.5 for faster entries)
 input int      PullbackTimeoutSeconds = 6;      // Timeout for pullback wait (reduced from 10 for faster reset)
 
 // ===== Volatility Cycle Filter =====
@@ -110,12 +113,8 @@ input int      BlockEndHour2 = 0;               // Second blocked period end
 // ===== Dynamic Breakeven =====
 input group "===== Dynamic Breakeven ====="
 input bool     UseDynamicBreakeven = true;      // Enable dynamic breakeven
-input double   BreakevenTriggerPoints = 1000.0; // Move SL when profit > X points (BTCUSD)
-input double   BreakevenOffsetPoints = 300.0;   // Move SL to entry - X points (BTCUSD)
-
-// ===== Trade Cooldown =====
-input group "===== Trade Cooldown ====="
-input int      TradeCooldownSeconds = 60;       // Wait N seconds after closing before new trade
+input double   BreakevenTriggerPoints = 10.0;   // Move SL when profit > X points (avoid micro-noise)
+input double   BreakevenOffsetPoints = 3.0;     // Move SL to entry - X points
 
 
 // =====================================================================================================
@@ -177,7 +176,7 @@ bool tradingStopped = false;
 double effectiveMaxLoss = 50.0;  // Symbol-aware max loss (set in OnInit)
 double effectiveVelocityMinProfit = 25.0;  // Symbol-aware velocity decay floor (set in OnInit)
 
-// Pullback tracking
+// Pullback tracking (MODE B only)
 double breakoutPeakPrice = 0.0;
 bool breakoutDetected = false;
 int breakoutDirection = 0;
@@ -195,9 +194,8 @@ int spreadHistoryIndex = 0;
 int spreadHistoryCount = 0;
 double averageSpread = 0.0;
 
-// Trade cooldown
-datetime lastTradeCloseTime = 0;
-int tradeCooldownSeconds = 60;  // Wait 60 seconds after closing before new trade
+// Symbol-specific pullback override
+bool effectiveUsePullback = true;  // Will be set in OnInit based on symbol
 
 // =====================================================================================================
 // INITIALIZATION
@@ -206,8 +204,8 @@ int tradeCooldownSeconds = 60;  // Wait 60 seconds after closing before new trad
 int OnInit()
 {
    Print("========================================");
-   Print("Hyperactive HFT MT5 Scalper V2.00");
-   Print("Ultra-fast momentum breakout scalping with advanced filters");
+   Print("SUPERPOWER EA V1.1 - IMPULSE ENTRY");
+   Print("Dual-Mode Entry: Early Impulse + Pullback");
    Print("========================================");
    
    trade.SetExpertMagicNumber(MagicNumber);
@@ -237,14 +235,8 @@ int OnInit()
    if(maxTrades < 1) maxTrades = 1;
    if(maxTrades > 5) maxTrades = 5;
    
-   // Symbol-aware max loss: Different assets need different stops
-   if(StringFind(tradeSymbol, "BTC") >= 0 || StringFind(tradeSymbol, "BITCOIN") >= 0)
-   {
-      // BTCUSD: Very wide stops needed due to high volatility
-      effectiveMaxLoss = 5000.0;  // ~$50 on 0.01 lot
-      effectiveVelocityMinProfit = 2000.0;
-   }
-   else if(StringFind(tradeSymbol, "XAU") >= 0 || StringFind(tradeSymbol, "GOLD") >= 0)
+   // Symbol-aware max loss: Gold needs wider stop than FX
+   if(StringFind(tradeSymbol, "XAU") >= 0 || StringFind(tradeSymbol, "GOLD") >= 0)
    {
       effectiveMaxLoss = 65.0;
       effectiveVelocityMinProfit = 40.0;
@@ -260,6 +252,14 @@ int OnInit()
       effectiveMaxLoss = MaxLossPoints;
    if(VelocityDecayMinProfit > effectiveVelocityMinProfit)
       effectiveVelocityMinProfit = VelocityDecayMinProfit;
+   
+   // USDJPY RULE: Disable pullback for JPY pairs (breakouts continue, pullbacks destroy edge)
+   effectiveUsePullback = UsePullbackFilter;
+   if(StringFind(tradeSymbol, "JPY") >= 0)
+   {
+      effectiveUsePullback = false;
+      Print("JPY pair detected - Pullback filter DISABLED (Mode B will enter immediately)");
+   }
    
    // Initialize trading state
    activeTradeCount = 0;
@@ -313,16 +313,13 @@ int OnInit()
    spreadHistoryCount = 0;
    averageSpread = 0.0;
    
-   // Initialize cooldown
-   lastTradeCloseTime = 0;
-   tradeCooldownSeconds = TradeCooldownSeconds;
-   
    Print("Trade Symbol: ", tradeSymbol);
    Print("Lot Mode: ", (UseFixedLot ? "FIXED" : "DYNAMIC"));
    Print("Fixed Lot: ", FixedLotSize);
    Print("Max Loss Points: ", effectiveMaxLoss, " (symbol-aware)");
    Print("Velocity Decay Ratio: ", VelocityDecayRatio);
    Print("Momentum Flips to Exit: ", MomentumFlipsToExit);
+   Print("Pullback Mode B: ", (effectiveUsePullback ? "ENABLED" : "DISABLED"));
    Print("========================================");
    
    return(INIT_SUCCEEDED);
@@ -330,7 +327,7 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
-   Print("Hyperactive HFT MT5 Scalper deinitialized. Reason: ", reason);
+   Print("Superpower EA V1.1 Impulse Entry deinitialized. Reason: ", reason);
 }
 
 // =====================================================================================================
@@ -703,12 +700,12 @@ void CloseAllTrades(string reason)
 }
 
 // =====================================================================================================
-// ENTRY LOGIC - MOMENTUM BREAKOUT
+// ENTRY LOGIC - DUAL-MODE MOMENTUM BREAKOUT
 // =====================================================================================================
 
 int GetMomentumBreakoutSignal()
 {
-   if(!tickBufferReady || tickIndex < MomentumPeriod)
+   if(!tickBufferReady || tickIndex < 21)  // Need at least 21 ticks for volatility check (access tickPrices[20])
       return 0;
    
    // Check liquidity time filter first
@@ -726,21 +723,72 @@ int GetMomentumBreakoutSignal()
          return 0;
    }
    
-   // Check tick speed
-   if(UseTickSpeedFilter && ticksPerSecond < MinTickSpeed)
+   // Check spread
+   if(currentSpread > MaxSpreadPoints)
+      return 0;
+   
+   // =================================================================
+   // CALCULATE ENTRY MOMENTUM (price displacement)
+   // =================================================================
+   double entryDisplacement = tickPrices[0] - tickPrices[10];
+   double shortRange = MathAbs(tickPrices[0] - tickPrices[5]);
+   double longRange  = MathAbs(tickPrices[0] - tickPrices[20]);
+   
+   int entryMomentumDir = 0;
+   if(entryDisplacement > 0)
+      entryMomentumDir = 1;
+   else if(entryDisplacement < 0)
+      entryMomentumDir = -1;
+   
+   // =================================================================
+   // MODE A: EARLY IMPULSE ENTRY (PRIORITY)
+   // Catch the START of real momentum - NO PULLBACK, ENTER IMMEDIATELY
+   // =================================================================
+   if(
+      MathAbs(entryDisplacement) >= BreakoutThreshold * StrongBreakoutMultiplier &&  // Strong displacement (1.8x threshold)
+      ticksPerSecond >= MinTickSpeed * 2.0 &&                                         // High tick speed (2x minimum)
+      longRange >= shortRange * 1.5 &&                                                // Volatility expanding
+      consecutiveMomentumTicks >= 2                                                   // Some momentum confirmation
+   )
+   {
+      // EARLY IMPULSE - Enter immediately, NO pullback wait
+      breakoutDetected = false;  // Reset any pending pullback
+      Print("MODE A: EARLY IMPULSE ENTRY - Displacement: ", DoubleToString(MathAbs(entryDisplacement), 6), 
+            " TickSpeed: ", DoubleToString(ticksPerSecond, 1));
+      return entryMomentumDir;  // BUY or SELL immediately
+   }
+   
+   // =================================================================
+   // MODE B: PULLBACK ENTRY (SECONDARY)
+   // Only runs if Mode A did NOT trigger
+   // =================================================================
+   
+   // Quality gate: Require tick speed expansion (1.5x minimum)
+   if(ticksPerSecond < MinTickSpeed * 1.5)
       return 0;
    
    // Check volatility cycle filter
    if(!CheckVolatilityCycle())
       return 0;
    
-   // Check spread
-   if(currentSpread > MaxSpreadPoints)
+   // Quality gate: Volatility regime - only trade expanding markets
+   if(longRange < shortRange * 1.2)
+      return 0;  // Market compressing - DO NOT TRADE
+   
+   // Entry threshold for Mode B
+   double entryThreshold = BreakoutThreshold * 2.0;  // 2x for real fills
+   
+   // Need sufficient displacement
+   if(MathAbs(entryDisplacement) < entryThreshold)
+      return 0;
+   
+   // Quality gate: Require momentum confirmation
+   if(consecutiveMomentumTicks < 3)
       return 0;
    
    double midPrice = (currentBid + currentAsk) / 2.0;
    
-   // Calculate momentum breakout
+   // Calculate momentum breakout using entry momentum direction
    double priceChange = 0.0;
    
    if(tickIndex >= MomentumPeriod)
@@ -750,137 +798,94 @@ int GetMomentumBreakoutSignal()
       double newestPrice = tickPrices[0];
       priceChange = newestPrice - oldestPrice;
       
-      // Check for breakout: strong movement in momentum direction
-      double breakoutThreshold = BreakoutThreshold;
+      double breakoutThreshold = BreakoutThreshold * 2.0;  // Doubled for reality
       
-      if(momentumDirection == 1 && priceChange >= breakoutThreshold)
+      if(entryMomentumDir == 1 && priceChange >= breakoutThreshold)
       {
          // Bullish breakout detected
-         if(consecutiveMomentumTicks >= 1)  // Reduced from 2 to 1 for more entries
+         if(effectiveUsePullback)
          {
-            // Check for strong breakout - enter immediately if momentum is very strong
-            double strongBreakoutThreshold = breakoutThreshold * StrongBreakoutMultiplier;
-            bool isStrongBreakout = (priceChange >= strongBreakoutThreshold && consecutiveMomentumTicks >= 2);
-            
-            if(isStrongBreakout)
+            // Track breakout peak for pullback entry
+            if(!breakoutDetected || breakoutDirection != 1)
             {
-               // Strong breakout - enter immediately (sniper entry on strong momentum)
-               breakoutDetected = false;  // Reset any pending pullback
-               return 1;  // BUY immediately
+               breakoutDetected = true;
+               breakoutDirection = 1;
+               breakoutPeakPrice = midPrice;
+               breakoutTime = TimeCurrent();
+               return 0;  // Wait for pullback
             }
-            
-            if(UsePullbackFilter)
+            else if(breakoutDirection == 1)
             {
-               // Track breakout peak
-               if(!breakoutDetected || breakoutDirection != 1)
+               // Update peak if price goes higher
+               if(midPrice > breakoutPeakPrice)
                {
-                  breakoutDetected = true;
-                  breakoutDirection = 1;
                   breakoutPeakPrice = midPrice;
                   breakoutTime = TimeCurrent();
-                  return 0;  // Wait for pullback
+                  return 0;  // Still in breakout, wait for pullback
                }
-               else if(breakoutDirection == 1)
+               
+               // Check for pullback: price retraced PullbackPoints from peak
+               double retraceFromPeak = breakoutPeakPrice - midPrice;
+               if(retraceFromPeak >= (PullbackPoints * point))
                {
-                  // Update peak if price goes higher
-                  if(midPrice > breakoutPeakPrice)
-                  {
-                     breakoutPeakPrice = midPrice;
-                     breakoutTime = TimeCurrent();
-                     
-                     // If price continues strongly upward, enter immediately (strong momentum)
-                     double continuedMomentum = midPrice - breakoutPeakPrice;
-                     if(continuedMomentum >= (breakoutThreshold * 0.5))
-                     {
-                        breakoutDetected = false;
-                        return 1;  // BUY - momentum too strong, don't wait for pullback
-                     }
-                     
-                     return 0;  // Still in breakout, wait for pullback
-                  }
-                  
-                  // Check for pullback: price retraced PullbackPoints from peak
-                  double retraceFromPeak = breakoutPeakPrice - midPrice;
-                  if(retraceFromPeak >= (PullbackPoints * point))
-                  {
-                     // Pullback occurred, enter immediately
-                     breakoutDetected = false;  // Reset for next breakout
-                     return 1;  // BUY
-                  }
-                  
-                  return 0;  // Still waiting for pullback
+                  // Pullback occurred, enter
+                  breakoutDetected = false;  // Reset for next breakout
+                  Print("MODE B: PULLBACK ENTRY (BUY) - Retrace: ", DoubleToString(retraceFromPeak / point, 1), " pts");
+                  return 1;  // BUY
                }
-            }
-            else
-            {
-               // No pullback filter, enter immediately
-               return 1;  // BUY
+               
+               return 0;  // Still waiting for pullback
             }
          }
+         else
+         {
+            // No pullback filter (JPY pairs or disabled), enter immediately
+            Print("MODE B: DIRECT ENTRY (BUY) - No pullback required");
+            return 1;  // BUY
+         }
       }
-      else if(momentumDirection == -1 && priceChange <= -breakoutThreshold)
+      else if(entryMomentumDir == -1 && priceChange <= -breakoutThreshold)
       {
          // Bearish breakout detected
-         if(consecutiveMomentumTicks >= 1)  // Reduced from 2 to 1 for more entries
+         if(effectiveUsePullback)
          {
-            // Check for strong breakout - enter immediately if momentum is very strong
-            double strongBreakoutThreshold = breakoutThreshold * StrongBreakoutMultiplier;
-            bool isStrongBreakout = (priceChange <= -strongBreakoutThreshold && consecutiveMomentumTicks >= 2);
-            
-            if(isStrongBreakout)
+            // Track breakout peak (lowest point for SELL)
+            if(!breakoutDetected || breakoutDirection != -1)
             {
-               // Strong breakout - enter immediately (sniper entry on strong momentum)
-               breakoutDetected = false;  // Reset any pending pullback
-               return -1;  // SELL immediately
+               breakoutDetected = true;
+               breakoutDirection = -1;
+               breakoutPeakPrice = midPrice;
+               breakoutTime = TimeCurrent();
+               return 0;  // Wait for pullback
             }
-            
-            if(UsePullbackFilter)
+            else if(breakoutDirection == -1)
             {
-               // Track breakout peak (lowest point for SELL)
-               if(!breakoutDetected || breakoutDirection != -1)
+               // Update peak (lowest point) if price goes lower
+               if(midPrice < breakoutPeakPrice)
                {
-                  breakoutDetected = true;
-                  breakoutDirection = -1;
                   breakoutPeakPrice = midPrice;
                   breakoutTime = TimeCurrent();
-                  return 0;  // Wait for pullback
+                  return 0;  // Still in breakout, wait for pullback
                }
-               else if(breakoutDirection == -1)
+               
+               // Check for pullback: price retraced PullbackPoints from peak (lowest point)
+               double retraceFromPeak = midPrice - breakoutPeakPrice;
+               if(retraceFromPeak >= (PullbackPoints * point))
                {
-                  // Update peak (lowest point) if price goes lower
-                  if(midPrice < breakoutPeakPrice)
-                  {
-                     breakoutPeakPrice = midPrice;
-                     breakoutTime = TimeCurrent();
-                     
-                     // If price continues strongly downward, enter immediately (strong momentum)
-                     double continuedMomentum = breakoutPeakPrice - midPrice;
-                     if(continuedMomentum >= (breakoutThreshold * 0.5))
-                     {
-                        breakoutDetected = false;
-                        return -1;  // SELL - momentum too strong, don't wait for pullback
-                     }
-                     
-                     return 0;  // Still in breakout, wait for pullback
-                  }
-                  
-                  // Check for pullback: price retraced PullbackPoints from peak (lowest point)
-                  double retraceFromPeak = midPrice - breakoutPeakPrice;
-                  if(retraceFromPeak >= (PullbackPoints * point))
-                  {
-                     // Pullback occurred, enter immediately
-                     breakoutDetected = false;  // Reset for next breakout
-                     return -1;  // SELL
-                  }
-                  
-                  return 0;  // Still waiting for pullback
+                  // Pullback occurred, enter
+                  breakoutDetected = false;  // Reset for next breakout
+                  Print("MODE B: PULLBACK ENTRY (SELL) - Retrace: ", DoubleToString(retraceFromPeak / point, 1), " pts");
+                  return -1;  // SELL
                }
+               
+               return 0;  // Still waiting for pullback
             }
-            else
-            {
-               // No pullback filter, enter immediately
-               return -1;  // SELL
-            }
+         }
+         else
+         {
+            // No pullback filter (JPY pairs or disabled), enter immediately
+            Print("MODE B: DIRECT ENTRY (SELL) - No pullback required");
+            return -1;  // SELL
          }
       }
    }
@@ -904,10 +909,6 @@ bool ShouldOpenTrade(int direction)
    
    // Check if trading is stopped
    if(tradingStopped)
-      return false;
-   
-   // Check cooldown after last trade close
-   if(lastTradeCloseTime > 0 && (TimeCurrent() - lastTradeCloseTime) < tradeCooldownSeconds)
       return false;
    
    // Check spread
@@ -1002,7 +1003,7 @@ bool OpenTrade(int direction)
    // No take profit (using dynamic exit)
    double tp = 0.0;
    
-   string comment = "HyperHFT_" + (direction == 1 ? "BUY" : "SELL");
+   string comment = "Superpower_" + (direction == 1 ? "BUY" : "SELL");
    
    ENUM_ORDER_TYPE orderType = (direction == 1) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
    
@@ -1106,7 +1107,7 @@ bool OpenTrade(int direction)
 }
 
 // =====================================================================================================
-// MANAGE TRADE (EXIT LOGIC)
+// MANAGE TRADE (EXIT LOGIC) - UNCHANGED
 // =====================================================================================================
 
 void ManageTrade()
@@ -1369,9 +1370,6 @@ void CloseTrade(int tradeIndex, string reason)
    {
       Print("TRADE CLOSED: ", reason, " | P&L: $", DoubleToString(profit, 2), " | Remaining trades: ", activeTradeCount - 1);
       
-      // Set cooldown timer
-      lastTradeCloseTime = TimeCurrent();
-      
       // Daily profit calculated dynamically from balance - no manual tracking
       RemoveTrade(tradeIndex);
    }
@@ -1403,55 +1401,64 @@ void RemoveTrade(int tradeIndex)
 
 void UpdateDisplay()
 {
-   string status = "\n=== Hyperactive HFT MT5 Scalper V2.00 ===\n";
+   string status = "\n=== SUPERPOWER EA V1.1 IMPULSE ===\n";
    status += "Symbol: " + tradeSymbol + "\n";
-   status += "Lot Mode: " + (UseFixedLot ? "FIXED" : "DYNAMIC") + "\n";
-   if(UseFixedLot)
-      status += "Lot Size: " + DoubleToString(FixedLotSize, 2) + "\n";
-   else
-      status += "Dynamic Lot: " + DoubleToString(CalculateLotSize(), 2) + "\n";
+   status += "Lot Size: " + DoubleToString(CalculateLotSize(), 2) + "\n";
    
-   status += "Tick Speed: " + DoubleToString(ticksPerSecond, 2) + " ticks/sec";
-   if(UseTickSpeedFilter && ticksPerSecond < MinTickSpeed)
-      status += " [LOW]";
+   // Entry mode indicators
+   status += "\n--- Dual-Mode Entry ---\n";
+   status += "MODE A (Impulse): ";
+   double entryDisp = MathAbs(tickPrices[0] - tickPrices[10]);
+   double impulseThresh = BreakoutThreshold * StrongBreakoutMultiplier;
+   bool impulseReady = (entryDisp >= impulseThresh && ticksPerSecond >= MinTickSpeed * 2.0 && consecutiveMomentumTicks >= 2);
+   status += impulseReady ? "[READY]" : "[WAIT]";
    status += "\n";
    
-   status += "Spread: " + DoubleToString(currentSpread, 1) + " points";
-   if(currentSpread > MaxSpreadPoints)
-      status += " [HIGH]";
-   if(UseSpreadNormalizedFilter && averageSpread > 0.0)
-   {
-      status += " (Avg: " + DoubleToString(averageSpread, 1);
-      if(currentSpread > (averageSpread * SpreadMultiplier))
-         status += " [SPIKE]";
-      status += ")";
-   }
+   status += "MODE B (Pullback): " + (effectiveUsePullback ? "ENABLED" : "DISABLED (JPY)") + "\n";
+   
+   // Entry quality indicators
+   status += "\n--- Entry Quality ---\n";
+   double requiredSpeed = MinTickSpeed * 1.5;
+   status += "Tick Speed: " + DoubleToString(ticksPerSecond, 1) + "/" + DoubleToString(requiredSpeed, 1);
+   status += (ticksPerSecond >= requiredSpeed) ? " [OK]" : " [LOW]";
    status += "\n";
    
-   status += "Momentum: " + (momentumDirection == 1 ? "BULLISH" : (momentumDirection == -1 ? "BEARISH" : "NEUTRAL"));
-   status += " (" + IntegerToString(consecutiveMomentumTicks) + " ticks)\n";
+   status += "Spread: " + DoubleToString(currentSpread, 1) + " pts";
+   status += (currentSpread <= MaxSpreadPoints) ? " [OK]" : " [HIGH]";
+   status += "\n";
    
-   // Show filter statuses
-   if(UsePullbackFilter && breakoutDetected)
-   {
-      status += "Breakout: " + (breakoutDirection == 1 ? "BULLISH" : "BEARISH");
-      status += " | Peak: " + DoubleToString(breakoutPeakPrice, symbolDigits);
-      status += " | Waiting for pullback...\n";
-   }
+   status += "Momentum: " + (momentumDirection == 1 ? "BULL" : (momentumDirection == -1 ? "BEAR" : "FLAT"));
+   status += " x" + IntegerToString(consecutiveMomentumTicks);
+   status += (consecutiveMomentumTicks >= 3) ? " [OK]" : " [WAIT]";
+   status += "\n";
    
-   if(UseVolatilityCycleFilter)
+   // Show volatility regime
+   if(tickBufferReady && tickIndex >= 21)
    {
-      status += "Volatility Cycle: " + (CheckVolatilityCycle() ? "RISING" : "NOT RISING") + "\n";
+      double shortRange = MathAbs(tickPrices[0] - tickPrices[5]);
+      double longRange  = MathAbs(tickPrices[0] - tickPrices[20]);
+      bool expanding = (longRange >= shortRange * 1.2);
+      status += "Volatility: " + (expanding ? "EXPANDING [OK]" : "COMPRESSING [BLOCK]") + "\n";
    }
    
    if(UseLiquidityTimeFilter)
+      status += "Liquidity: " + (CheckLiquidityTime() ? "ALLOWED" : "BLOCKED") + "\n";
+   
+   // Show breakout status (Mode B only)
+   if(breakoutDetected && effectiveUsePullback)
    {
-      status += "Liquidity Time: " + (CheckLiquidityTime() ? "ALLOWED" : "BLOCKED") + "\n";
+      status += "\n>>> MODE B: BREAKOUT " + (breakoutDirection == 1 ? "BULL" : "BEAR");
+      status += " | Waiting pullback...\n";
    }
+   
+   // Trading status
+   status += "\n--- Status ---\n";
+   status += "Max Loss: " + DoubleToString(effectiveMaxLoss, 0) + " pts (symbol-aware)\n";
+   status += "Vel Min Profit: " + DoubleToString(effectiveVelocityMinProfit, 0) + " pts\n";
    
    if(tradingStopped)
    {
-      status += "\nSTATUS: TRADING STOPPED\n";
+      status += ">>> TRADING STOPPED <<<\n";
       if(UseDrawdownProtection)
       {
          double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -1459,12 +1466,9 @@ void UpdateDisplay()
          status += "Drawdown: " + DoubleToString(drawdown, 2) + "%\n";
       }
    }
-   else
-   {
-      status += "STATUS: ACTIVE\n";
-   }
    
-   status += "\n--- Active Trades: " + IntegerToString(activeTradeCount) + "/" + IntegerToString(maxTrades) + " ---\n";
+   // Active trades
+   status += "\n--- Trades: " + IntegerToString(activeTradeCount) + "/" + IntegerToString(maxTrades) + " ---\n";
    
    if(activeTradeCount > 0)
    {
@@ -1484,13 +1488,14 @@ void UpdateDisplay()
             
             double velocityRatio = (activeTrades[i].peakTickSpeed > 0) ? (ticksPerSecond / activeTrades[i].peakTickSpeed) : 1.0;
             
-            status += "[" + IntegerToString(i+1) + "] " + (activeTrades[i].direction == 1 ? "BUY" : "SELL");
-            status += " | $" + DoubleToString(profit, 2);
-            status += " | " + DoubleToString(profitPoints, 1) + " pts";
-            status += " | " + IntegerToString(holdSeconds) + "s";
-            status += "\n    Flips:" + IntegerToString(activeTrades[i].momentumFlipCount);
-            status += " | Vel:" + DoubleToString(velocityRatio, 2);
-            if(activeTrades[i].wasProfitable) status += " [WasProfit]";
+            status += (activeTrades[i].direction == 1 ? "BUY" : "SELL");
+            status += " $" + DoubleToString(profit, 2);
+            status += " | " + DoubleToString(profitPoints, 1) + "pts";
+            status += " | " + IntegerToString(holdSeconds) + "s\n";
+            status += "  Flips:" + IntegerToString(activeTrades[i].momentumFlipCount);
+            status += " Vel:" + DoubleToString(velocityRatio, 2);
+            if(holdSeconds < MinTradeMaturitySeconds) status += " [MATURING]";
+            if(activeTrades[i].wasProfitable) status += " [PROFIT]";
             if(activeTrades[i].breakevenMoved) status += " [BE]";
             status += "\n";
          }
@@ -1498,18 +1503,13 @@ void UpdateDisplay()
    }
    else
    {
-      status += "Waiting for momentum breakout signal...\n";
+      status += "Scanning for impulse entries...\n";
    }
    
+   // Account
    status += "\n--- Account ---\n";
-   status += "Balance: $" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + "\n";
-   status += "Equity: $" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + "\n";
-   if(DailyProfitTarget > 0.0)
-   {
-      status += "Daily Profit: $" + DoubleToString(dailyProfit, 2);
-      status += " / $" + DoubleToString(DailyProfitTarget, 2) + "\n";
-   }
+   status += "Bal: $" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2);
+   status += " | Eq: $" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + "\n";
    
    Comment(status);
 }
-

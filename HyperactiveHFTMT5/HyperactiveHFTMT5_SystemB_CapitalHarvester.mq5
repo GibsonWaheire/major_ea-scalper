@@ -50,6 +50,13 @@ input int      DeadImpulseSeconds = 3;            // Abort time for winning trad
 input int      DeadImpulseSecondsLosing = 2;      // Abort time for losing trades - cut bad entries faster (seconds)
 input int      FailsafeTimeSeconds = 8;           // Hard time cap failsafe (seconds)
 
+input group "===== Dynamic Maximum Profit Stop ====="
+input double   MinProfitPointsToActivate = 50.0;  // Minimum profit in points to start monitoring for peak exit
+input int      PeakHoldSeconds = 3;                // Close when profit stays at peak for this many seconds
+input double   PeakTolerancePercent = 0.98;        // Consider at peak if within this % of peak (0.98 = 98%)
+input bool     CloseOnDeclineFromPeak = true;      // Close immediately if profit declines from peak
+input double   DeclineThresholdPercent = 0.95;     // Close if profit drops below this % of peak (0.95 = 95%)
+
 // ===== Entry Phase State Machine =====
 enum ENTRY_PHASE {
    PHASE_NONE,                                     // No active cycle
@@ -115,18 +122,34 @@ int failCount = 0;                                // Consecutive trade failures
 // Point normalization
 double normalizedImpulsePoints = 20.0;            // Normalized impulse points for broker
 
+// ===== Dynamic Maximum Profit Stop State Tracking =====
+struct TradeProfitStopState {
+   ulong ticket;                                  // Position ticket
+   double entryPrice;                             // Entry price
+   bool monitoringActive;                         // Whether profit monitoring is active
+   ulong activationTime;                          // When monitoring started (ms)
+   double peakProfitPoints;                       // Highest profit seen in points
+   double peakProfitUSD;                          // Highest profit seen in USD
+   ulong peakTime;                                // Time when peak profit was reached (ms)
+   bool atPeak;                                   // Currently at or near peak profit
+   double lastProfitPoints;                       // Last profit value for comparison
+   ENUM_POSITION_TYPE positionType;               // BUY or SELL
+};
+
+TradeProfitStopState profitStopStates[];          // Array to track profit stop state for each trade
+
 // =====================================================================================================
 // INITIALIZATION
 // =====================================================================================================
 
 int OnInit()
 {
-   // Fix #20: Disable Strategy Tester explicitly
-   if(MQLInfoInteger(MQL_TESTER))
-   {
-      Print("SYSTEM B DISABLED IN STRATEGY TESTER — Live VPS execution only");
-      return INIT_FAILED;
-   }
+   // Strategy Tester enabled for backtesting
+   // if(MQLInfoInteger(MQL_TESTER))
+   // {
+   //    Print("SYSTEM B DISABLED IN STRATEGY TESTER — Live VPS execution only");
+   //    return INIT_FAILED;
+   // }
    
    // Validate g_Symbol
    if(!SymbolInfoInteger(g_Symbol, SYMBOL_SELECT))
@@ -313,6 +336,9 @@ void OnTimer()
    
    // PRIORITY 1: Per-trade profit exits (velocity decay for profitable trades)
    CheckPerTradeProfitExits();
+   
+   // PRIORITY 1.5: Dynamic stop loss for losing trades (reversal-based)
+   CheckDynamicStopLoss();
    
    // PRIORITY 2: Loss abort logic (only for losing basket)
    if(CheckAbortConditions())
@@ -753,7 +779,11 @@ void CheckPerTradeProfitExits()
             {
                Print("PER-TRADE PROFIT EXIT: Ticket=", ticket, " Profit=$", DoubleToString(tradeProfit, 2),
                      " Velocity decayed (peak=", DoubleToString(peak_velocity, 2), " current=", DoubleToString(equity_velocity, 2), ")");
-               trade.PositionClose(ticket);
+               if(trade.PositionClose(ticket))
+               {
+                  // Clean up profit stop state
+                  RemoveProfitStopState(ticket);
+               }
             }
          }
       }
@@ -941,6 +971,415 @@ void CheckFailsafeTime()
 }
 
 // =====================================================================================================
+// DYNAMIC PROFIT STOP STATE MANAGEMENT
+// =====================================================================================================
+
+// Find or create profit stop state for a ticket, returns array index or -1 if error
+int GetProfitStopStateIndex(ulong ticket)
+{
+   // First, try to find existing state
+   int size = ArraySize(profitStopStates);
+   for(int i = 0; i < size; i++)
+   {
+      if(profitStopStates[i].ticket == ticket)
+      {
+         return i;
+      }
+   }
+   
+   // Not found - create new state
+   ArrayResize(profitStopStates, size + 1);
+   
+   profitStopStates[size].ticket = ticket;
+   profitStopStates[size].monitoringActive = false;
+   profitStopStates[size].activationTime = 0;
+   profitStopStates[size].peakProfitPoints = 0.0;
+   profitStopStates[size].peakProfitUSD = 0.0;
+   profitStopStates[size].peakTime = 0;
+   profitStopStates[size].atPeak = false;
+   profitStopStates[size].lastProfitPoints = 0.0;
+   
+   // Get position info to set entry price and type
+   if(PositionSelectByTicket(ticket))
+   {
+      profitStopStates[size].entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      profitStopStates[size].positionType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   }
+   
+   return size;
+}
+
+// Remove profit stop state for a ticket
+void RemoveProfitStopState(ulong ticket)
+{
+   int size = ArraySize(profitStopStates);
+   for(int i = 0; i < size; i++)
+   {
+      if(profitStopStates[i].ticket == ticket)
+      {
+         // Shift remaining elements
+         for(int j = i; j < size - 1; j++)
+         {
+            profitStopStates[j] = profitStopStates[j + 1];
+         }
+         ArrayResize(profitStopStates, size - 1);
+         return;
+      }
+   }
+}
+
+// Clean up stale states (tickets that no longer exist)
+void CleanupProfitStopStates()
+{
+   int size = ArraySize(profitStopStates);
+   for(int i = size - 1; i >= 0; i--)
+   {
+      ulong ticket = profitStopStates[i].ticket;
+      bool exists = false;
+      
+      // Check if position still exists
+      for(int j = PositionsTotal() - 1; j >= 0; j--)
+      {
+         ulong posTicket = PositionGetTicket(j);
+         if(posTicket == ticket)
+         {
+            if(PositionSelectByTicket(posTicket))
+            {
+               if(PositionGetString(POSITION_SYMBOL) == g_Symbol &&
+                  PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+               {
+                  exists = true;
+                  break;
+               }
+            }
+         }
+      }
+      
+      if(!exists)
+      {
+         // Position no longer exists - remove state
+         RemoveProfitStopState(ticket);
+      }
+   }
+}
+
+// =====================================================================================================
+// ASSESS PRICE MOMENTUM (Helper for reversal detection)
+// =====================================================================================================
+
+bool AssessPriceMomentum(double entryPrice, ENUM_POSITION_TYPE positionType)
+{
+   // Need some tick history
+   if(tickCount < 10)
+      return false;
+   
+   // Get current price
+   MqlTick tick;
+   if(!SymbolInfoTick(g_Symbol, tick))
+      return false;
+   
+   double currentPrice = (tick.bid + tick.ask) / 2.0;
+   double point = SymbolInfoDouble(g_Symbol, SYMBOL_POINT);
+   
+   // Calculate average price from recent ticks (last 5 ticks, excluding current)
+   int lookbackTicks = MathMin(5, tickCount - 1);
+   if(lookbackTicks < 2)
+      return false;
+   
+   double recentPrice = 0.0;
+   int validTicks = 0;
+   
+   // Get average of recent ticks (excluding the most recent which is current)
+   for(int offset = 1; offset <= lookbackTicks; offset++)
+   {
+      int idx = (tickIndex - 1 - offset + maxTicks) % maxTicks;
+      if(tickPrices[idx] > 0.0)
+      {
+         recentPrice += tickPrices[idx];
+         validTicks++;
+      }
+   }
+   
+   if(validTicks == 0)
+      return false;
+   
+   recentPrice = recentPrice / validTicks;
+   
+   // For BUY position losing: price went down from entry, recovery = price moving up
+   // Compare: if recent average price is higher than older price, that's recovery
+   if(positionType == POSITION_TYPE_BUY)
+   {
+      // BUY losing: currentPrice < entryPrice
+      // Recovery: price moving up means recent price should be higher than older price
+      // Get older price (further back)
+      double olderPrice = 0.0;
+      int olderValidTicks = 0;
+      for(int offset = lookbackTicks + 1; offset <= lookbackTicks * 2 && offset < tickCount; offset++)
+      {
+         int idx = (tickIndex - 1 - offset + maxTicks) % maxTicks;
+         if(tickPrices[idx] > 0.0)
+         {
+            olderPrice += tickPrices[idx];
+            olderValidTicks++;
+         }
+      }
+      
+      if(olderValidTicks == 0)
+         return false;
+      
+      olderPrice = olderPrice / olderValidTicks;
+      
+      // Recovery: recent price > older price (price moving up)
+      return (recentPrice > olderPrice);
+   }
+   else // SELL
+   {
+      // SELL losing: currentPrice > entryPrice
+      // Recovery: price moving down means recent price should be lower than older price
+      // Get older price (further back)
+      double olderPrice = 0.0;
+      int olderValidTicks = 0;
+      for(int offset = lookbackTicks + 1; offset <= lookbackTicks * 2 && offset < tickCount; offset++)
+      {
+         int idx = (tickIndex - 1 - offset + maxTicks) % maxTicks;
+         if(tickPrices[idx] > 0.0)
+         {
+            olderPrice += tickPrices[idx];
+            olderValidTicks++;
+         }
+      }
+      
+      if(olderValidTicks == 0)
+         return false;
+      
+      olderPrice = olderPrice / olderValidTicks;
+      
+      // Recovery: recent price < older price (price moving down)
+      return (recentPrice < olderPrice);
+   }
+}
+
+// =====================================================================================================
+// OPEN REVERSAL RECOVERY TRADE
+// =====================================================================================================
+
+void OpenReversalRecoveryTrade(ENUM_POSITION_TYPE closedPositionType)
+{
+   // Reversal recovery trades disabled - only close at maximum profit
+   return;
+   
+   if(isClosing)
+      return;
+   
+   // Get current price
+   MqlTick tick;
+   if(!SymbolInfoTick(g_Symbol, tick))
+      return;
+   
+   // Check spread
+   double point = SymbolInfoDouble(g_Symbol, SYMBOL_POINT);
+   double spreadPoints = (tick.ask - tick.bid) / point;
+   if(spreadPoints > MaxSpreadPoints)
+      return; // Spread too wide
+   
+   // Calculate lot size
+   double lotSize = CalculateLotSize();
+   if(lotSize <= 0)
+      return;
+   
+   // Open trade in opposite direction
+   int direction = (closedPositionType == POSITION_TYPE_BUY) ? -1 : 1;
+   double price = (direction == 1) ? tick.ask : tick.bid;
+   ENUM_ORDER_TYPE orderType = (direction == 1) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   
+   // Set magic number
+   trade.SetExpertMagicNumber(MagicNumber);
+   
+   // Open reversal recovery trade
+   if(trade.PositionOpen(g_Symbol, orderType, lotSize, price, 0, 0, "SystemB Reversal"))
+   {
+      if(trade.ResultRetcode() == TRADE_RETCODE_DONE)
+      {
+         Print("REVERSAL RECOVERY TRADE OPENED: ", (direction == 1 ? "BUY" : "SELL"),
+               " | Lot: ", lotSize, " | Price: ", price);
+      }
+      else
+      {
+         Print("Failed to open reversal recovery trade: ", trade.ResultRetcodeDescription());
+      }
+   }
+   else
+   {
+      Print("Failed to open reversal recovery trade: ", trade.ResultRetcodeDescription());
+   }
+}
+
+// =====================================================================================================
+// CHECK DYNAMIC MAXIMUM PROFIT STOP (Close at highest profit, never close losing trades)
+// =====================================================================================================
+
+void CheckDynamicStopLoss()
+{
+   // Clean up stale states first
+   CleanupProfitStopStates();
+   
+   // Get current price and point value
+   MqlTick tick;
+   if(!SymbolInfoTick(g_Symbol, tick))
+      return;
+   
+   double point = SymbolInfoDouble(g_Symbol, SYMBOL_POINT);
+   ulong currentTime = GetTickCount64();
+   
+   // Iterate through all open positions
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0)
+         continue;
+      
+      if(!PositionSelectByTicket(ticket))
+         continue;
+      
+      if(PositionGetString(POSITION_SYMBOL) != g_Symbol ||
+         PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+         continue;
+      
+      // Get position details
+      double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      ENUM_POSITION_TYPE positionType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double currentPrice = (positionType == POSITION_TYPE_BUY) ? tick.bid : tick.ask;
+      double tradeProfit = PositionGetDouble(POSITION_PROFIT);
+      
+      // CRITICAL: Only process PROFITABLE trades - NEVER close losing trades
+      if(tradeProfit <= 0)
+         continue; // Skip losing trades completely
+      
+      // Calculate current profit in points
+      double profitPoints = 0.0;
+      if(positionType == POSITION_TYPE_BUY)
+      {
+         profitPoints = (currentPrice - entryPrice) / point; // BUY profit if price above entry
+      }
+      else // SELL
+      {
+         profitPoints = (entryPrice - currentPrice) / point; // SELL profit if price below entry
+      }
+      
+      // Only process trades with positive profit
+      if(profitPoints <= 0)
+         continue;
+      
+      // Get or create profit stop state
+      int stateIndex = GetProfitStopStateIndex(ticket);
+      if(stateIndex < 0)
+         continue;
+      
+      // Check if we should activate monitoring (profit >= threshold)
+      if(profitPoints >= MinProfitPointsToActivate)
+      {
+         // Activate monitoring if not already active
+         if(!profitStopStates[stateIndex].monitoringActive)
+         {
+            profitStopStates[stateIndex].monitoringActive = true;
+            profitStopStates[stateIndex].activationTime = currentTime;
+            profitStopStates[stateIndex].peakProfitPoints = profitPoints;
+            profitStopStates[stateIndex].peakProfitUSD = tradeProfit;
+            profitStopStates[stateIndex].peakTime = currentTime;
+            profitStopStates[stateIndex].atPeak = true;
+            profitStopStates[stateIndex].lastProfitPoints = profitPoints;
+            Print("MAX PROFIT MONITORING ACTIVATED: Ticket=", ticket, " | Profit=", DoubleToString(profitPoints, 1), 
+                  " points ($", DoubleToString(tradeProfit, 2), ") | Entry=", DoubleToString(entryPrice, 5));
+         }
+         
+         // Update peak profit if we've reached a new high
+         if(profitPoints > profitStopStates[stateIndex].peakProfitPoints)
+         {
+            // New peak reached - update peak and reset peak time
+            profitStopStates[stateIndex].peakProfitPoints = profitPoints;
+            profitStopStates[stateIndex].peakProfitUSD = tradeProfit;
+            profitStopStates[stateIndex].peakTime = currentTime;
+            profitStopStates[stateIndex].atPeak = true;
+            Print("NEW PEAK REACHED: Ticket=", ticket, " | Peak Profit=", DoubleToString(profitPoints, 1),
+                  " points ($", DoubleToString(tradeProfit, 2), ")");
+         }
+         
+         // Check if we're currently at or near peak (within tolerance)
+         double peakTolerance = profitStopStates[stateIndex].peakProfitPoints * PeakTolerancePercent;
+         bool currentlyAtPeak = (profitPoints >= peakTolerance);
+         
+         if(currentlyAtPeak)
+         {
+            // We're at or near peak - update status
+            if(!profitStopStates[stateIndex].atPeak)
+            {
+               // Just returned to peak - reset peak time
+               profitStopStates[stateIndex].peakTime = currentTime;
+               profitStopStates[stateIndex].atPeak = true;
+            }
+            
+            // Check if we've been at peak for the required time
+            ulong timeAtPeak = (currentTime - profitStopStates[stateIndex].peakTime) / 1000; // Convert to seconds
+            
+            if((int)timeAtPeak >= PeakHoldSeconds)
+            {
+               // Been at peak for required time - close at maximum profit
+               Print("MAX PROFIT CLOSE: Ticket=", ticket, " | Peak Profit=", 
+                     DoubleToString(profitStopStates[stateIndex].peakProfitPoints, 1), " points ($",
+                     DoubleToString(profitStopStates[stateIndex].peakProfitUSD, 2), ") | Current Profit=",
+                     DoubleToString(profitPoints, 1), " points ($", DoubleToString(tradeProfit, 2),
+                     ") | Time at peak=", (int)timeAtPeak, " seconds");
+               
+               if(trade.PositionClose(ticket))
+               {
+                  RemoveProfitStopState(ticket);
+               }
+               else
+               {
+                  Print("Failed to close position: ", trade.ResultRetcodeDescription());
+               }
+               continue; // Move to next position
+            }
+         }
+         else
+         {
+            // Not at peak anymore
+            profitStopStates[stateIndex].atPeak = false;
+            
+            // Check if profit has declined significantly from peak
+            if(CloseOnDeclineFromPeak)
+            {
+               double declineThreshold = profitStopStates[stateIndex].peakProfitPoints * DeclineThresholdPercent;
+               
+               if(profitPoints < declineThreshold)
+               {
+                  // Profit has declined significantly from peak - close immediately
+                  Print("DECLINE FROM PEAK CLOSE: Ticket=", ticket, " | Peak Profit=",
+                        DoubleToString(profitStopStates[stateIndex].peakProfitPoints, 1), " points ($",
+                        DoubleToString(profitStopStates[stateIndex].peakProfitUSD, 2), ") | Current Profit=",
+                        DoubleToString(profitPoints, 1), " points ($", DoubleToString(tradeProfit, 2),
+                        ") | Decline=", DoubleToString((profitPoints / profitStopStates[stateIndex].peakProfitPoints) * 100, 1), "%");
+                  
+                  if(trade.PositionClose(ticket))
+                  {
+                     RemoveProfitStopState(ticket);
+                  }
+                  else
+                  {
+                     Print("Failed to close position: ", trade.ResultRetcodeDescription());
+                  }
+                  continue; // Move to next position
+               }
+            }
+         }
+         
+         // Update last profit for next comparison
+         profitStopStates[stateIndex].lastProfitPoints = profitPoints;
+      }
+   }
+}
+
+// =====================================================================================================
 // CHECK EXIT CONDITIONS (DEPRECATED - Replaced by velocity system)
 // =====================================================================================================
 
@@ -1014,6 +1453,9 @@ void CloseAllPositions()
    
    // Reset velocity tracking
    ResetVelocityTracking();
+   
+   // Clean up all profit stop states
+   ArrayResize(profitStopStates, 0);
    
    if(remaining == 0)
    {

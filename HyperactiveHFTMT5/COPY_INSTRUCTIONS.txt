@@ -1,0 +1,34 @@
+HOW TO COPY EA TO METATRADER 5
+================================
+
+METHOD 1: Using MetaTrader 5 (Easiest)
+--------------------------------------
+1. Open MetaTrader 5
+2. Press Ctrl+Shift+D (or go to File -> Open Data Folder)
+3. Navigate to: MQL5/Experts/
+4. Copy this file there:
+   HyperactiveHFTMT5_MSS_OB_FVG.mq5
+
+METHOD 2: Using Terminal
+-------------------------
+Run this command (replace [YOUR_MT5_PATH] with your actual path):
+
+cp "/Users/apple/Desktop/sites/mt4-mt5-ea-collection/HyperactiveHFTMT5/HyperactiveHFTMT5_MSS_OB_FVG.mq5" "[YOUR_MT5_PATH]/MQL5/Experts/"
+
+Example:
+cp "/Users/apple/Desktop/sites/mt4-mt5-ea-collection/HyperactiveHFTMT5/HyperactiveHFTMT5_MSS_OB_FVG.mq5" "$HOME/Library/Application Support/MetaQuotes/Terminal/[HASH]/MQL5/Experts/"
+
+METHOD 3: Using the script
+---------------------------
+1. Find your MT5 data folder path
+2. Edit copy_to_mt5.sh and add your path
+3. Run: ./copy_to_mt5.sh
+
+AFTER COPYING:
+--------------
+1. Open MetaEditor in MT5
+2. Open the file: HyperactiveHFTMT5_MSS_OB_FVG.mq5
+3. Press F7 to compile
+4. Check for errors in the Errors tab
+
+

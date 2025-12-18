@@ -122,6 +122,15 @@ input bool     UseBasketTrailingStop  = true;     // Enable basket trailing stop
 input double   BasketTrailingStartUSD = 1.0;      // Start trailing after $1 profit
 input double   BasketTrailingStepUSD  = 0.3;      // Trail by $0.30
 
+// ===== Velocity-Based Exit Settings =====
+input group "===== Velocity-Based Exit Settings ====="
+input bool     UseVelocityExits = true;           // Enable velocity-based exits
+input double   VelocitySampleIntervalMS = 200.0;  // Velocity sampling interval (milliseconds)
+input double   VelocityReversalThreshold = 0.3;   // Velocity reversal threshold (points/second)
+input double   VelocityDecayRatio = 0.4;          // Close when velocity < peak * ratio
+input double   VelocityTrailingMultiplier = 2.0;  // Trailing stop multiplier based on velocity
+input double   MinVelocityForHold = 0.1;          // Minimum velocity to extend hold time
+
 // =====================================================================================================
 // STRUCTURES & GLOBALS
 // =====================================================================================================
@@ -190,6 +199,18 @@ int lastMomentumDirection = 0;       // Previous momentum direction (for flip de
 double breakoutOriginPrice = 0.0;    // Price at first breakout detection (for failure detection)
 bool momentumLegUsed = false;        // Track if current momentum leg already used for entry
 int lastMomentumLegDirection = 0;    // Direction of last momentum leg that opened a trade
+
+// Price velocity tracking
+double priceVelocity = 0.0;              // Current price velocity (points/second)
+double priceVelocityHistory[20];         // Velocity history for trend detection
+ulong priceVelocityTimeMS[20];          // Timestamps for velocity samples (milliseconds)
+int priceVelocityIndex = 0;              // Ring buffer index
+int priceVelocityCount = 0;             // Number of samples collected
+double peakVelocity = 0.0;               // Peak velocity seen since basket opened
+double basketEntryPrice = 0.0;           // Entry price for velocity calculation
+ulong lastVelocitySampleMS = 0;          // Last velocity sample time
+double lastPriceForVelocity = 0.0;       // Last price used for velocity calculation
+bool velocityTrackingActive = false;    // Whether velocity tracking is active
 
 // =====================================================================================================
 // INITIALIZATION
@@ -283,6 +304,21 @@ int OnInit()
    breakoutOriginPrice = 0.0;
    momentumLegUsed = false;
    lastMomentumLegDirection = 0;
+   
+   // Initialize velocity tracking
+   for(int i = 0; i < 20; i++)
+   {
+      priceVelocityHistory[i] = 0.0;
+      priceVelocityTimeMS[i] = 0;
+   }
+   priceVelocityIndex = 0;
+   priceVelocityCount = 0;
+   priceVelocity = 0.0;
+   peakVelocity = 0.0;
+   basketEntryPrice = 0.0;
+   lastVelocitySampleMS = 0;
+   lastPriceForVelocity = 0.0;
+   velocityTrackingActive = false;
    
    Print("Trade Symbol: ", tradeSymbol);
    Print("Lot Mode: ", (UseFixedLot ? "FIXED" : "DYNAMIC"));
@@ -407,6 +443,23 @@ void CloseAllBasketTrades()
     lastMomentumLegDirection = 0;
     basketOpenTimeMS = 0;  // Reset basket open time
     basketMaxProfitUSD = 0.0;  // Reset trailing stop tracking
+    
+    // Reset velocity tracking
+    priceVelocity = 0.0;
+    peakVelocity = 0.0;
+    basketEntryPrice = 0.0;
+    lastVelocitySampleMS = 0;
+    lastPriceForVelocity = 0.0;
+    priceVelocityCount = 0;
+    priceVelocityIndex = 0;
+    velocityTrackingActive = false;
+    
+    // Clear velocity history
+    for(int i = 0; i < 20; i++)
+    {
+       priceVelocityHistory[i] = 0.0;
+       priceVelocityTimeMS[i] = 0;
+    }
 }
 
 // Execution delay to simulate VPS + broker latency
@@ -446,6 +499,8 @@ void OnTick()
    // Manage basket trades
    if(OpenTradesCount() > 0)
    {
+      // Calculate price velocity for velocity-based exits
+      CalculatePriceVelocity();
       ManageBasket();
    }
    
@@ -624,6 +679,76 @@ void UpdateSpreadHistory()
       }
       averageSpread = sum / spreadHistoryCount;
    }
+}
+
+// =====================================================================================================
+// PRICE VELOCITY TRACKING
+// =====================================================================================================
+
+void CalculatePriceVelocity()
+{
+   if(!velocityTrackingActive || OpenTradesCount() == 0)
+      return;
+   
+   ulong currentTimeMS = GetTickCount64();
+   double midPrice = (currentBid + currentAsk) / 2.0;
+   
+   // Initialize on first sample
+   if(lastVelocitySampleMS == 0 || lastPriceForVelocity == 0.0)
+   {
+      lastVelocitySampleMS = currentTimeMS;
+      lastPriceForVelocity = midPrice;
+      return;
+   }
+   
+   // Check if enough time has passed for sampling
+   ulong elapsedMS = currentTimeMS - lastVelocitySampleMS;
+   if(elapsedMS < (ulong)VelocitySampleIntervalMS)
+      return;
+   
+   // Calculate velocity: (price_change) / (time_elapsed_in_seconds)
+   double priceChange = midPrice - lastPriceForVelocity;
+   double elapsedSeconds = (double)elapsedMS / 1000.0;
+   
+   if(elapsedSeconds > 0.001)  // Avoid division by zero
+   {
+      // Calculate velocity in points per second
+      // For BUY trades, positive velocity is good (price going up)
+      // For SELL trades, negative velocity is good (price going down)
+      priceVelocity = priceChange / elapsedSeconds / point;  // Convert to points/second
+      
+      // Adjust sign based on basket direction for easier interpretation
+      // Positive velocity = favorable for basket, negative = unfavorable
+      if(basketEntryDirection == -1)  // SELL basket
+         priceVelocity = -priceVelocity;  // Invert so positive = favorable
+      
+      // Track peak velocity
+      if(MathAbs(priceVelocity) > MathAbs(peakVelocity))
+         peakVelocity = priceVelocity;
+      
+      // Store in history (ring buffer)
+      if(priceVelocityCount < 20)
+      {
+         priceVelocityHistory[priceVelocityCount] = priceVelocity;
+         priceVelocityTimeMS[priceVelocityCount] = currentTimeMS;
+         priceVelocityCount++;
+      }
+      else
+      {
+         // Shift array (ring buffer)
+         for(int i = 0; i < 19; i++)
+         {
+            priceVelocityHistory[i] = priceVelocityHistory[i+1];
+            priceVelocityTimeMS[i] = priceVelocityTimeMS[i+1];
+         }
+         priceVelocityHistory[19] = priceVelocity;
+         priceVelocityTimeMS[19] = currentTimeMS;
+      }
+   }
+   
+   // Update for next sample
+   lastVelocitySampleMS = currentTimeMS;
+   lastPriceForVelocity = midPrice;
 }
 
 // =====================================================================================================
@@ -1117,6 +1242,17 @@ bool OpenTrade(int direction)
       lastMomentumLegDirection = direction;
       basketOpenTimeMS = GetTickCount64();  // Record basket open time
       basketMaxProfitUSD = 0.0;  // Reset trailing stop tracking
+      
+      // Initialize velocity tracking
+      basketEntryPrice = (currentBid + currentAsk) / 2.0;
+      lastPriceForVelocity = basketEntryPrice;
+      lastVelocitySampleMS = GetTickCount64();
+      priceVelocity = 0.0;
+      peakVelocity = 0.0;
+      priceVelocityCount = 0;
+      priceVelocityIndex = 0;
+      velocityTrackingActive = true;
+      
       Print("BASKET ENTRY: Direction = ", (direction == 1 ? "BUY" : "SELL"), 
             " | Origin Price = ", DoubleToString(breakoutOriginPrice, symbolDigits));
    }
@@ -1206,6 +1342,136 @@ bool OpenTrade(int direction)
 }
 
 // =====================================================================================================
+// VELOCITY-BASED EXIT CHECKS
+// =====================================================================================================
+
+// Check velocity-based exit conditions
+// Returns true if basket should be closed, false otherwise
+bool CheckVelocityExits()
+{
+   if(!UseVelocityExits || !velocityTrackingActive || OpenTradesCount() == 0)
+      return false;
+   
+   // Need at least a few velocity samples before making decisions
+   if(priceVelocityCount < 2)
+      return false;
+   
+   // ===== VELOCITY REVERSAL EXIT (Highest Priority for Profitable Trades) =====
+   // If basket is profitable AND velocity reverses direction, close immediately
+   if(basketTotalProfitUSD > 0.0 && priceVelocityCount >= 2)
+   {
+      // Get recent velocity samples to detect reversal
+      double currentVel = priceVelocity;
+      double previousVel = 0.0;
+      
+      // Find previous velocity sample
+      if(priceVelocityCount >= 2)
+      {
+         int prevIndex = (priceVelocityCount >= 2) ? priceVelocityCount - 2 : 0;
+         previousVel = priceVelocityHistory[prevIndex];
+      }
+      
+      // Check for velocity reversal: was positive (favorable) now negative (unfavorable)
+      // Or was negative (favorable for SELL) now positive (unfavorable)
+      if(previousVel > VelocityReversalThreshold && currentVel < -VelocityReversalThreshold)
+      {
+         // Velocity reversed from favorable to unfavorable
+         DelayExecution();
+         CloseAllBasketTrades();
+         Print("BASKET CLOSED: Velocity reversal detected | Profit: $", DoubleToString(basketTotalProfitUSD, 2), 
+               " | Previous Vel: ", DoubleToString(previousVel, 3), " | Current Vel: ", DoubleToString(currentVel, 3));
+         return true;
+      }
+   }
+   
+   // ===== VELOCITY DECAY EXIT =====
+   // Close when velocity drops below decay ratio of peak (momentum exhaustion)
+   if(MathAbs(peakVelocity) > 0.1 && priceVelocityCount >= 3)  // Need peak velocity and some history
+   {
+      double decayThreshold = peakVelocity * VelocityDecayRatio;
+      
+      // Check if current velocity has decayed significantly from peak
+      // For favorable velocity (positive), check if it dropped below threshold
+      if(peakVelocity > 0 && priceVelocity < decayThreshold)
+      {
+         // Only exit if we're at least slightly profitable (don't exit losing trades on decay alone)
+         if(basketTotalProfitUSD > 0.0)
+         {
+            DelayExecution();
+            CloseAllBasketTrades();
+            Print("BASKET CLOSED: Velocity decay detected | Profit: $", DoubleToString(basketTotalProfitUSD, 2), 
+                  " | Peak Vel: ", DoubleToString(peakVelocity, 3), " | Current Vel: ", DoubleToString(priceVelocity, 3), 
+                  " | Decay Threshold: ", DoubleToString(decayThreshold, 3));
+            return true;
+         }
+      }
+   }
+   
+   return false;  // No velocity-based exit triggered
+}
+
+// Get velocity-adjusted trailing stop level
+// Returns the trailing stop level in USD, or 0 if trailing stop shouldn't be applied
+double GetVelocityAdjustedTrailingStop()
+{
+   if(!UseVelocityExits || !UseBasketTrailingStop || basketTotalProfitUSD <= 0.0)
+      return 0.0;
+   
+   if(basketMaxProfitUSD < BasketTrailingStartUSD)
+      return 0.0;  // Haven't reached trailing start threshold
+   
+   // Base trailing step
+   double baseTrailingStep = BasketTrailingStepUSD;
+   
+   // Adjust trailing step based on current velocity
+   // High velocity = wider trailing stop (allow more room for volatility)
+   // Low velocity = tighter trailing stop (protect profits)
+   double velocityMultiplier = 1.0;
+   
+   if(MathAbs(priceVelocity) > MinVelocityForHold)
+   {
+      // Scale multiplier based on velocity magnitude
+      // Higher velocity = larger multiplier (up to VelocityTrailingMultiplier)
+      double velocityRatio = MathAbs(priceVelocity) / MathMax(MathAbs(peakVelocity), 0.1);
+      velocityMultiplier = 1.0 + (VelocityTrailingMultiplier - 1.0) * velocityRatio;
+   }
+   else
+   {
+      // Low velocity - use tighter trailing stop (smaller multiplier)
+      velocityMultiplier = 0.7;  // 30% tighter when velocity is low
+   }
+   
+   double adjustedTrailingStep = baseTrailingStep * velocityMultiplier;
+   double trailingStopLevel = basketMaxProfitUSD - adjustedTrailingStep;
+   
+   return trailingStopLevel;
+}
+
+// Check if velocity indicates we should extend hold time
+bool ShouldExtendHoldTime()
+{
+   if(!UseVelocityExits)
+      return false;
+   
+   // If velocity is accelerating favorably (positive and increasing), extend hold time
+   if(priceVelocityCount >= 2 && priceVelocity > MinVelocityForHold)
+   {
+      // Check if velocity is increasing (accelerating)
+      if(priceVelocityCount >= 2)
+      {
+         double currentVel = priceVelocity;
+         double previousVel = priceVelocityHistory[priceVelocityCount - 2];
+         
+         // If velocity is positive and increasing, extend hold
+         if(currentVel > previousVel && currentVel > MinVelocityForHold)
+            return true;
+      }
+   }
+   
+   return false;
+}
+
+// =====================================================================================================
 // BASKET MANAGEMENT (EXIT LOGIC)
 // =====================================================================================================
 
@@ -1239,7 +1505,10 @@ void ManageBasket()
       ulong elapsedMS = currentTimeMS - basketOpenTimeMS;
       ulong elapsedSeconds = elapsedMS / 1000;
       
-      if(elapsedSeconds >= (ulong)BasketMaxHoldSeconds)
+      // Check if velocity indicates we should extend hold time
+      bool extendHold = ShouldExtendHoldTime();
+      
+      if(elapsedSeconds >= (ulong)BasketMaxHoldSeconds && !extendHold)
       {
          DelayExecution();
          CloseAllBasketTrades();
@@ -1261,7 +1530,19 @@ void ManageBasket()
       // Check if profit has dropped by trailing step from peak
       if(basketMaxProfitUSD >= BasketTrailingStartUSD)
       {
-         double trailingStopLevel = basketMaxProfitUSD - BasketTrailingStepUSD;
+         // Use velocity-adjusted trailing stop if enabled, otherwise use fixed trailing stop
+         double trailingStopLevel = 0.0;
+         
+         if(UseVelocityExits)
+         {
+            trailingStopLevel = GetVelocityAdjustedTrailingStop();
+            if(trailingStopLevel == 0.0)  // Fallback to fixed if velocity-adjusted returns 0
+               trailingStopLevel = basketMaxProfitUSD - BasketTrailingStepUSD;
+         }
+         else
+         {
+            trailingStopLevel = basketMaxProfitUSD - BasketTrailingStepUSD;
+         }
          
          if(basketTotalProfitUSD <= trailingStopLevel)
          {
@@ -1328,6 +1609,15 @@ void ManageBasket()
                   DoubleToString(basketTotalProfitUSD, 2));
             return;
          }
+      }
+   }
+   
+   // ===== VELOCITY-BASED EXITS (Before Fixed Profit Target) =====
+   if(UseVelocityExits)
+   {
+      if(CheckVelocityExits())
+      {
+         return;  // Basket was closed by velocity exit
       }
    }
    
@@ -1444,6 +1734,32 @@ void UpdateDisplay()
       if(basketDir != 0)
       {
          status += "Direction: " + (basketDir == 1 ? "BUY" : "SELL") + "\n";
+      }
+      
+      // Show velocity information
+      if(UseVelocityExits && velocityTrackingActive)
+      {
+         status += "\n--- Velocity Status ---\n";
+         status += "Current Velocity: " + DoubleToString(priceVelocity, 3) + " pts/sec";
+         if(priceVelocity > 0)
+            status += " [FAVORABLE]";
+         else if(priceVelocity < 0)
+            status += " [UNFAVORABLE]";
+         status += "\n";
+         status += "Peak Velocity: " + DoubleToString(peakVelocity, 3) + " pts/sec\n";
+         status += "Samples: " + IntegerToString(priceVelocityCount) + "\n";
+         
+         // Show velocity trend
+         if(priceVelocityCount >= 2)
+         {
+            double prevVel = priceVelocityHistory[priceVelocityCount - 2];
+            if(priceVelocity > prevVel)
+               status += "Trend: ACCELERATING\n";
+            else if(priceVelocity < prevVel)
+               status += "Trend: DECELERATING\n";
+            else
+               status += "Trend: STABLE\n";
+         }
       }
    }
    else
