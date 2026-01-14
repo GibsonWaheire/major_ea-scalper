@@ -243,7 +243,9 @@ bool BuildEntry(ENUM_ORDER_TYPE &type, double &entryPrice, double &sl, double &t
 int CountPositions()
 {
    int count = 0;
-   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   int total = (int)PositionsTotal();
+   int i;
+   for(i = 0; i < total; i++)
    {
       if(!PositionSelectByIndex(i)) continue;
       if((int)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
@@ -259,7 +261,8 @@ int CountTradesLastHour()
    datetime oneHourAgo = now - 3600;
    int count = 0;
    
-   for(int i = ArraySize(g_tradeTimes) - 1; i >= 0; --i)
+   int size = ArraySize(g_tradeTimes);
+   for(int i = size - 1; i >= 0; i--)
    {
       if(g_tradeTimes[i] >= oneHourAgo)
          count++;
@@ -301,7 +304,9 @@ void ManagePosition()
    MqlTick tick;
    if(!SymbolInfoTick(g_symbol, tick)) return;
 
-   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   int total = (int)PositionsTotal();
+   int i;
+   for(i = 0; i < total; i++)
    {
       if(!PositionSelectByIndex(i)) continue;
       if((int)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
@@ -412,7 +417,7 @@ int OnInit()
       g_symbol = InpSymbol;
 
    // Normalize symbol name (handles extensions like .z, .a automatically)
-   g_symbol = SymbolInfoString(g_symbol, SYMBOL_NAME);
+   // MT5 handles symbol extensions automatically, so we just use the symbol as-is
    
    if(!SymbolSelect(g_symbol, true))
    {

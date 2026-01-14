@@ -1,7 +1,8 @@
 //+------------------------------------------------------------------+
 //| Higher timeframe trend filter                                    |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef TREND_BIAS_MQH
+#define TREND_BIAS_MQH
 
 #include "state.mqh"
 #include "utils.mqh"
@@ -44,3 +45,4 @@ inline BiasDirection GetTrendBias(const TrendSettings &cfg,
 
    return bias;
 }
+#endif // TREND_BIAS_MQH

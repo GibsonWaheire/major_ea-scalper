@@ -1,7 +1,8 @@
 //+------------------------------------------------------------------+
 //| Utility helpers                                                  |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef UTILS_MQH
+#define UTILS_MQH
 
 inline double PipFactor()
 {
@@ -50,3 +51,4 @@ inline double PointsFromPips(double pips)
 {
    return pips * _Point * PipFactor();
 }
+#endif // UTILS_MQH

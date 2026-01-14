@@ -1,4 +1,5 @@
-#pragma once
+#ifndef DEFS_MQH
+#define DEFS_MQH
 
 // Core data structures shared across modules
 
@@ -76,3 +77,4 @@ struct StrategyState
    int      barsSinceEntry;
    int      lastBias;
 };
+#endif // DEFS_MQH

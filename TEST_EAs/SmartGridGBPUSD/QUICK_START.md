@@ -133,3 +133,16 @@ If you encounter issues:
 
 **Remember**: This EA is a tool, not a guarantee. Always practice proper risk management!
 
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,15 +1,14 @@
 #property copyright "Copyright 2025, Hyperactive HFT MT5 Scalper"
 #property link      "https://www.mcgibsdigitalsolutions.com"
-#property version   "2.11"
+#property version   "2.10"
 
 #include <Trade/Trade.mqh>
 
 CTrade trade;
 
 // =====================================================================================================
-// HYPERACTIVE HFT MT5 SCALPER V2.11 - GOLD OPTIMIZED
+// HYPERACTIVE HFT MT5 SCALPER V2.1
 // Strategy: Momentum breakout with information-based exits
-// Optimized for Gold (XAUUSD) trading with tighter spreads and smaller point values
 // 
 // EXIT PHILOSOPHY: Entry=fast, Exit=slow, Loss=quick, Profit=patient
 // 
@@ -24,13 +23,12 @@ CTrade trade;
 // - Momentum breakout entry with filters
 // - No time-based exits - information-based only
 // - Asymmetric loss protection (realistic caps)
-// - Gold-optimized parameters for XAUUSD trading
 // =====================================================================================================
 
 // ===== Core Trading Settings =====
 input group "===== Core Trading Settings ====="
 input int      MagicNumber         = 202510;
-input string   TradeSymbol         = "XAUUSD";  // Symbol to trade (empty = current chart symbol) - Default: XAUUSD for Gold
+input string   TradeSymbol         = "";      // Symbol to trade (empty = current chart symbol)
 input bool     UseFixedLot         = true;     // Use fixed lot size (false = dynamic)
 input double   FixedLotSize        = 0.1;      // Fixed lot size (if UseFixedLot = true)
 input double   DynamicLotBase     = 0.05;     // Base lot for dynamic sizing
@@ -42,14 +40,14 @@ input int      MaxSimultaneousTrades = 1;     // Maximum simultaneous trades (1-
 // ===== Entry Settings =====
 input group "===== Momentum Breakout Entry ====="
 input int      MomentumPeriod      = 18;       // Period for momentum calculation (ticks) - Reduced from 30 for more opportunities
-input double   BreakoutThreshold   = 15.0;     // Minimum price movement for breakout in points (Gold: ~15 points = $0.15-0.30 depending on point value)
-input int      MinTickSpeed        = 2;        // Minimum ticks per second for entry (reduced for more opportunities)
-input bool     UseTickSpeedFilter  = false;    // Enable tick speed filter (disabled by default for backtesting)
+input double   BreakoutThreshold   = 0.00045;  // Minimum price movement for breakout (raised for expansion trading)
+input int      MinTickSpeed        = 4;        // Minimum ticks per second for entry (raised ~20% for expansion trading)
+input bool     UseTickSpeedFilter  = true;     // Enable tick speed filter
 input double   StrongBreakoutMultiplier = 1.8; // Enter immediately if breakout >= threshold * multiplier (bypass pullback)
 
 // ===== Unified Exit Settings =====
 input group "===== Hard Loss Protection ====="
-input double   MaxLossPoints       = 65.0;     // Maximum loss in points (Gold: ~$6.50 on 0.01 lot)
+input double   MaxLossPoints       = 50.0;     // Maximum loss in points (hard safety cap)
 input bool     UseStopLoss         = false;    // Use hard stop loss on broker side
 
 input group "===== Momentum Invalidation Exit ====="
@@ -60,17 +58,17 @@ input int      MinTradeMaturitySeconds = 8;    // No exits (except hard loss) be
 
 input group "===== Velocity Decay Exit ====="
 input double   VelocityDecayRatio  = 0.6;      // Exit when tick speed < peak * this ratio
-input double   VelocityDecayMinProfit = 40.0;  // Minimum profit points before velocity decay (Gold)
+input double   VelocityDecayMinProfit = 150.0;  // Minimum profit points before velocity decay (FX=25, Gold=40)
 
 input group "===== Trailing Stop Settings ====="
 input bool     UseTrailingStop     = true;     // Use trailing stop loss
-input double   TrailingStartPoints = 60.0;     // Start trailing after X points profit (Gold)
-input double   TrailingStepPoints  = 30.0;     // Trailing step in points (Gold)
+input double   TrailingStartPoints = 200.0;     // Start trailing after X points profit (FX-friendly)
+input double   TrailingStepPoints  = 100.0;     // Trailing step in points (FX-friendly)
 
 // ===== Spread & Slippage =====
 input group "===== Spread & Execution ====="
-input double   MaxSpreadPoints     = 100.0;    // Maximum spread in points (Gold has tighter spreads)
-input int      MaxSlippagePoints   = 30;       // Maximum slippage in points (Gold slippage is smaller)
+input double   MaxSpreadPoints     = 1200.0;     // Maximum spread in points
+input int      MaxSlippagePoints   = 300;       // Maximum slippage in points
 input int      OrderRetries        = 3;        // Number of order retries
 
 // ===== Risk Management =====
@@ -87,13 +85,13 @@ input int      SessionEndHour      = 20;        // Session end hour (GMT)
 
 // ===== Pullback Entry Filter =====
 input group "===== Pullback Entry Filter ====="
-input bool     UsePullbackFilter  = false;      // Enable micro-pullback filter (disabled for more entries)
-input double   PullbackPoints     = 1.5;        // Retrace points after breakout (Gold - smaller for more entries)
-input int      PullbackTimeoutSeconds = 3;      // Timeout for pullback wait (reduced for faster reset)
+input bool     UsePullbackFilter  = true;       // Enable micro-pullback filter
+input double   PullbackPoints     = 1.5;        // Retrace points after breakout (reduced from 2.5 for faster entries)
+input int      PullbackTimeoutSeconds = 6;      // Timeout for pullback wait (reduced from 10 for faster reset)
 
 // ===== Volatility Cycle Filter =====
 input group "===== Volatility Cycle Filter ====="
-input bool     UseVolatilityCycleFilter = false; // Enable volatility cycle filter (disabled for more entries)
+input bool     UseVolatilityCycleFilter = true; // Enable volatility cycle filter
 input int      VolatilityCycleSeconds = 2;      // Tick speed must be rising for N seconds (reduced from 4 for more entries)
 
 // ===== Spread Normalized Filter =====
@@ -103,7 +101,7 @@ input double   SpreadMultiplier = 1.5;           // Block when spread > avg * mu
 
 // ===== Liquidity Time Filter =====
 input group "===== Liquidity Time Filter ====="
-input bool     UseLiquidityTimeFilter = false;  // Enable liquidity time filter (disabled for more opportunities)
+input bool     UseLiquidityTimeFilter = true;   // Enable liquidity time filter
 input int      BlockStartHour1 = 22;            // First blocked period start (GMT)
 input int      BlockEndHour1 = 2;               // First blocked period end (GMT)
 input int      BlockStartHour2 = 0;             // Second blocked period start (0 = disabled)
@@ -112,13 +110,16 @@ input int      BlockEndHour2 = 0;               // Second blocked period end
 // ===== Dynamic Breakeven =====
 input group "===== Dynamic Breakeven ====="
 input bool     UseDynamicBreakeven = true;      // Enable dynamic breakeven
-input double   BreakevenTriggerPoints = 15.0;   // Move SL when profit > X points (Gold)
-input double   BreakevenOffsetPoints = 5.0;     // Move SL to entry - X points (Gold)
+input double   BreakevenTriggerPoints = 10.0;   // Move SL when profit > X points (avoid micro-noise)
+input double   BreakevenOffsetPoints = 3.0;     // Move SL to entry - X points
 
-// ===== Trade Cooldown =====
-input group "===== Trade Cooldown ====="
-input int      TradeCooldownSeconds = 60;       // Wait N seconds after closing before new trade
-
+// ===== Higher Timeframe Bias Filter =====
+input group "===== Higher Timeframe Bias Filter ====="
+input bool     UseHTFBiasFilter = true;         // Enable HTF displacement bias filter (mandatory for expansion trading)
+input ENUM_TIMEFRAMES HTFTimeframe = PERIOD_M5; // HTF timeframe for displacement calculation
+input int      HTFLookbackCandles = 8;          // Number of HTF candles to look back for displacement
+input double   HTFDisplacementMultiplier = 2.5; // Multiplier for FX spread-based threshold (2-3x range)
+input double   HTFGoldMinPoints = 200.0;       // Minimum displacement for Gold in points (150-300 range)
 
 // =====================================================================================================
 // STRUCTURES & GLOBALS
@@ -197,9 +198,11 @@ int spreadHistoryIndex = 0;
 int spreadHistoryCount = 0;
 double averageSpread = 0.0;
 
-// Trade cooldown
-datetime lastTradeCloseTime = 0;
-int tradeCooldownSeconds = 60;  // Wait 60 seconds after closing before new trade
+// HTF bias filter
+ENUM_TIMEFRAMES htfTimeframe = PERIOD_M5;
+datetime lastHTFCheck = 0;
+double cachedHTFDisplacement = 0.0;
+datetime cachedHTFDisplacementTime = 0;
 
 // =====================================================================================================
 // INITIALIZATION
@@ -208,9 +211,8 @@ int tradeCooldownSeconds = 60;  // Wait 60 seconds after closing before new trad
 int OnInit()
 {
    Print("========================================");
-   Print("Hyperactive HFT MT5 Scalper V2.11 - Gold Optimized");
+   Print("Hyperactive HFT MT5 Scalper V2.00");
    Print("Ultra-fast momentum breakout scalping with advanced filters");
-   Print("Optimized for Gold (XAUUSD) trading");
    Print("========================================");
    
    trade.SetExpertMagicNumber(MagicNumber);
@@ -235,21 +237,12 @@ int OnInit()
    if(symbolDigits == 3 || symbolDigits == 5)
       point *= 10.0;
    
-   // Validate and set max trades (clamp between 1 and 5)
-   maxTrades = MaxSimultaneousTrades;
-   if(maxTrades < 1) maxTrades = 1;
-   if(maxTrades > 5) maxTrades = 5;
+   // Force single trade mode for expansion trading (no stacking)
+   maxTrades = 1;
    
-   // Symbol-aware max loss: Different assets need different stops
-   if(StringFind(tradeSymbol, "BTC") >= 0 || StringFind(tradeSymbol, "BITCOIN") >= 0)
+   // Symbol-aware max loss: Gold needs wider stop than FX
+   if(StringFind(tradeSymbol, "XAU") >= 0 || StringFind(tradeSymbol, "GOLD") >= 0)
    {
-      // BTCUSD: Very wide stops needed due to high volatility
-      effectiveMaxLoss = 5000.0;  // ~$50 on 0.01 lot
-      effectiveVelocityMinProfit = 2000.0;
-   }
-   else if(StringFind(tradeSymbol, "XAU") >= 0 || StringFind(tradeSymbol, "GOLD") >= 0)
-   {
-      // Gold: Optimized for Gold volatility and spreads
       effectiveMaxLoss = 65.0;
       effectiveVelocityMinProfit = 40.0;
    }
@@ -317,9 +310,11 @@ int OnInit()
    spreadHistoryCount = 0;
    averageSpread = 0.0;
    
-   // Initialize cooldown
-   lastTradeCloseTime = 0;
-   tradeCooldownSeconds = TradeCooldownSeconds;
+   // Initialize HTF bias filter
+   htfTimeframe = HTFTimeframe;
+   lastHTFCheck = 0;
+   cachedHTFDisplacement = 0.0;
+   cachedHTFDisplacementTime = 0;
    
    Print("Trade Symbol: ", tradeSymbol);
    Print("Lot Mode: ", (UseFixedLot ? "FIXED" : "DYNAMIC"));
@@ -334,7 +329,7 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
-   Print("Hyperactive HFT MT5 Scalper (Gold Optimized) deinitialized. Reason: ", reason);
+   Print("Hyperactive HFT MT5 Scalper deinitialized. Reason: ", reason);
 }
 
 // =====================================================================================================
@@ -645,6 +640,83 @@ bool CheckLiquidityTime()
 }
 
 // =====================================================================================================
+// HIGHER TIMEFRAME BIAS FILTER
+// =====================================================================================================
+
+bool CheckHTFBias(int direction)
+{
+   if(!UseHTFBiasFilter)
+      return true;  // Filter disabled, allow entry (though expansion trading should have this enabled)
+   
+   if(direction == 0)
+      return false;  // Invalid direction
+   
+   // Check if we need to recalculate HTF displacement (only on HTF candle close)
+   // Use closed candle time (index 1) to avoid forming candle flicker
+   datetime closedHTFTime = iTime(tradeSymbol, htfTimeframe, 1);
+   bool needRecalc = (closedHTFTime != cachedHTFDisplacementTime);
+   
+   if(needRecalc)
+   {
+      // Calculate HTF displacement using CLOSED candles only (not forming candle)
+      // Close[1] = last closed candle, Close[HTFLookbackCandles + 1] = lookback from closed candle
+      double close0 = iClose(tradeSymbol, htfTimeframe, 1);
+      double closeN = iClose(tradeSymbol, htfTimeframe, HTFLookbackCandles + 1);
+      
+      if(close0 == 0.0 || closeN == 0.0)
+      {
+         // Data not available yet, block entry
+         return false;
+      }
+      
+      double displacement = close0 - closeN;
+      cachedHTFDisplacement = displacement / point;  // Convert to points
+      cachedHTFDisplacementTime = closedHTFTime;
+   }
+   
+   // Determine symbol-aware threshold
+   double threshold = 0.0;
+   
+   // Check if symbol is Gold
+   bool isGold = (StringFind(tradeSymbol, "XAU") >= 0 || StringFind(tradeSymbol, "GOLD") >= 0);
+   
+   if(isGold)
+   {
+      // Gold: Fixed minimum threshold
+      threshold = HTFGoldMinPoints;
+   }
+   else
+   {
+      // FX pairs: Use average spread * multiplier (clamped to safe min/max)
+      if(averageSpread > 0.0)
+      {
+         threshold = averageSpread * HTFDisplacementMultiplier;
+         // Clamp between safe min/max for FX
+         threshold = MathMax(20.0, MathMin(100.0, threshold));  // 20-100 points for FX safety
+      }
+      else
+      {
+         // No spread history yet, use conservative default
+         threshold = 30.0;  // Conservative default for FX
+      }
+   }
+   
+   // Check if displacement aligns with trade direction
+   if(direction == 1)  // BUY
+   {
+      // Allow BUY only if displacement is positive and above threshold
+      return (cachedHTFDisplacement >= threshold);
+   }
+   else if(direction == -1)  // SELL
+   {
+      // Allow SELL only if displacement is negative and below -threshold
+      return (cachedHTFDisplacement <= -threshold);
+   }
+   
+   return false;  // Default: block entry
+}
+
+// =====================================================================================================
 // RISK MANAGEMENT
 // =====================================================================================================
 
@@ -755,8 +827,7 @@ int GetMomentumBreakoutSignal()
       priceChange = newestPrice - oldestPrice;
       
       // Check for breakout: strong movement in momentum direction
-      // Convert BreakoutThreshold from points to absolute price (multiply by point value)
-      double breakoutThreshold = BreakoutThreshold * point;
+      double breakoutThreshold = BreakoutThreshold;
       
       if(momentumDirection == 1 && priceChange >= breakoutThreshold)
       {
@@ -770,6 +841,9 @@ int GetMomentumBreakoutSignal()
             if(isStrongBreakout)
             {
                // Strong breakout - enter immediately (sniper entry on strong momentum)
+               // Check HTF bias before entry
+               if(!CheckHTFBias(1))
+                  return 0;  // HTF bias blocks BUY entry
                breakoutDetected = false;  // Reset any pending pullback
                return 1;  // BUY immediately
             }
@@ -795,8 +869,11 @@ int GetMomentumBreakoutSignal()
                      
                      // If price continues strongly upward, enter immediately (strong momentum)
                      double continuedMomentum = midPrice - breakoutPeakPrice;
-                     if(continuedMomentum >= (BreakoutThreshold * point * 0.5))
+                     if(continuedMomentum >= (breakoutThreshold * 0.5))
                      {
+                        // Check HTF bias before entry
+                        if(!CheckHTFBias(1))
+                           return 0;  // HTF bias blocks BUY entry
                         breakoutDetected = false;
                         return 1;  // BUY - momentum too strong, don't wait for pullback
                      }
@@ -808,7 +885,9 @@ int GetMomentumBreakoutSignal()
                   double retraceFromPeak = breakoutPeakPrice - midPrice;
                   if(retraceFromPeak >= (PullbackPoints * point))
                   {
-                     // Pullback occurred, enter immediately
+                     // Pullback occurred, check HTF bias before entry
+                     if(!CheckHTFBias(1))
+                        return 0;  // HTF bias blocks BUY entry
                      breakoutDetected = false;  // Reset for next breakout
                      return 1;  // BUY
                   }
@@ -818,7 +897,9 @@ int GetMomentumBreakoutSignal()
             }
             else
             {
-               // No pullback filter, enter immediately
+               // No pullback filter, check HTF bias before entry
+               if(!CheckHTFBias(1))
+                  return 0;  // HTF bias blocks BUY entry
                return 1;  // BUY
             }
          }
@@ -835,6 +916,9 @@ int GetMomentumBreakoutSignal()
             if(isStrongBreakout)
             {
                // Strong breakout - enter immediately (sniper entry on strong momentum)
+               // Check HTF bias before entry
+               if(!CheckHTFBias(-1))
+                  return 0;  // HTF bias blocks SELL entry
                breakoutDetected = false;  // Reset any pending pullback
                return -1;  // SELL immediately
             }
@@ -860,8 +944,11 @@ int GetMomentumBreakoutSignal()
                      
                      // If price continues strongly downward, enter immediately (strong momentum)
                      double continuedMomentum = breakoutPeakPrice - midPrice;
-                     if(continuedMomentum >= (BreakoutThreshold * point * 0.5))
+                     if(continuedMomentum >= (breakoutThreshold * 0.5))
                      {
+                        // Check HTF bias before entry
+                        if(!CheckHTFBias(-1))
+                           return 0;  // HTF bias blocks SELL entry
                         breakoutDetected = false;
                         return -1;  // SELL - momentum too strong, don't wait for pullback
                      }
@@ -873,7 +960,9 @@ int GetMomentumBreakoutSignal()
                   double retraceFromPeak = midPrice - breakoutPeakPrice;
                   if(retraceFromPeak >= (PullbackPoints * point))
                   {
-                     // Pullback occurred, enter immediately
+                     // Pullback occurred, check HTF bias before entry
+                     if(!CheckHTFBias(-1))
+                        return 0;  // HTF bias blocks SELL entry
                      breakoutDetected = false;  // Reset for next breakout
                      return -1;  // SELL
                   }
@@ -883,7 +972,9 @@ int GetMomentumBreakoutSignal()
             }
             else
             {
-               // No pullback filter, enter immediately
+               // No pullback filter, check HTF bias before entry
+               if(!CheckHTFBias(-1))
+                  return 0;  // HTF bias blocks SELL entry
                return -1;  // SELL
             }
          }
@@ -903,16 +994,16 @@ int GetMomentumBreakoutSignal()
 
 bool ShouldOpenTrade(int direction)
 {
+   // Defensive check: Re-enforce HTF bias filter (redundant checks are a feature)
+   if(!CheckHTFBias(direction))
+      return false;
+   
    // Check if we can open more trades
    if(activeTradeCount >= maxTrades)
       return false;
    
    // Check if trading is stopped
    if(tradingStopped)
-      return false;
-   
-   // Check cooldown after last trade close
-   if(lastTradeCloseTime > 0 && (TimeCurrent() - lastTradeCloseTime) < tradeCooldownSeconds)
       return false;
    
    // Check spread
@@ -1007,7 +1098,7 @@ bool OpenTrade(int direction)
    // No take profit (using dynamic exit)
    double tp = 0.0;
    
-   string comment = "HyperHFT_GOLD_" + (direction == 1 ? "BUY" : "SELL");
+   string comment = "HyperHFT_" + (direction == 1 ? "BUY" : "SELL");
    
    ENUM_ORDER_TYPE orderType = (direction == 1) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
    
@@ -1165,7 +1256,7 @@ void ManageTrade()
       if(tickBufferReady && tickIndex >= 5)
       {
          double exitMomentum = tickPrices[0] - tickPrices[5];
-         double exitThreshold = (BreakoutThreshold * point) * 0.3;  // Convert to absolute price
+         double exitThreshold = BreakoutThreshold * 0.3;
          if(exitMomentum > exitThreshold) exitMomentumDir = 1;
          else if(exitMomentum < -exitThreshold) exitMomentumDir = -1;
       }
@@ -1374,9 +1465,6 @@ void CloseTrade(int tradeIndex, string reason)
    {
       Print("TRADE CLOSED: ", reason, " | P&L: $", DoubleToString(profit, 2), " | Remaining trades: ", activeTradeCount - 1);
       
-      // Set cooldown timer
-      lastTradeCloseTime = TimeCurrent();
-      
       // Daily profit calculated dynamically from balance - no manual tracking
       RemoveTrade(tradeIndex);
    }
@@ -1408,7 +1496,7 @@ void RemoveTrade(int tradeIndex)
 
 void UpdateDisplay()
 {
-   string status = "\n=== Hyperactive HFT MT5 Scalper V2.11 - Gold Optimized ===\n";
+   string status = "\n=== Hyperactive HFT MT5 Scalper V2.00 ===\n";
    status += "Symbol: " + tradeSymbol + "\n";
    status += "Lot Mode: " + (UseFixedLot ? "FIXED" : "DYNAMIC") + "\n";
    if(UseFixedLot)
@@ -1452,6 +1540,25 @@ void UpdateDisplay()
    if(UseLiquidityTimeFilter)
    {
       status += "Liquidity Time: " + (CheckLiquidityTime() ? "ALLOWED" : "BLOCKED") + "\n";
+   }
+   
+   if(UseHTFBiasFilter)
+   {
+      string htfBiasStatus = "HTF Bias: ";
+      if(cachedHTFDisplacementTime > 0)
+      {
+         string htfTimeframeStr = (htfTimeframe == PERIOD_M5) ? "M5" : ((htfTimeframe == PERIOD_M15) ? "M15" : "HTF");
+         htfBiasStatus += htfTimeframeStr + " | Displacement: " + DoubleToString(cachedHTFDisplacement, 1) + " pts";
+         if(cachedHTFDisplacement >= 0)
+            htfBiasStatus += " | BUY allowed";
+         else
+            htfBiasStatus += " | SELL allowed";
+      }
+      else
+      {
+         htfBiasStatus += "Calculating...";
+      }
+      status += htfBiasStatus + "\n";
    }
    
    if(tradingStopped)
@@ -1517,6 +1624,3 @@ void UpdateDisplay()
    
    Comment(status);
 }
-
-
-

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Script to copy SmartGridGBPUSD.mq5 to MetaTrader 5 Experts folder
+# Script to copy DailyHoldScalper.mq5 to MetaTrader 5 Experts folder
 # Usage: ./copy_to_mt5.sh
 
 # Colors for output
@@ -10,24 +10,24 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 # Source file
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SOURCE_FILE="$SCRIPT_DIR/SmartGridGBPUSD.mq5"
+SOURCE_FILE="DailyHoldScalper/DailyHoldScalper.mq5"
 
 # Common MetaTrader 5 destination paths (macOS)
 MT5_PATHS=(
-    "$HOME/Library/Application Support/MetaQuotes/Terminal/*/MQL5/Experts"
     "$HOME/Library/Application Support/net.metaquotes.wine.metatrader5/drive_c/Program Files/MetaTrader 5/MQL5/Experts"
     "$HOME/.wine/drive_c/Program Files/MetaTrader 5/MQL5/Experts"
+    "$HOME/Library/Application Support/MetaQuotes/Terminal/*/MQL5/Experts"
 )
 
 echo "=========================================="
-echo "SmartGridGBPUSD - MetaTrader 5 Copy Script"
+echo "DailyHoldScalper - MetaTrader 5 Copy Script"
 echo "=========================================="
 echo ""
 
 # Check if source file exists
 if [ ! -f "$SOURCE_FILE" ]; then
     echo -e "${RED}ERROR: Source file not found: $SOURCE_FILE${NC}"
+    echo "Please make sure you're running this script from the project root directory."
     exit 1
 fi
 
@@ -55,8 +55,8 @@ if [ -z "$MT5_EXPERTS_DIR" ]; then
         echo -e "${RED}ERROR: MetaTrader 5 Experts directory not found!${NC}"
         echo ""
         echo "Please manually copy the file:"
-        echo "  From: $SOURCE_FILE"
-        echo "  To:   [Your MT5 Installation]/MQL5/Experts/SmartGridGBPUSD.mq5"
+        echo "  From: $(pwd)/$SOURCE_FILE"
+        echo "  To:   [Your MT5 Installation]/MQL5/Experts/DailyHoldScalper.mq5"
         echo ""
         echo "Common locations:"
         for path in "${MT5_PATHS[@]}"; do
@@ -66,7 +66,7 @@ if [ -z "$MT5_EXPERTS_DIR" ]; then
     fi
 fi
 
-DEST_FILE="$MT5_EXPERTS_DIR/SmartGridGBPUSD.mq5"
+DEST_FILE="$MT5_EXPERTS_DIR/DailyHoldScalper.mq5"
 
 echo "Found MetaTrader 5 directory:"
 echo "  $MT5_EXPERTS_DIR"
@@ -80,7 +80,7 @@ if [ -f "$DEST_FILE" ]; then
 fi
 
 # Copy the file
-echo "Copying SmartGridGBPUSD.mq5 to MetaTrader 5..."
+echo "Copying $SOURCE_FILE to MetaTrader 5..."
 cp "$SOURCE_FILE" "$DEST_FILE"
 
 # Check if copy was successful
@@ -92,21 +92,15 @@ if [ $? -eq 0 ]; then
     echo "Next steps:"
     echo "1. Open MetaTrader 5"
     echo "2. Press F4 to open MetaEditor"
-    echo "3. Find 'SmartGridGBPUSD.mq5' in the Navigator (under Experts)"
+    echo "3. Find 'DailyHoldScalper.mq5' in the Navigator (under Experts)"
     echo "4. Press F7 to compile"
-    echo "5. Attach to GBPUSD chart (H1 recommended)"
-    echo "6. Configure parameters (see README.md)"
-    echo "7. Enable AutoTrading"
+    echo "5. Drag the EA onto a chart to use it"
     echo ""
     echo -e "${GREEN}Done!${NC}"
 else
     echo -e "${RED}ERROR: Failed to copy file!${NC}"
     exit 1
 fi
-
-
-
-
 
 
 

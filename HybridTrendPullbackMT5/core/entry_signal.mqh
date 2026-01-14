@@ -1,7 +1,8 @@
 //+------------------------------------------------------------------+
 //| Entry logic: pullback + momentum on entry timeframe               |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef ENTRY_SIGNAL_MQH
+#define ENTRY_SIGNAL_MQH
 
 #include "params.mqh"
 #include "state.mqh"
@@ -115,3 +116,4 @@ inline EntrySignal BuildEntry(const EAConfig        &cfg,
    sig.valid = true;
    return sig;
 }
+#endif // ENTRY_SIGNAL_MQH

@@ -1,7 +1,6 @@
 #!/bin/bash
 
-# Script to copy SmartGridGBPUSD.mq5 to MetaTrader 5 Experts folder
-# Usage: ./copy_to_mt5.sh
+# Script to copy FlipperMT5.mq5 to MetaTrader 5 Experts folder
 
 # Colors for output
 GREEN='\033[0;32m'
@@ -11,7 +10,7 @@ NC='\033[0m' # No Color
 
 # Source file
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SOURCE_FILE="$SCRIPT_DIR/SmartGridGBPUSD.mq5"
+SOURCE_FILE="$SCRIPT_DIR/FlipperMT5.mq5"
 
 # Common MetaTrader 5 destination paths (macOS)
 MT5_PATHS=(
@@ -21,7 +20,7 @@ MT5_PATHS=(
 )
 
 echo "=========================================="
-echo "SmartGridGBPUSD - MetaTrader 5 Copy Script"
+echo "FlipperMT5 - MetaTrader 5 Copy Script"
 echo "=========================================="
 echo ""
 
@@ -56,7 +55,7 @@ if [ -z "$MT5_EXPERTS_DIR" ]; then
         echo ""
         echo "Please manually copy the file:"
         echo "  From: $SOURCE_FILE"
-        echo "  To:   [Your MT5 Installation]/MQL5/Experts/SmartGridGBPUSD.mq5"
+        echo "  To:   [Your MT5 Installation]/MQL5/Experts/FlipperMT5.mq5"
         echo ""
         echo "Common locations:"
         for path in "${MT5_PATHS[@]}"; do
@@ -66,7 +65,7 @@ if [ -z "$MT5_EXPERTS_DIR" ]; then
     fi
 fi
 
-DEST_FILE="$MT5_EXPERTS_DIR/SmartGridGBPUSD.mq5"
+DEST_FILE="$MT5_EXPERTS_DIR/FlipperMT5.mq5"
 
 echo "Found MetaTrader 5 directory:"
 echo "  $MT5_EXPERTS_DIR"
@@ -80,7 +79,7 @@ if [ -f "$DEST_FILE" ]; then
 fi
 
 # Copy the file
-echo "Copying SmartGridGBPUSD.mq5 to MetaTrader 5..."
+echo "Copying FlipperMT5.mq5 to MetaTrader 5..."
 cp "$SOURCE_FILE" "$DEST_FILE"
 
 # Check if copy was successful
@@ -92,11 +91,9 @@ if [ $? -eq 0 ]; then
     echo "Next steps:"
     echo "1. Open MetaTrader 5"
     echo "2. Press F4 to open MetaEditor"
-    echo "3. Find 'SmartGridGBPUSD.mq5' in the Navigator (under Experts)"
+    echo "3. Find 'FlipperMT5.mq5' in the Navigator (under Experts)"
     echo "4. Press F7 to compile"
-    echo "5. Attach to GBPUSD chart (H1 recommended)"
-    echo "6. Configure parameters (see README.md)"
-    echo "7. Enable AutoTrading"
+    echo "5. Drag the EA onto a chart to use it"
     echo ""
     echo -e "${GREEN}Done!${NC}"
 else

@@ -1,7 +1,8 @@
 //+------------------------------------------------------------------+
 //| Inputs and configuration structures for Hybrid Trend Pullback EA |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef PARAMS_MQH
+#define PARAMS_MQH
 
 // General inputs
 input string   InpSymbol                = _Symbol;
@@ -40,6 +41,15 @@ input bool     InpUseTrailing           = true;
 input double   InpTrailStartRR          = 1.5;
 input double   InpTrailStepPips         = 25.0;
 input double   InpTrailAtrMult          = 0.8;
+
+// Partial take profit
+input bool     InpUsePartialTP          = true;
+input double   InpPartialTP_Level1_ATR  = 2.0;   // Close 20% at this ATR profit
+input double   InpPartialTP_Level2_ATR  = 3.5;   // Close 20% at this ATR profit (40% total)
+input double   InpPartialTP_Level3_ATR  = 5.0;   // Close 20% at this ATR profit (60% total)
+input double   InpPartialTP_Level4_ATR  = 6.5;   // Close 20% at this ATR profit (80% total)
+input bool     InpUseMomentumBreakExit  = true;  // Close remaining on momentum break
+input double   InpMomentumBreakThreshold = 0.3;  // ATR multiplier for momentum break detection
 
 // Session control (broker time)
 input bool     InpUseSessions           = true;
@@ -101,6 +111,13 @@ struct ExitSettings
    double           trailStartRR;
    double           trailStepPips;
    double           trailAtrMult;
+   bool             usePartialTP;
+   double           partialTP_Level1_ATR;
+   double           partialTP_Level2_ATR;
+   double           partialTP_Level3_ATR;
+   double           partialTP_Level4_ATR;
+   bool             useMomentumBreakExit;
+   double           momentumBreakThreshold;
 };
 
 struct SessionSettings
@@ -171,6 +188,13 @@ inline EAConfig LoadConfig()
    cfg.exit.trailStartRR = InpTrailStartRR;
    cfg.exit.trailStepPips = InpTrailStepPips;
    cfg.exit.trailAtrMult = InpTrailAtrMult;
+   cfg.exit.usePartialTP = InpUsePartialTP;
+   cfg.exit.partialTP_Level1_ATR = InpPartialTP_Level1_ATR;
+   cfg.exit.partialTP_Level2_ATR = InpPartialTP_Level2_ATR;
+   cfg.exit.partialTP_Level3_ATR = InpPartialTP_Level3_ATR;
+   cfg.exit.partialTP_Level4_ATR = InpPartialTP_Level4_ATR;
+   cfg.exit.useMomentumBreakExit = InpUseMomentumBreakExit;
+   cfg.exit.momentumBreakThreshold = InpMomentumBreakThreshold;
 
    cfg.session.useSessions = InpUseSessions;
    cfg.session.londonStart = InpLondonStartHour;
@@ -183,3 +207,4 @@ inline EAConfig LoadConfig()
 
    return cfg;
 }
+#endif // PARAMS_MQH

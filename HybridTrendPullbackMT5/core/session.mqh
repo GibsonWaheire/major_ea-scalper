@@ -1,7 +1,8 @@
 //+------------------------------------------------------------------+
 //| Session / time filters                                           |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef SESSION_MQH
+#define SESSION_MQH
 
 #include "params.mqh"
 
@@ -28,3 +29,4 @@ inline bool SessionAllowed(const SessionSettings &cfg, datetime now)
 
    return true;
 }
+#endif // SESSION_MQH

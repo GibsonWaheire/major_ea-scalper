@@ -1,7 +1,8 @@
 //+------------------------------------------------------------------+
 //| Volatility regime filter                                         |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef VOL_FILTER_MQH
+#define VOL_FILTER_MQH
 
 #include "utils.mqh"
 
@@ -40,3 +41,4 @@ inline VolCheckResult CheckVolatility(const VolSettings &cfg,
    res.ok = true;
    return res;
 }
+#endif // VOL_FILTER_MQH

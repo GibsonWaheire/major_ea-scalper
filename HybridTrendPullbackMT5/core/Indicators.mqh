@@ -1,4 +1,5 @@
-#pragma once
+#ifndef INDICATORS_MQH
+#define INDICATORS_MQH
 #include <Indicators/Trend.mqh>
 #include <Indicators/Indicators.mqh>
 #include "Defs.mqh"
@@ -53,3 +54,4 @@ double SpreadInPips(const MqlTick &tick)
 {
    return ((tick.ask - tick.bid) / _Point) / GetPipFactor();
 }
+#endif // INDICATORS_MQH

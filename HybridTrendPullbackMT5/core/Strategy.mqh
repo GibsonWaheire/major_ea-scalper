@@ -1,4 +1,5 @@
-#pragma once
+#ifndef STRATEGY_MQH
+#define STRATEGY_MQH
 #include "Defs.mqh"
 #include "Indicators.mqh"
 
@@ -144,3 +145,4 @@ EntrySignal BuildSignal(const TrendConfig      &trendCfg,
    signal.valid = true;
    return signal;
 }
+#endif // STRATEGY_MQH

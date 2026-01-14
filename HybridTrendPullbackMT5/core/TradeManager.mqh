@@ -1,4 +1,5 @@
-#pragma once
+#ifndef TRADEMANAGER_MQH
+#define TRADEMANAGER_MQH
 #include <Trade/Trade.mqh>
 #include "Defs.mqh"
 #include "Indicators.mqh"
@@ -78,3 +79,4 @@ void ManageOpenPositions(CTrade        &trade,
       }
    }
 }
+#endif // TRADEMANAGER_MQH

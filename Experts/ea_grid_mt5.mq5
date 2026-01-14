@@ -355,6 +355,7 @@ void OnTick()
    }
    
    // Execute immediate market entry if enabled and no positions exist
+   // Only allow one market order at a time - skip if positions already exist
    if(ImmediateMarketEntry && !immediateEntryExecuted && positionCount == 0 && !positionsFromOldParams)
    {
       ExecuteImmediateMarketEntry();
@@ -385,7 +386,7 @@ void OnTick()
       }
       else
       {
-         // Maintain exactly 3 pending orders (only check every 10 ticks to avoid excessive calls)
+         // Maintain exactly 4 pending orders (only check every 10 ticks to avoid excessive calls)
          gridUpdateCounter++;
          if(gridUpdateCounter >= 10)
          {
@@ -412,11 +413,11 @@ void OnTick()
    }
    
    // Check if we need to add more grid trades (martingale on losing positions)
-   // But respect MaxBasketTrades limit
-   if(positionCount > 0 && positionCount < MaxBasketTrades)
-   {
-      CheckAndAddMartingaleTrades();
-   }
+   // DISABLED: Only one market order allowed at a time - no martingale additions via market orders
+   // if(positionCount > 0 && positionCount < MaxBasketTrades)
+   // {
+   //    CheckAndAddMartingaleTrades();
+   // }
    
    // Manage individual position trailing stops
    if(positionCount > 0 && UseIndividualTrailing)
@@ -1098,13 +1099,15 @@ void ExecutePendingOrders()
       ulong ticket = OrderGetTicket(i);
       if(ticket > 0)
       {
-         if(OrderGetInteger(ORDER_MAGIC) == Magic)
+         if(OrderSelect(ticket))
          {
-            if(OrderGetString(ORDER_SYMBOL) == Symbol())
+            if(OrderGetInteger(ORDER_MAGIC) == Magic)
             {
-               ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-               double orderLot = OrderGetDouble(ORDER_VOLUME);
-               double orderPrice = OrderGetDouble(ORDER_PRICE_OPEN);
+               if(OrderGetString(ORDER_SYMBOL) == Symbol())
+               {
+                  ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+                  double orderLot = OrderGetDouble(ORDER_VOLUME);
+                  double orderPrice = OrderGetDouble(ORDER_PRICE_OPEN);
                
                // Execute pending orders as market orders (only BUYSTOP/SELLSTOP, delete LIMIT orders)
                if(orderType == ORDER_TYPE_BUY_STOP)
@@ -1156,7 +1159,7 @@ void ExecutePendingOrders()
 }
 
 //+------------------------------------------------------------------+
-//| Initialize grid with pending orders (max 3)                      |
+//| Initialize grid with pending orders (max 4)                      |
 //+------------------------------------------------------------------+
 void InitializeGrid()
 {
@@ -1187,6 +1190,14 @@ void InitializeGrid()
          entryDirection = 1;  // Default to BUY
    }
    
+   // Check momentum before placing pending orders
+   double momentum = CalculateMomentum(entryDirection);
+   if(momentum < MomentumThreshold)
+   {
+      Print("Momentum filter: Momentum (", DoubleToString(momentum, 3), ") below threshold (", DoubleToString(MomentumThreshold, 3), "). Skipping pending order placement.");
+      return;
+   }
+   
    // Calculate TP in price (10+ pips)
    double tpPrice = 0.0;
    double tpPoints = MinTakeProfitPips * point;
@@ -1195,8 +1206,8 @@ void InitializeGrid()
       tpPoints = MinTakeProfitPips * point;
    }
    
-   // Place exactly 3 pending orders (STRICT LIMIT - always 3, never more)
-   int maxPending = 3;
+   // Place exactly 4 pending orders (STRICT LIMIT - always 4, never more)
+   int maxPending = 4;
    
    if(entryDirection == 1)  // BUY - place BUYSTOP orders above current price
    {
@@ -1244,7 +1255,7 @@ void InitializeGrid()
    }
    
    lastGridCenter = (ask + bid) / 2.0;
-   Print("Grid initialized with ", maxPending, " pending orders (max 3)");
+   Print("Grid initialized with ", maxPending, " pending orders (max 4). Momentum: ", DoubleToString(momentum, 3));
 }
 
 //+------------------------------------------------------------------+
@@ -1252,6 +1263,14 @@ void InitializeGrid()
 //+------------------------------------------------------------------+
 void ExecuteImmediateMarketEntry()
 {
+   // Only allow one market order at a time - check if positions already exist
+   int positionCount = CountPositions();
+   if(positionCount > 0)
+   {
+      Print("Immediate entry: Positions already exist (", positionCount, "). Only one market order allowed at a time.");
+      return;
+   }
+   
    // Check filters unless we're ignoring them
    if(!ImmediateEntryIgnoreFilters)
    {
@@ -1822,21 +1841,24 @@ int CountPendingOrders()
       ulong ticket = OrderGetTicket(i);
       if(ticket > 0)
       {
-         if(OrderGetInteger(ORDER_MAGIC) == Magic)
+         if(OrderSelect(ticket))
          {
-            if(OrderGetString(ORDER_SYMBOL) == Symbol())
+            if(OrderGetInteger(ORDER_MAGIC) == Magic)
             {
-               ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-               // Only count BUYSTOP and SELLSTOP (LIMIT orders are deleted)
-               if(orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_SELL_STOP)
+               if(OrderGetString(ORDER_SYMBOL) == Symbol())
                {
-                  count++;
-               }
-               // Delete any LIMIT orders found
-               else if(orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_SELL_LIMIT)
-               {
-                  trade.OrderDelete(ticket);
-                  Print("Deleted LIMIT order during count: Ticket=", ticket);
+                  ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+                  // Only count BUYSTOP and SELLSTOP (LIMIT orders are deleted)
+                  if(orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_SELL_STOP)
+                  {
+                     count++;
+                  }
+                  // Delete any LIMIT orders found
+                  else if(orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_SELL_LIMIT)
+                  {
+                     trade.OrderDelete(ticket);
+                     Print("Deleted LIMIT order during count: Ticket=", ticket);
+                  }
                }
             }
          }
@@ -1858,21 +1880,24 @@ int GetPendingOrdersDirection()
       ulong ticket = OrderGetTicket(i);
       if(ticket > 0)
       {
-         if(OrderGetInteger(ORDER_MAGIC) == Magic)
+         if(OrderSelect(ticket))
          {
-            if(OrderGetString(ORDER_SYMBOL) == Symbol())
+            if(OrderGetInteger(ORDER_MAGIC) == Magic)
             {
-               ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-               // Only check BUYSTOP and SELLSTOP (delete LIMIT orders)
-               if(orderType == ORDER_TYPE_BUY_STOP)
-                  buyCount++;
-               else if(orderType == ORDER_TYPE_SELL_STOP)
-                  sellCount++;
-               else if(orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_SELL_LIMIT)
+               if(OrderGetString(ORDER_SYMBOL) == Symbol())
                {
-                  // Delete LIMIT orders
-                  trade.OrderDelete(ticket);
-                  Print("Deleted LIMIT order during direction check: Ticket=", ticket);
+                  ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+                  // Only check BUYSTOP and SELLSTOP (delete LIMIT orders)
+                  if(orderType == ORDER_TYPE_BUY_STOP)
+                     buyCount++;
+                  else if(orderType == ORDER_TYPE_SELL_STOP)
+                     sellCount++;
+                  else if(orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_SELL_LIMIT)
+                  {
+                     // Delete LIMIT orders
+                     trade.OrderDelete(ticket);
+                     Print("Deleted LIMIT order during direction check: Ticket=", ticket);
+                  }
                }
             }
          }
@@ -1899,13 +1924,15 @@ void ExecuteAllPendingOrders()
       ulong ticket = OrderGetTicket(i);
       if(ticket > 0)
       {
-         if(OrderGetInteger(ORDER_MAGIC) == Magic)
+         if(OrderSelect(ticket))
          {
-            if(OrderGetString(ORDER_SYMBOL) == Symbol())
+            if(OrderGetInteger(ORDER_MAGIC) == Magic)
             {
-               ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-               double orderLot = OrderGetDouble(ORDER_VOLUME);
-               double orderTP = OrderGetDouble(ORDER_TP);
+               if(OrderGetString(ORDER_SYMBOL) == Symbol())
+               {
+                  ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+                  double orderLot = OrderGetDouble(ORDER_VOLUME);
+                  double orderTP = OrderGetDouble(ORDER_TP);
                
                // Only execute BUYSTOP and SELLSTOP (delete LIMIT orders)
                if(orderType == ORDER_TYPE_BUY_STOP)
@@ -1942,16 +1969,16 @@ void ExecuteAllPendingOrders()
 }
 
 //+------------------------------------------------------------------+
-//| Manage pending orders (maintain exactly 3)                       |
+//| Manage pending orders (maintain exactly 4)                       |
 //+------------------------------------------------------------------+
 void ManagePendingOrders()
 {
    int pendingCount = CountPendingOrders();
    
-   // STRICT LIMIT: If we have more than 3, delete ALL and recreate exactly 3
-   if(pendingCount > 3)
+   // STRICT LIMIT: If we have more than 4, delete ALL and recreate exactly 4
+   if(pendingCount > 4)
    {
-      Print("WARNING: Found ", pendingCount, " pending orders (max 3 allowed). Deleting all and recreating exactly 3.");
+      Print("WARNING: Found ", pendingCount, " pending orders (max 4 allowed). Deleting all and recreating exactly 4.");
       
       // Delete ALL pending orders
       int deleted = 0;
@@ -1960,36 +1987,39 @@ void ManagePendingOrders()
          ulong ticket = OrderGetTicket(i);
          if(ticket > 0)
          {
-            if(OrderGetInteger(ORDER_MAGIC) == Magic)
+            if(OrderSelect(ticket))
             {
-               if(OrderGetString(ORDER_SYMBOL) == Symbol())
+               if(OrderGetInteger(ORDER_MAGIC) == Magic)
                {
-                  ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-                  if(orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_SELL_STOP || 
-                     orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_SELL_LIMIT)
+                  if(OrderGetString(ORDER_SYMBOL) == Symbol())
                   {
-                     if(trade.OrderDelete(ticket))
-                        deleted++;
+                     ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+                     if(orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_SELL_STOP || 
+                        orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_SELL_LIMIT)
+                     {
+                        if(trade.OrderDelete(ticket))
+                           deleted++;
+                     }
                   }
                }
             }
          }
       }
       
-      Print("Deleted ", deleted, " pending orders. Recreating exactly 3.");
+      Print("Deleted ", deleted, " pending orders. Recreating exactly 4.");
       
-      // Recreate exactly 3 pending orders
+      // Recreate exactly 4 pending orders
       InitializeGrid();
       return;  // Exit after recreating
    }
    
-   // If we have less than 3, add missing ones (STRICT LIMIT: never exceed 3)
-   if(pendingCount < 3)
+   // If we have less than 4, add missing ones (STRICT LIMIT: never exceed 4)
+   if(pendingCount < 4)
    {
-      int toAdd = 3 - pendingCount;  // Calculate how many to add
+      int toAdd = 4 - pendingCount;  // Calculate how many to add
       int currentPendingDir = GetPendingOrdersDirection();
       
-      // If no pending orders, initialize grid (will create exactly 3)
+      // If no pending orders, initialize grid (will create exactly 4)
       if(currentPendingDir == 0)
       {
          InitializeGrid();
@@ -1997,6 +2027,13 @@ void ManagePendingOrders()
       }
       else
       {
+         // Check momentum before adding new pending orders
+         double momentum = CalculateMomentum(currentPendingDir);
+         if(momentum < MomentumThreshold)
+         {
+            Print("Momentum filter: Momentum (", DoubleToString(momentum, 3), ") below threshold (", DoubleToString(MomentumThreshold, 3), "). Skipping pending order addition.");
+            return;
+         }
          // Add missing orders in same direction (but check count after each addition)
          double ask = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
          double bid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
@@ -2014,42 +2051,45 @@ void ManagePendingOrders()
             ulong ticket = OrderGetTicket(i);
             if(ticket > 0)
             {
-               if(OrderGetInteger(ORDER_MAGIC) == Magic)
+               if(OrderSelect(ticket))
                {
-                  if(OrderGetString(ORDER_SYMBOL) == Symbol())
+                  if(OrderGetInteger(ORDER_MAGIC) == Magic)
                   {
-                     ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-                     // Only process BUYSTOP and SELLSTOP (delete LIMIT orders)
-                     if(orderType == ORDER_TYPE_BUY_STOP)
+                     if(OrderGetString(ORDER_SYMBOL) == Symbol())
                      {
-                        double price = OrderGetDouble(ORDER_PRICE_OPEN);
-                        if(first || price > highestPrice)
+                        ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+                        // Only process BUYSTOP and SELLSTOP (delete LIMIT orders)
+                        if(orderType == ORDER_TYPE_BUY_STOP)
                         {
-                           highestPrice = price;
-                           first = false;
+                           double price = OrderGetDouble(ORDER_PRICE_OPEN);
+                           if(first || price > highestPrice)
+                           {
+                              highestPrice = price;
+                              first = false;
+                           }
                         }
-                     }
-                     else if(orderType == ORDER_TYPE_SELL_STOP)
-                     {
-                        double price = OrderGetDouble(ORDER_PRICE_OPEN);
-                        if(first || price < lowestPrice || lowestPrice == 0)
+                        else if(orderType == ORDER_TYPE_SELL_STOP)
                         {
-                           lowestPrice = price;
-                           first = false;
+                           double price = OrderGetDouble(ORDER_PRICE_OPEN);
+                           if(first || price < lowestPrice || lowestPrice == 0)
+                           {
+                              lowestPrice = price;
+                              first = false;
+                           }
                         }
-                     }
-                     else if(orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_SELL_LIMIT)
-                     {
-                        // Delete LIMIT orders
-                        trade.OrderDelete(ticket);
-                        Print("Deleted LIMIT order during price search: Ticket=", ticket);
+                        else if(orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_SELL_LIMIT)
+                        {
+                           // Delete LIMIT orders
+                           trade.OrderDelete(ticket);
+                           Print("Deleted LIMIT order during price search: Ticket=", ticket);
+                        }
                      }
                   }
                }
             }
          }
          
-         // Add orders one by one, checking count after each to ensure we never exceed 3
+         // Add orders one by one, checking count after each to ensure we never exceed 4
          int added = 0;
          if(currentPendingDir == 1)  // BUY
          {
@@ -2058,8 +2098,8 @@ void ManagePendingOrders()
             {
                // Re-check count before adding each order
                int currentCount = CountPendingOrders();
-               if(currentCount >= 3)
-                  break;  // Stop if we already have 3
+               if(currentCount >= 4)
+                  break;  // Stop if we already have 4
                
                double gridPrice = startPrice + (StepPoints * point * i);
                double baseLot = CalculateDynamicLotSize(1);
@@ -2081,8 +2121,8 @@ void ManagePendingOrders()
             {
                // Re-check count before adding each order
                int currentCount = CountPendingOrders();
-               if(currentCount >= 3)
-                  break;  // Stop if we already have 3
+               if(currentCount >= 4)
+                  break;  // Stop if we already have 4
                
                double gridPrice = startPrice - (StepPoints * point * i);
                double baseLot = CalculateDynamicLotSize(-1);
@@ -2175,7 +2215,7 @@ void UpdateDisplay(double basketProfit, int positionCount, int pendingCount)
    string info = "\n=== Smart Grid + Martingale EA ===\n";
    info += "Magic: " + IntegerToString(Magic) + "\n";
    info += "Positions: " + IntegerToString(positionCount) + "/" + IntegerToString(MaxBasketTrades) + "\n";
-   info += "Pending: " + IntegerToString(pendingCount) + "/3 (max)\n";
+   info += "Pending: " + IntegerToString(pendingCount) + "/4 (max)\n";
    info += "Basket Profit: " + DoubleToString(basketProfit, 2) + " " + AccountInfoString(ACCOUNT_CURRENCY) + "\n";
    
    // Show dynamic TP target

@@ -2,7 +2,8 @@
 //| Inputs and configuration structures for Hybrid Trend Pullback EA |
 //| USDJPY Optimized Version                                         |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef PARAMS_USDJPY_MQH
+#define PARAMS_USDJPY_MQH
 
 // General inputs
 input string   InpSymbol                = "USDJPY";  // Trading symbol (USDJPY optimized)
@@ -184,3 +185,4 @@ inline EAConfig LoadConfig()
 
    return cfg;
 }
+#endif // PARAMS_USDJPY_MQH
