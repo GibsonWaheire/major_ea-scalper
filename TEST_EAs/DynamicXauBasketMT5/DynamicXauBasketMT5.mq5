@@ -1,5 +1,5 @@
 // DynamicXauBasketMT5.mq5
-// Momentum Breakout EA - Dynamic lot (min to max), 1-20 trades per basket, bulk close
+// Momentum Breakout EA - Multi-instrument (XAUUSD, EURUSD, US30, AUDUSD, USDJPY, etc.)
 #property copyright "Dynamic XAU Momentum Breakout EA"
 #property link      "local"
 #property version   "3.00"
@@ -9,11 +9,11 @@
 #include <Trade/PositionInfo.mqh>
 
 // --- Inputs ---
-input string   TradeSymbol           = "XAUUSD";
+input string   TradeSymbol           = "XAUUSD";  // XAUUSD, EURUSD, US30, AUDUSD, USDJPY, etc.
 input int      MagicNumber           = 905533;
 input double   BaseLot               = 0.01;   // Lot for first trade (min)
 input double   LotStep               = 0;      // Add per trade (0 = flat BaseLot for all)
-input double   MaxLot                = 0.10;   // Cap (not too much)
+input double   MaxLot                = 0.03;   // Cap (not too much)
 input int      MinTotalTrades        = 1;      // Min trades per basket
 input int      MaxTotalTrades        = 10;     // Max trades per basket (1-20 dynamic)
 input int      ATRPeriod             = 14;
@@ -23,7 +23,7 @@ input double   MomentumThresholdATR  = 0.15;   // Minimum momentum to trigger br
 input int      MomentumLookback      = 2;      // Number of candles to look back for momentum
 input bool     RequireVolumeConfirmation = false; // Require volume confirmation for breakout
 input int      DeviationPoints       = 30;     // Slippage guard
-input double   SpreadLimitPoints     = 900;    // Skip trading if spread too wide
+input double   SpreadLimitPoints     = 100;    // Skip trading if spread too wide (30 forex, 50 XAU, 100 indices)
 input int      MinSecondsBetweenEntries = 5;   // Min seconds between opening new trades
 input bool     OneEntryPerBar       = true;   // Max one entry per M1 bar
 input bool     UseLimitOrders       = true;   // Use limit orders instead of market
@@ -36,10 +36,13 @@ input int      PendingOrderTimeoutSeconds = 60; // Cancel pendings if not filled
 input bool     UseStopLoss           = true;   // Enable stop loss
 input double   StopLossATRMultiplierXAU   = 3.0;   // ATR multiplier (XAUUSD)
 input double   StopLossATRMultiplierOther = 3.0;   // ATR multiplier (other)
-input double   StopLossMinPointsXAU       = 1500;  // Floor: min SL points (breathing room)
-input double   StopLossMinPointsOther    = 150;   // Floor for other symbols
-input double   StopLossMaxPointsXAU       = 6000; // Cap: max SL points (account protection)
-input double   StopLossMaxPointsOther    = 600;   // Cap for other symbols
+input double   StopLossMinPointsXAU       = 1500;  // Floor: min SL points (XAUUSD/GOLD)
+input double   StopLossMinPointsOther    = 150;   // Floor for forex (EURUSD, USDJPY, AUDUSD)
+input double   StopLossMinPointsIndex    = 200;   // Floor for indices (US30, etc.)
+input double   StopLossMaxPointsXAU       = 6000; // Cap: max SL points (XAUUSD/GOLD)
+input double   StopLossMaxPointsOther    = 600;   // Cap for forex
+input double   StopLossMaxPointsIndex    = 2000; // Cap for indices
+input double   StopLossATRMultiplierIndex = 3.0;  // ATR multiplier for indices
 
 // --- Basket Profit Settings ---
 input bool     UseBasketProfit       = true;   // Close all trades when basket profit target reached
@@ -90,6 +93,18 @@ bool EnsureSymbolReady(const string symbol)
       return false;
    }
    return true;
+}
+
+// Symbol type helpers for multi-instrument support (XAUUSD, GOLD, EURUSD, US30, AUDUSD, USDJPY, etc.)
+bool IsGoldSymbol(const string symbol)
+{
+   return (StringFind(symbol, "XAU") >= 0 || StringFind(symbol, "GOLD") >= 0);
+}
+bool IsIndexSymbol(const string symbol)
+{
+   return (StringFind(symbol, "US30") >= 0 || StringFind(symbol, "DJ30") >= 0 ||
+           StringFind(symbol, "USTEC") >= 0 || StringFind(symbol, "NAS") >= 0 ||
+           StringFind(symbol, "US500") >= 0 || StringFind(symbol, "SPX") >= 0);
 }
 
 // Close all existing trades (any magic number) when EA is activated
@@ -469,9 +484,13 @@ double GetStopLossDistance(const string symbol, double atr)
    if(!UseStopLoss)
       return 0;
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   double mult = (symbol == "XAUUSD" || symbol == "GOLD") ? StopLossATRMultiplierXAU : StopLossATRMultiplierOther;
-   double minPt = (symbol == "XAUUSD" || symbol == "GOLD") ? StopLossMinPointsXAU : StopLossMinPointsOther;
-   double maxPt = (symbol == "XAUUSD" || symbol == "GOLD") ? StopLossMaxPointsXAU : StopLossMaxPointsOther;
+   double mult, minPt, maxPt;
+   if(IsGoldSymbol(symbol))
+      { mult = StopLossATRMultiplierXAU; minPt = StopLossMinPointsXAU; maxPt = StopLossMaxPointsXAU; }
+   else if(IsIndexSymbol(symbol))
+      { mult = StopLossATRMultiplierIndex; minPt = StopLossMinPointsIndex; maxPt = StopLossMaxPointsIndex; }
+   else
+      { mult = StopLossATRMultiplierOther; minPt = StopLossMinPointsOther; maxPt = StopLossMaxPointsOther; }
    double atrDist = (atr > 0) ? atr * mult : 0;
    double minDist = minPt * point;
    double maxDist = maxPt * point;
@@ -607,6 +626,18 @@ void ManageExits(const string symbol, double atr)
    int basketAgeSec = (int)(TimeCurrent() - basketOldest);
    int holdSeconds = UseTimeBasedClose ? MinHoldSeconds : 0;
    
+   // Spread-aware profit floor: only close if profit >= 1.2x spread cost (avoids losing to spread on XAUUSD)
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+   double spreadPts = (point > 0) ? (ask - bid) / point : 0;
+   double spreadCost = 0;
+   if(point > 0 && tickSize > 0 && totalLots > 0)
+      spreadCost = (spreadPts * point) * (totalLots / tickSize) * tickValue;
+   double profitFloor = MathMax(MinProfitToClose, 1.2 * spreadCost);
+   
    // CloseMode 1 or 2: Close individual positions when profitable (1 sec hold)
    int individualClosed = 0;
    if(CloseMode == 1 || CloseMode == 2)
@@ -619,7 +650,9 @@ void ManageExits(const string symbol, double atr)
          
          double posProfit = pos.Profit() + pos.Swap() + pos.Commission();
          int posAgeSec = (int)(TimeCurrent() - pos.Time());
-         if(posProfit >= MinProfitToClose && posAgeSec >= holdSeconds)
+         double posSpreadCost = (point > 0 && tickSize > 0) ? (spreadPts * point) * (pos.Volume() / tickSize) * tickValue : 0;
+         double posProfitFloor = MathMax(MinProfitToClose, 1.2 * posSpreadCost);
+         if(posProfit >= posProfitFloor && posAgeSec >= holdSeconds)
          {
             ulong ticket = pos.Ticket();
             if(trade.PositionClose(ticket, DeviationPoints))
@@ -633,8 +666,8 @@ void ManageExits(const string symbol, double atr)
          return;  // For CLOSE_BOTH, skip basket close this tick after individual closes
    }
    
-   // CloseMode 0 or 2: Close basket when profitable (1 sec hold)
-   if((CloseMode == 0 || CloseMode == 2) && CloseAtAnyProfit && basketProfit >= MinProfitToClose && basketProfit > 0)
+   // CloseMode 0 or 2: Close basket when profitable (1 sec hold), profit >= profit floor (1.2x spread cost)
+   if((CloseMode == 0 || CloseMode == 2) && CloseAtAnyProfit && basketProfit >= profitFloor && basketProfit > 0)
    {
       bool canClose = (holdSeconds == 0 || basketAgeSec >= holdSeconds);
       if(canClose)
@@ -699,9 +732,6 @@ void ManageExits(const string symbol, double atr)
    }
    
    // Break-even protection and stop loss management
-   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    double stopLossDist = GetStopLossDistance(symbol, atr);
    double breakEvenTrigger = atr * BreakEvenTriggerATR;
@@ -903,8 +933,9 @@ int OnInit()
    Print("Stop Loss: ", (UseStopLoss ? "ENABLED" : "DISABLED"));
    if(UseStopLoss)
    {
-      Print("  - XAUUSD: ATR x ", StopLossATRMultiplierXAU, " | floor ", StopLossMinPointsXAU, " pts | cap ", StopLossMaxPointsXAU, " pts");
-      Print("  - Other: ATR x ", StopLossATRMultiplierOther, " | floor ", StopLossMinPointsOther, " pts | cap ", StopLossMaxPointsOther, " pts");
+      Print("  - Gold (XAU/GOLD): ATR x ", StopLossATRMultiplierXAU, " | floor ", StopLossMinPointsXAU, " pts | cap ", StopLossMaxPointsXAU, " pts");
+      Print("  - Forex (EURUSD, USDJPY, AUDUSD): ATR x ", StopLossATRMultiplierOther, " | floor ", StopLossMinPointsOther, " pts | cap ", StopLossMaxPointsOther, " pts");
+      Print("  - Indices (US30): ATR x ", StopLossATRMultiplierIndex, " | floor ", StopLossMinPointsIndex, " pts | cap ", StopLossMaxPointsIndex, " pts");
    }
    Print("Trailing Stop: ", (UseTrailingStop ? "ENABLED" : "DISABLED"));
    if(UseTrailingStop)
