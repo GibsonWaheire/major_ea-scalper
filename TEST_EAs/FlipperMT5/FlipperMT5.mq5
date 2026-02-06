@@ -282,6 +282,29 @@ int GetOwnPositionsCount()
 }
 
 //+------------------------------------------------------------------+
+//| Collect EA-owned position tickets into array                     |
+//| filter: WRONG_VALUE/-1 = all, POSITION_TYPE_BUY = buys only,     |
+//|         POSITION_TYPE_SELL = sells only. Returns count.          |
+//+------------------------------------------------------------------+
+int CollectOwnTickets(ulong &tickets[], ENUM_POSITION_TYPE filter = (ENUM_POSITION_TYPE)-1)
+{
+   ArrayResize(tickets, 0);
+   int n = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+         continue;
+      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      if(filter >= 0 && type != filter) continue;
+      ArrayResize(tickets, n + 1);
+      tickets[n++] = ticket;
+   }
+   return n;
+}
+
+//+------------------------------------------------------------------+
 //| Calculate allowed number of positions based on capital           |
 //+------------------------------------------------------------------+
 int CalculateAllowedPositions(double accountBalance)
@@ -561,78 +584,47 @@ void CheckTrailingProfit()
 }
 
 //+------------------------------------------------------------------+
+//| Bulk close positions by filter (internal)                        |
+//+------------------------------------------------------------------+
+void BulkClosePositions(ENUM_POSITION_TYPE filter = (ENUM_POSITION_TYPE)-1)
+{
+   ulong tickets[];
+   int n = CollectOwnTickets(tickets, filter);
+   if(n == 0) return;
+   
+   trade.SetDeviationInPoints(SlippageBuffer);
+   trade.SetAsyncMode(true);
+   for(int i = 0; i < n; i++)
+      trade.PositionClose(tickets[i], SlippageBuffer);
+   trade.SetAsyncMode(false);
+   
+   // Retry pass for any remaining
+   Sleep(50);
+   n = CollectOwnTickets(tickets, filter);
+   if(n > 0)
+   {
+      trade.SetAsyncMode(true);
+      for(int i = 0; i < n; i++)
+         trade.PositionClose(tickets[i], SlippageBuffer);
+      trade.SetAsyncMode(false);
+   }
+}
+
+//+------------------------------------------------------------------+
 //| MODULE 3: Close All Positions (High-Speed Exit)                 |
 //+------------------------------------------------------------------+
 void CloseAllPositions()
 {
-   trade.SetDeviationInPoints(SlippageBuffer);
-   
-   int maxAttempts = 10; // Maximum retry attempts
-   int attempt = 0;
-   
-   // Get count of positions owned by this EA
    int ownPositionsCount = GetOwnPositionsCount();
+   if(ownPositionsCount == 0) return;
    
-   if(ownPositionsCount == 0)
-      return; // No positions to close
+   Print("Closing all ", ownPositionsCount, " EA positions...");
+   BulkClosePositions((ENUM_POSITION_TYPE)-1);
    
-   // Optimized while loop for high-speed closing during volatility
-   while(ownPositionsCount > 0 && attempt < maxAttempts)
-   {
-      int closedThisRound = 0;
-      
-      if(attempt == 0)
-         Print("Closing all ", ownPositionsCount, " EA positions...");
-      
-      // Close positions in reverse order to avoid index shifting issues
-      for(int i = PositionsTotal() - 1; i >= 0; i--)
-      {
-         ulong ticket = PositionGetTicket(i);
-         if(ticket > 0)
-         {
-            if(PositionSelectByTicket(ticket))
-            {
-               string symbol = PositionGetString(POSITION_SYMBOL);
-               long magic = PositionGetInteger(POSITION_MAGIC);
-               
-               // Only close positions owned by this EA
-               if(symbol != _Symbol || magic != MagicNumber)
-                  continue;
-               
-               ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-               
-               if(trade.PositionClose(ticket))
-               {
-                  Print("Position closed: Ticket=", ticket, " Symbol=", symbol, " Type=", EnumToString(type));
-                  closedThisRound++;
-               }
-               else
-               {
-                  Print("Failed to close position: Ticket=", ticket, " Error=", 
-                        trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
-               }
-            }
-         }
-      }
-      
-      // Update count after closing
-      ownPositionsCount = GetOwnPositionsCount();
-      
-      attempt++;
-      
-      // Small delay for broker processing, but keep it minimal for speed
-      if(ownPositionsCount > 0)
-      {
-         Sleep(50); // Reduced delay for faster execution
-      }
-   }
-   
-   // Final verification
    int remaining = GetOwnPositionsCount();
    if(remaining > 0)
    {
-      Print("WARNING: ", remaining, " EA positions still open after ", maxAttempts, " close attempts");
-      Print("Manual intervention may be required");
+      Print("WARNING: ", remaining, " EA positions still open after bulk close. Manual intervention may be required");
    }
    else
    {
@@ -640,6 +632,63 @@ void CloseAllPositions()
       double finalBalance = AccountInfoDouble(ACCOUNT_BALANCE);
       Print("All EA positions closed successfully. Final profit: $", finalProfit, " Balance: $", finalBalance);
    }
+}
+
+//+------------------------------------------------------------------+
+//| Close all BUY positions owned by this EA                         |
+//+------------------------------------------------------------------+
+void CloseAllBuys()
+{
+   ulong tickets[];
+   int n = CollectOwnTickets(tickets, POSITION_TYPE_BUY);
+   if(n == 0) return;
+   Print("Closing ", n, " EA BUY positions...");
+   trade.SetDeviationInPoints(SlippageBuffer);
+   trade.SetAsyncMode(true);
+   for(int i = 0; i < n; i++)
+      trade.PositionClose(tickets[i], SlippageBuffer);
+   trade.SetAsyncMode(false);
+}
+
+//+------------------------------------------------------------------+
+//| Close all SELL positions owned by this EA                        |
+//+------------------------------------------------------------------+
+void CloseAllSells()
+{
+   ulong tickets[];
+   int n = CollectOwnTickets(tickets, POSITION_TYPE_SELL);
+   if(n == 0) return;
+   Print("Closing ", n, " EA SELL positions...");
+   trade.SetDeviationInPoints(SlippageBuffer);
+   trade.SetAsyncMode(true);
+   for(int i = 0; i < n; i++)
+      trade.PositionClose(tickets[i], SlippageBuffer);
+   trade.SetAsyncMode(false);
+}
+
+//+------------------------------------------------------------------+
+//| Modify SL and/or TP on all EA positions. Use 0 to keep current.  |
+//+------------------------------------------------------------------+
+int BulkModifySLTP(double newSL = 0, double newTP = 0)
+{
+   ulong tickets[];
+   int n = CollectOwnTickets(tickets, (ENUM_POSITION_TYPE)-1);
+   int modified = 0;
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   
+   for(int i = 0; i < n; i++)
+   {
+      if(!PositionSelectByTicket(tickets[i])) continue;
+      double sl = (newSL != 0) ? NormalizeDouble(newSL, digits) : PositionGetDouble(POSITION_SL);
+      double tp = (newTP != 0) ? NormalizeDouble(newTP, digits) : PositionGetDouble(POSITION_TP);
+      if(trade.PositionModify(tickets[i], sl, tp))
+         modified++;
+      else
+         Print("BulkModifySLTP failed ticket=", tickets[i], " err=", trade.ResultRetcode());
+   }
+   if(modified > 0)
+      Print("BulkModifySLTP: ", modified, "/", n, " positions modified");
+   return modified;
 }
 
 //+------------------------------------------------------------------+

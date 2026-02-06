@@ -11,9 +11,10 @@
 // --- Inputs ---
 input string   TradeSymbol           = "XAUUSD";
 input int      MagicNumber           = 905533;
-input double   BaseLot               = 0.01;   // Lot for first trade (min)
-input double   LotStep               = 0;      // Add per trade (0 = flat BaseLot for all)
-input double   MaxLot                = 0.10;   // Cap (not too much)
+input double   BaseLot               = 0.02;   // Lot for first trade (min)
+input double   MaxLot                = 0.50;   // Cap (scale up to this)
+input double   ProfitPerLotStep       = 10.0;  // Every $X realized profit adds LotIncrement
+input double   LotIncrement          = 0.01;   // Lot added per profit step
 input int      MinTotalTrades        = 1;      // Min trades per basket
 input int      MaxTotalTrades        = 10;     // Max trades per basket (1-20 dynamic)
 input int      ATRPeriod             = 14;
@@ -23,23 +24,25 @@ input double   MomentumThresholdATR  = 0.15;   // Minimum momentum to trigger br
 input int      MomentumLookback      = 2;      // Number of candles to look back for momentum
 input bool     RequireVolumeConfirmation = false; // Require volume confirmation for breakout
 input int      DeviationPoints       = 30;     // Slippage guard
-input double   SpreadLimitPoints     = 900;    // Skip trading if spread too wide
-input int      MinSecondsBetweenEntries = 5;   // Min seconds between opening new trades
-input bool     OneEntryPerBar       = true;   // Max one entry per M1 bar
+input double   SpreadLimitPoints     = 30;     // Skip trading if spread too wide
+input int      MinSecondsBetweenEntries = 0;   // Min seconds between opening new trades (0 = HFT)
+input int      MinSecondsBetweenTrades = 1;   // Min seconds between each new trade (staggered entry)
+input bool     OneEntryPerBar       = false;  // Max one entry per M1 bar (false = HFT)
 input bool     UseLimitOrders       = true;   // Use limit orders instead of market
-input int      MarketOrdersAtExecution = 2;    // Market orders to open immediately on signal
+input bool     UseStopOrders        = true;   // true=Breakout Stop, false=Limit (dip/rally)
+input int      MarketOrdersAtExecution = 4;    // Market orders to open immediately on signal
 input int      LimitOrderCount      = 5;      // Number of limit orders per basket
 input int      MinPendingHoldSeconds = 3;     // Min seconds before cancelling pendings on direction change
 input int      PendingOrderTimeoutSeconds = 60; // Cancel pendings if not filled after this many seconds
+input double   InpTickVelocityThresholdPoints = 500.0; // Tick Velocity: spike if price moves more than this in 500ms
+input int      TradingStartHour     = 7;     // Institutional hours: no new entries before this (broker time)
+input int      TradingEndHour       = 20;    // Institutional hours: no new entries at or after this (broker time)
+input bool     ShowStatusOnChart    = true;  // Show block reason on chart (spread, hours, etc.)
 
 // --- Stop Loss Settings ---
 input bool     UseStopLoss           = true;   // Enable stop loss
-input double   StopLossATRMultiplierXAU   = 3.0;   // ATR multiplier (XAUUSD)
-input double   StopLossATRMultiplierOther = 3.0;   // ATR multiplier (other)
-input double   StopLossMinPointsXAU       = 1500;  // Floor: min SL points (breathing room)
-input double   StopLossMinPointsOther    = 150;   // Floor for other symbols
-input double   StopLossMaxPointsXAU       = 6000; // Cap: max SL points (account protection)
-input double   StopLossMaxPointsOther    = 600;   // Cap for other symbols
+input double   StopLossPointsXAU     = 1000.0; // Stop loss in points for XAUUSD (~100 pips)
+input double   StopLossPointsOther   = 300.0;  // Stop loss in points for other symbols (~30 pips)
 
 // --- Basket Profit Settings ---
 input bool     UseBasketProfit       = true;   // Close all trades when basket profit target reached
@@ -53,9 +56,10 @@ input double   EarlyCloseProfitPercent = 1.0;  // Alternative: Close early at th
 input bool     UsePercentForEarlyClose = false; // If true use % for early close, if false use ATR
 input bool     CloseAtAnyProfit        = true;  // Close basket as soon as profit > 0
 input double   MinProfitToClose       = 0.01;   // Minimum profit (currency) to trigger close
-input bool     UseTimeBasedClose      = true;  // Require min hold time before closing profit
-input int      MinHoldSeconds         = 1;     // Min seconds to hold before close (1-5 sec window)
-input int      MaxHoldSeconds         = 5;     // Max seconds for close window
+input bool     UseTimeBasedClose      = true;  // Dynamic hold (0.5-4 sec by profit %)
+input double   MinHoldSeconds         = 5.0;   // Min hold when profit % is high (close fast)
+input double   MaxHoldSeconds         = 30.0;  // Max hold when profit % is low (wait for profit)
+input double   ProfitPctForFastClose  = 1.5;   // When profit >= this % of balance, use min hold
 input int      CloseMode             = 2;     // 0=basket only, 1=individual only, 2=both
 
 // --- Exit Settings ---
@@ -73,10 +77,23 @@ bool           eaInitialized = false;
 double         lastPrice     = 0.0;  // Track last price for momentum calculation
 datetime       lastEntryTime = 0;    // Entry cooldown
 datetime       lastEntryBar  = 0;    // One entry per bar
+datetime       lastTradeOpenTime = 0; // Last trade opened (staggered entry)
+double         cumulativeRealizedProfit = 0;  // Realized profit from closed trades (for lot scaling)
+double         tickVelPrice  = 0.0;  // Tick Velocity Filter: price at last sample
+ulong          tickVelTime   = 0;    // Tick Velocity Filter: last sample time (ms)
+double         g_spreadHistory[100];  // Last 100 tick spreads for defensive scaling
+int            g_spreadHistoryCount = 0;
+int            g_spreadHistoryIdx   = 0;
 
 // ---------------------------------------------------------------------------
 // Utility helpers
 // ---------------------------------------------------------------------------
+void ChartStatus(const string msg)
+{
+   if(ShowStatusOnChart)
+      Comment("GibsonScalpter\n", msg);
+}
+
 bool EnsureSymbolReady(const string symbol)
 {
    if(!SymbolSelect(symbol, true))
@@ -142,19 +159,30 @@ double GetATR()
    return buffer[0];
 }
 
-// Detect Momentum Breakout - Simple and effective for scalping
+// Detect Momentum Breakout - Sniper entries with blockers
 int DetectMomentumBreakout(const string symbol, double atr)
 {
    if(atr <= 0)
       return 0;
    
-   double close[];
+   double high[], low[], open[], close[];
    long volume[];
+   ArraySetAsSeries(high, true);
+   ArraySetAsSeries(low, true);
+   ArraySetAsSeries(open, true);
    ArraySetAsSeries(close, true);
    ArraySetAsSeries(volume, true);
    
    int lookback = MomentumLookback + 1;
-   if(CopyClose(symbol, MomentumTF, 0, lookback, close) < lookback)
+   if(CopyHigh(symbol, MomentumTF, 0, lookback, high) < lookback ||
+      CopyLow(symbol, MomentumTF, 0, lookback, low) < lookback ||
+      CopyOpen(symbol, MomentumTF, 0, lookback, open) < lookback ||
+      CopyClose(symbol, MomentumTF, 0, lookback, close) < lookback)
+      return 0;
+   
+   // Overextension Blocker: prevent buying exhaustion
+   double barRange = high[0] - low[0];
+   if(barRange > atr * 2.0)
       return 0;
    
    if(RequireVolumeConfirmation)
@@ -170,6 +198,22 @@ int DetectMomentumBreakout(const string symbol, double atr)
    // Check if momentum exceeds threshold
    if(MathAbs(momentum) < momentumThreshold)
       return 0;
+   
+   // Rejection Wick Blocker: only enter on full-body momentum, not spiky rejection candles
+   double bodySize = MathAbs(open[0] - close[0]);
+   if(bodySize < 0.00001) bodySize = 0.00001;
+   if(momentum > 0)  // BUY candidate
+   {
+      double upperWick = high[0] - MathMax(open[0], close[0]);
+      if(upperWick > bodySize * 2.0)
+         return 0;
+   }
+   else  // SELL candidate
+   {
+      double lowerWick = MathMin(open[0], close[0]) - low[0];
+      if(lowerWick > bodySize * 2.0)
+         return 0;
+   }
    
    // Volume confirmation (if enabled)
    if(RequireVolumeConfirmation && lookback > 1)
@@ -203,12 +247,66 @@ double NormalizeVolume(const string symbol, double lots)
    return NormalizeDouble(lots, 2);
 }
 
-double GetDynamicLot(const string symbol, int currentTrades)
+// Update spread history (call from OnTick each tick)
+void UpdateSpreadHistory(const string symbol)
+{
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   if(point <= 0) return;
+   double spread = (SymbolInfoDouble(symbol, SYMBOL_ASK) - SymbolInfoDouble(symbol, SYMBOL_BID)) / point;
+   g_spreadHistory[g_spreadHistoryIdx] = spread;
+   g_spreadHistoryIdx = (g_spreadHistoryIdx + 1) % 100;
+   if(g_spreadHistoryCount < 100) g_spreadHistoryCount++;
+}
+
+double GetAverageSpread()
+{
+   if(g_spreadHistoryCount < 10) return 0;
+   double sum = 0;
+   for(int i = 0; i < g_spreadHistoryCount; i++)
+      sum += g_spreadHistory[i];
+   return sum / g_spreadHistoryCount;
+}
+
+// Lot scaling: profit-based + liquidity (volume/spread)
+double GetScaledLot(const string symbol)
 {
    double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
-   double lot = (LotStep == 0) ? BaseLot : (BaseLot + (currentTrades * LotStep));
+   if(ProfitPerLotStep <= 0) return NormalizeVolume(symbol, BaseLot);
+   int steps = (int)MathFloor(cumulativeRealizedProfit / ProfitPerLotStep);
+   double lot = BaseLot + (steps * LotIncrement);
+   lot = MathMin(MaxLot, MathMax(minLot, lot));
+   
+   // Liquidity-based scaling: 20-period volume
+   long volume[];
+   ArraySetAsSeries(volume, true);
+   if(CopyTickVolume(symbol, MomentumTF, 0, 21, volume) >= 21)
+   {
+      long avgVolume = 0;
+      for(int i = 1; i < 21; i++)
+         avgVolume += volume[i];
+      avgVolume /= 20;
+      if(avgVolume > 0 && volume[0] > avgVolume * 1.5)
+         lot *= 1.2;  // Aggressive: high volume
+   }
+   
+   // Defensive: spread > avg spread * 1.5
+   double avgSpread = GetAverageSpread();
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double currentSpread = (point > 0) ? (SymbolInfoDouble(symbol, SYMBOL_ASK) - SymbolInfoDouble(symbol, SYMBOL_BID)) / point : 0;
+   if(avgSpread > 0 && currentSpread > avgSpread * 1.5)
+      lot *= 0.5;  // Defensive: wide spread
+   
    lot = MathMin(MaxLot, MathMax(minLot, lot));
    return NormalizeVolume(symbol, lot);
+}
+
+// Alternating lot: consecutive trades get different lots (even=base, odd=base+increment)
+double GetNextLot(const string symbol)
+{
+   int count = PositionsCount(symbol) + PendingOrdersCount(symbol);
+   double base = GetScaledLot(symbol);
+   double lot = (count % 2 == 0) ? base : base + LotIncrement;
+   return NormalizeVolume(symbol, MathMin(MaxLot, lot));
 }
 
 // Count all positions (including pre-existing if IncludeAllTrades is true)
@@ -249,7 +347,7 @@ int PendingOrdersCount(const string symbol)
    return count;
 }
 
-// Returns: 1 = any BUY limit, -1 = any SELL limit, 0 = none or mixed
+// Returns: 1 = any BUY (limit/stop), -1 = any SELL (limit/stop), 0 = none or mixed
 int GetPendingOrdersDirection(const string symbol)
 {
    int buys = 0, sells = 0;
@@ -261,8 +359,8 @@ int GetPendingOrdersDirection(const string symbol)
       if(OrderGetString(ORDER_SYMBOL) != symbol) continue;
       if(!IncludeAllTrades && OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
       ENUM_ORDER_TYPE otype = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-      if(otype == ORDER_TYPE_BUY_LIMIT) buys++;
-      else if(otype == ORDER_TYPE_SELL_LIMIT) sells++;
+      if(otype == ORDER_TYPE_BUY_LIMIT || otype == ORDER_TYPE_BUY_STOP) buys++;
+      else if(otype == ORDER_TYPE_SELL_LIMIT || otype == ORDER_TYPE_SELL_STOP) sells++;
    }
    if(buys == 0 && sells == 0) return 0;
    return (buys >= sells) ? 1 : -1;
@@ -298,6 +396,14 @@ void DeletePendingOrdersOnly(const string symbol)
       if(trade.OrderDelete(ticket))
          Print("Deleted pending order ", ticket, " (direction change)");
    }
+}
+
+// Returns: 1 = BUY, -1 = SELL, 0 = none. Uses positions first, else pendings (one direction only)
+int GetBasketOrPendingDirection(const string symbol)
+{
+   int posDir = GetBasketDirection(symbol);
+   if(posDir != 0) return posDir;
+   return GetPendingOrdersDirection(symbol);
 }
 
 // Returns: 1 = all BUY, -1 = all SELL, 0 = no positions
@@ -463,35 +569,35 @@ bool CloseBasket(const string symbol)
    return true;
 }
 
-// Returns SL distance in price (floor + ATR + cap)
-double GetStopLossDistance(const string symbol, double atr)
+double GetStopLossPrice(const string symbol, int direction)
 {
    if(!UseStopLoss)
       return 0;
+   
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   double mult = (symbol == "XAUUSD" || symbol == "GOLD") ? StopLossATRMultiplierXAU : StopLossATRMultiplierOther;
-   double minPt = (symbol == "XAUUSD" || symbol == "GOLD") ? StopLossMinPointsXAU : StopLossMinPointsOther;
-   double maxPt = (symbol == "XAUUSD" || symbol == "GOLD") ? StopLossMaxPointsXAU : StopLossMaxPointsOther;
-   double atrDist = (atr > 0) ? atr * mult : 0;
-   double minDist = minPt * point;
-   double maxDist = maxPt * point;
-   double dist = MathMax(minDist, MathMin(atrDist > 0 ? atrDist : minDist, maxDist));
-   return dist;
-}
-
-double GetStopLossPrice(const string symbol, int direction, double atr)
-{
-   if(!UseStopLoss)
-      return 0;
-   double dist = GetStopLossDistance(symbol, atr);
-   if(dist <= 0)
-      return 0;
+   double stopLossPoints = 0;
+   
+   // Determine stop loss based on symbol
+   if(symbol == "XAUUSD" || symbol == "GOLD")
+      stopLossPoints = StopLossPointsXAU;
+   else
+      stopLossPoints = StopLossPointsOther;
+   
    double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
-   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   double stopLoss = 0;
+   
    if(direction > 0) // BUY
-      return NormalizeDouble(ask - dist, digits);
-   return NormalizeDouble(bid + dist, digits);
+   {
+      stopLoss = ask - (stopLossPoints * point);
+   }
+   else // SELL
+   {
+      stopLoss = bid + (stopLossPoints * point);
+   }
+   
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   return NormalizeDouble(stopLoss, digits);
 }
 
 bool OpenMarket(const string symbol, int direction, double atr)
@@ -505,7 +611,7 @@ bool OpenMarket(const string symbol, int direction, double atr)
       return false;
    }
    
-   double lot = GetDynamicLot(symbol, totalTrades);
+   double lot = GetNextLot(symbol);
    if(lot <= 0)
    {
       Print("Lot calculation failed, aborting entry");
@@ -515,7 +621,7 @@ bool OpenMarket(const string symbol, int direction, double atr)
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(DeviationPoints);
    
-   double stopLoss = GetStopLossPrice(symbol, direction, atr);
+   double stopLoss = GetStopLossPrice(symbol, direction);
    // NO TAKE PROFIT - Let trades run until basket profit target is reached
    double takeProfit = 0; // No individual TP - basket management only
    bool result = false;
@@ -527,9 +633,7 @@ bool OpenMarket(const string symbol, int direction, double atr)
    
    if(result)
    {
-      double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
-      double slDist = GetStopLossDistance(symbol, atr);
-      double slPoints = (point > 0) ? slDist / point : 0;
+      double slPoints = (symbol == "XAUUSD" || symbol == "GOLD") ? StopLossPointsXAU : StopLossPointsOther;
       Print("Opened trade: ", (direction > 0 ? "BUY" : "SELL"), 
             " | Lot: ", DoubleToString(lot, 2),
             " | SL: ", DoubleToString(stopLoss, 5), " (", DoubleToString(slPoints, 1), " pts)",
@@ -540,8 +644,12 @@ bool OpenMarket(const string symbol, int direction, double atr)
    return result;
 }
 
-bool PlaceLimitOrders(const string symbol, int direction, double atr)
+bool PlaceSingleLimitOrder(const string symbol, int direction, double atr)
 {
+   int pendingCount = PendingOrdersCount(symbol);
+   if(pendingCount >= LimitOrderCount)
+      return false;
+   
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(DeviationPoints);
    
@@ -550,42 +658,67 @@ bool PlaceLimitOrders(const string symbol, int direction, double atr)
    double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    long stopsLevel = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   double stopLossDist = GetStopLossDistance(symbol, atr);
+   double stopLossPoints = (symbol == "XAUUSD" || symbol == "GOLD") ? StopLossPointsXAU : StopLossPointsOther;
    
    double offsets[] = {0.2, 0.4, 0.6, 0.8, 1.0};
    double minOffset = MathMax(atr * 0.2, (double)stopsLevel * point);
-   int placed = 0;
-   int n = MathMin(5, LimitOrderCount);
+   int offsetIndex = MathMin(pendingCount, 4);
+   double offset = MathMax(atr * offsets[offsetIndex], minOffset);
+   double lot = GetNextLot(symbol);
+   double limitPrice = 0;
+   double sl = 0;
    
-   for(int i = 0; i < n; i++)
+   if(direction > 0)  // BUY
    {
-      double lot = GetDynamicLot(symbol, PositionsCount(symbol) + PendingOrdersCount(symbol) + i);
-      double offset = MathMax(atr * offsets[i], minOffset);
-      double limitPrice = 0;
-      double sl = 0;
-      
-      if(direction > 0)  // BUY LIMIT
-      {
-         limitPrice = NormalizeDouble(bid - offset, digits);
-         sl = NormalizeDouble(limitPrice - stopLossDist, digits);
-         if(trade.BuyLimit(lot, limitPrice, symbol, sl, 0, ORDER_TIME_GTC, 0, "Limit BUY"))
-            placed++;
-         else
-            Print("BuyLimit failed: ", trade.ResultRetcode(), " at ", limitPrice);
-      }
-      else  // SELL LIMIT
+      if(UseStopOrders)  // Breakout: Buy Stop above ask
       {
          limitPrice = NormalizeDouble(ask + offset, digits);
-         sl = NormalizeDouble(limitPrice + stopLossDist, digits);
-         if(trade.SellLimit(lot, limitPrice, symbol, sl, 0, ORDER_TIME_GTC, 0, "Limit SELL"))
-            placed++;
-         else
-            Print("SellLimit failed: ", trade.ResultRetcode(), " at ", limitPrice);
+         sl = NormalizeDouble(limitPrice - stopLossPoints * point, digits);
+         if(trade.BuyStop(lot, limitPrice, symbol, sl, 0, ORDER_TIME_GTC, 0, "Stop BUY"))
+         {
+            Print("Placed stop BUY ", (pendingCount + 1), "/", LimitOrderCount, " | Lot: ", DoubleToString(lot, 2));
+            return true;
+         }
+         Print("BuyStop failed: ", trade.ResultRetcode(), " at ", limitPrice);
+      }
+      else  // Limit: Buy Limit below bid
+      {
+         limitPrice = NormalizeDouble(bid - offset, digits);
+         sl = NormalizeDouble(limitPrice - stopLossPoints * point, digits);
+         if(trade.BuyLimit(lot, limitPrice, symbol, sl, 0, ORDER_TIME_GTC, 0, "Limit BUY"))
+         {
+            Print("Placed limit BUY ", (pendingCount + 1), "/", LimitOrderCount, " | Lot: ", DoubleToString(lot, 2));
+            return true;
+         }
+         Print("BuyLimit failed: ", trade.ResultRetcode(), " at ", limitPrice);
       }
    }
-   if(placed > 0)
-      Print("Placed ", placed, "/", n, " limit orders (", (direction > 0 ? "BUY" : "SELL"), ")");
-   return (placed == n);
+   else  // SELL
+   {
+      if(UseStopOrders)  // Breakout: Sell Stop below bid
+      {
+         limitPrice = NormalizeDouble(bid - offset, digits);
+         sl = NormalizeDouble(limitPrice + stopLossPoints * point, digits);
+         if(trade.SellStop(lot, limitPrice, symbol, sl, 0, ORDER_TIME_GTC, 0, "Stop SELL"))
+         {
+            Print("Placed stop SELL ", (pendingCount + 1), "/", LimitOrderCount, " | Lot: ", DoubleToString(lot, 2));
+            return true;
+         }
+         Print("SellStop failed: ", trade.ResultRetcode(), " at ", limitPrice);
+      }
+      else  // Limit: Sell Limit above ask
+      {
+         limitPrice = NormalizeDouble(ask + offset, digits);
+         sl = NormalizeDouble(limitPrice + stopLossPoints * point, digits);
+         if(trade.SellLimit(lot, limitPrice, symbol, sl, 0, ORDER_TIME_GTC, 0, "Limit SELL"))
+         {
+            Print("Placed limit SELL ", (pendingCount + 1), "/", LimitOrderCount, " | Lot: ", DoubleToString(lot, 2));
+            return true;
+         }
+         Print("SellLimit failed: ", trade.ResultRetcode(), " at ", limitPrice);
+      }
+   }
+   return false;
 }
 
 bool SpreadOK(const string symbol)
@@ -605,40 +738,62 @@ void ManageExits(const string symbol, double atr)
    double profitTarget = CalculateBasketProfitTarget(symbol, atr, totalLots);
    datetime basketOldest = BasketOldestOpen(symbol);
    int basketAgeSec = (int)(TimeCurrent() - basketOldest);
-   int holdSeconds = UseTimeBasedClose ? MinHoldSeconds : 0;
    
-   // CloseMode 1 or 2: Close individual positions when profitable (1 sec hold)
+   // Dynamic hold: 0.5-4 sec by profit % (high profit = close fast, low = wait)
+   double holdSeconds = MinHoldSeconds;
+   if(UseTimeBasedClose)
+   {
+      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+      double profitPct = (balance > 0 && basketProfit > 0) ? (basketProfit / balance) * 100.0 : 0;
+      if(ProfitPctForFastClose > 0)
+         holdSeconds = MaxHoldSeconds - (profitPct / ProfitPctForFastClose) * (MaxHoldSeconds - MinHoldSeconds);
+      holdSeconds = MathMax(MinHoldSeconds, MathMin(MaxHoldSeconds, holdSeconds));
+   }
+   else
+      holdSeconds = 0;
+   
+   // CloseMode 1 or 2: Bulk close all individually profitable positions (async)
    int individualClosed = 0;
    if(CloseMode == 1 || CloseMode == 2)
    {
+      ulong profitTickets[];
+      double totalProfitToAdd = 0;
+      int nProfit = 0;
       for(int i = PositionsTotal() - 1; i >= 0; --i)
       {
          if(!pos.SelectByIndex(i)) continue;
          if(pos.Symbol() != symbol) continue;
          if(!IncludeAllTrades && pos.Magic() != MagicNumber) continue;
-         
          double posProfit = pos.Profit() + pos.Swap() + pos.Commission();
          int posAgeSec = (int)(TimeCurrent() - pos.Time());
-         if(posProfit >= MinProfitToClose && posAgeSec >= holdSeconds)
+         if(posProfit >= MinProfitToClose && posAgeSec >= (int)holdSeconds)
          {
-            ulong ticket = pos.Ticket();
-            if(trade.PositionClose(ticket, DeviationPoints))
-            {
-               individualClosed++;
-               Print("Individual close: ticket ", ticket, " profit ", DoubleToString(posProfit, 2));
-            }
+            ArrayResize(profitTickets, nProfit + 1);
+            profitTickets[nProfit++] = pos.Ticket();
+            totalProfitToAdd += posProfit;
          }
+      }
+      if(nProfit > 0)
+      {
+         cumulativeRealizedProfit += totalProfitToAdd;
+         trade.SetAsyncMode(true);
+         for(int i = 0; i < nProfit; i++)
+            trade.PositionClose(profitTickets[i], DeviationPoints);
+         trade.SetAsyncMode(false);
+         individualClosed = nProfit;
+         Print("Bulk closed ", nProfit, " profitable positions | +", DoubleToString(totalProfitToAdd, 2), " realized");
       }
       if(individualClosed > 0 && CloseMode == 2)
          return;  // For CLOSE_BOTH, skip basket close this tick after individual closes
    }
    
-   // CloseMode 0 or 2: Close basket when profitable (1 sec hold)
+   // CloseMode 0 or 2: Close basket when profitable (dynamic hold)
    if((CloseMode == 0 || CloseMode == 2) && CloseAtAnyProfit && basketProfit >= MinProfitToClose && basketProfit > 0)
    {
-      bool canClose = (holdSeconds == 0 || basketAgeSec >= holdSeconds);
+      bool canClose = (holdSeconds <= 0 || basketAgeSec >= (int)holdSeconds);
       if(canClose)
       {
+         cumulativeRealizedProfit += basketProfit;
          Print("Basket profitable - closing all. Profit: ", DoubleToString(basketProfit, 2));
          CloseBasket(symbol);
          return;
@@ -648,6 +803,7 @@ void ManageExits(const string symbol, double atr)
    // Check if basket profit target is reached (full target)
    if(UseBasketProfit && profitTarget > 0 && basketProfit >= profitTarget && basketProfit > 0)
    {
+      cumulativeRealizedProfit += basketProfit;
       Print("Basket profit target reached! Closing all trades.");
       Print("Basket Profit: ", DoubleToString(basketProfit, 2), 
             " | Target: ", DoubleToString(profitTarget, 2),
@@ -687,6 +843,7 @@ void ManageExits(const string symbol, double atr)
       // Close basket if early profit target reached
       if(earlyCloseTarget > 0 && basketProfit >= earlyCloseTarget)
       {
+         cumulativeRealizedProfit += basketProfit;
          Print("Early basket close triggered! Basket is profitable.");
          Print("Basket Profit: ", DoubleToString(basketProfit, 2), 
                " | Early Close Target: ", DoubleToString(earlyCloseTarget, 2),
@@ -703,7 +860,7 @@ void ManageExits(const string symbol, double atr)
    double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-   double stopLossDist = GetStopLossDistance(symbol, atr);
+   double stopLossPoints = (symbol == "XAUUSD" || symbol == "GOLD") ? StopLossPointsXAU : StopLossPointsOther;
    double breakEvenTrigger = atr * BreakEvenTriggerATR;
    
    for(int i = PositionsTotal() - 1; i >= 0; --i)
@@ -723,14 +880,14 @@ void ManageExits(const string symbol, double atr)
       ENUM_POSITION_TYPE ptype = (ENUM_POSITION_TYPE)pos.PositionType();
       
       // Add stop loss if missing
-      if(UseStopLoss && currentSL == 0 && stopLossDist > 0)
+      if(UseStopLoss && currentSL == 0)
       {
          double newSL = 0;
          
          if(ptype == POSITION_TYPE_BUY)
-            newSL = ask - stopLossDist;
+            newSL = ask - (stopLossPoints * point);
          else if(ptype == POSITION_TYPE_SELL)
-            newSL = bid + stopLossDist;
+            newSL = bid + (stopLossPoints * point);
          
          if(newSL > 0)
          {
@@ -866,7 +1023,9 @@ int OnInit()
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(DeviationPoints);
    
-   double firstLot = GetDynamicLot(TradeSymbol, 0);
+   cumulativeRealizedProfit = 0;
+   
+   double firstLot = GetScaledLot(TradeSymbol);
    double minLot = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_MIN);
    if(BaseLot < minLot)
       Print("WARNING: BaseLot ", BaseLot, " < broker min ", minLot, ". Using ", minLot);
@@ -876,7 +1035,7 @@ int OnInit()
    Print("Momentum Breakout EA initialized");
    Print("========================================");
    Print("Symbol: ", TradeSymbol);
-   Print("Dynamic Lot: Base=", BaseLot, " Step=", LotStep, " Max=", MaxLot, " (first=", DoubleToString(firstLot, 2), ")");
+   Print("Lot: Base=", BaseLot, " Max=", MaxLot, " | Every $", ProfitPerLotStep, " profit + ", LotIncrement, " (first=", DoubleToString(firstLot, 2), ")");
    Print("Trades per basket: ", MinTotalTrades, "-", maxTrades);
    string tfStr = (MomentumTF == PERIOD_M1) ? "M1 (Scalping)" : 
                   (MomentumTF == PERIOD_M5) ? "M5" :
@@ -885,12 +1044,18 @@ int OnInit()
    Print("Momentum Threshold: ", MomentumThresholdATR, "x ATR");
    Print("Momentum Lookback: ", MomentumLookback, " candles");
    Print("Volume Confirmation: ", (RequireVolumeConfirmation ? "ENABLED" : "DISABLED"));
-   Print("Entry cooldown: ", MinSecondsBetweenEntries, " sec | One per bar: ", (OneEntryPerBar ? "YES" : "NO"));
+   Print("Entry cooldown: ", MinSecondsBetweenEntries, " sec | Stagger: ", MinSecondsBetweenTrades, " sec between trades | One per bar: ", (OneEntryPerBar ? "YES" : "NO"));
+   Print("Institutional hours: ", TradingStartHour, ":00 - ", TradingEndHour, ":00 broker time");
+   Print("Liquidity scaling: 1.2x on high volume, 0.5x on wide spread");
+   if(InpTickVelocityThresholdPoints > 0)
+      Print("Tick Velocity Filter: ENABLED | Spike if price moves > ", InpTickVelocityThresholdPoints, " pts in 500ms (CloseBasket + ExpertRemove)");
+   else
+      Print("Tick Velocity Filter: DISABLED");
    Print("Same-direction rule: ENABLED (no mixed BUY/SELL basket)");
    if(UseLimitOrders)
    {
       long stopsLevel = SymbolInfoInteger(TradeSymbol, SYMBOL_TRADE_STOPS_LEVEL);
-      Print("Entry: ", MarketOrdersAtExecution, " market + ", LimitOrderCount, " limit | Min distance: ", stopsLevel, " pts");
+      Print("Entry: ", MarketOrdersAtExecution, " market + ", LimitOrderCount, " ", (UseStopOrders ? "stop" : "limit"), " | Min distance: ", stopsLevel, " pts");
       Print("Cancel pendings: direction change after ", MinPendingHoldSeconds, " sec | timeout ", PendingOrderTimeoutSeconds, " sec");
       double atrInit = GetATR();
       if(atrInit > 0)
@@ -903,8 +1068,8 @@ int OnInit()
    Print("Stop Loss: ", (UseStopLoss ? "ENABLED" : "DISABLED"));
    if(UseStopLoss)
    {
-      Print("  - XAUUSD: ATR x ", StopLossATRMultiplierXAU, " | floor ", StopLossMinPointsXAU, " pts | cap ", StopLossMaxPointsXAU, " pts");
-      Print("  - Other: ATR x ", StopLossATRMultiplierOther, " | floor ", StopLossMinPointsOther, " pts | cap ", StopLossMaxPointsOther, " pts");
+      Print("  - XAUUSD Stop Loss: ", StopLossPointsXAU, " points");
+      Print("  - Other instruments: ", StopLossPointsOther, " points");
    }
    Print("Trailing Stop: ", (UseTrailingStop ? "ENABLED" : "DISABLED"));
    if(UseTrailingStop)
@@ -931,7 +1096,7 @@ int OnInit()
       if(CloseAtAnyProfit)
          Print("  - Close At Any Profit: ", MinProfitToClose, " (min currency)");
       if(UseTimeBasedClose)
-         Print("  - Time-based hold: ", MinHoldSeconds, "-", MaxHoldSeconds, " sec");
+         Print("  - Dynamic hold: ", MinHoldSeconds, "-", MaxHoldSeconds, " sec by profit % (fast at ", ProfitPctForFastClose, "%)");
       Print("  - CloseMode: ", CloseMode, " (0=basket 1=individual 2=both)");
    }
    Print("Break-Even Protection: ", (UseBreakEven ? "ENABLED" : "DISABLED"));
@@ -951,7 +1116,7 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
-   // Release indicator handles
+   Comment("");  // Clear status on chart
    if(atrHandle != INVALID_HANDLE)
       IndicatorRelease(atrHandle);
    Print("EA stopped. reason=", reason);
@@ -960,13 +1125,53 @@ void OnDeinit(const int reason)
 void OnTick()
 {
    if(!EnsureSymbolReady(TradeSymbol))
+   {
+      ChartStatus("Symbol not ready");
       return;
+   }
+   double point = SymbolInfoDouble(TradeSymbol, SYMBOL_POINT);
+   double spreadPts = (point > 0) ? (SymbolInfoDouble(TradeSymbol, SYMBOL_ASK) - SymbolInfoDouble(TradeSymbol, SYMBOL_BID)) / point : 0;
    if(!SpreadOK(TradeSymbol))
+   {
+      ChartStatus("Spread too high: " + DoubleToString(spreadPts, 0) + " pts (max " + IntegerToString((int)SpreadLimitPoints) + ")");
       return;
+   }
+   
+   UpdateSpreadHistory(TradeSymbol);
 
    double atr = GetATR();
    if(atr <= 0.0)
+   {
+      ChartStatus("ATR not ready");
       return;
+   }
+
+   // Tick Velocity Filter: spike if price moves > threshold in 500ms
+   if(InpTickVelocityThresholdPoints > 0)
+   {
+      double mid = (SymbolInfoDouble(TradeSymbol, SYMBOL_BID) + SymbolInfoDouble(TradeSymbol, SYMBOL_ASK)) / 2.0;
+      ulong now = GetTickCount64();
+      if(tickVelTime > 0 && (now - tickVelTime) >= 500)
+      {
+         double point = SymbolInfoDouble(TradeSymbol, SYMBOL_POINT);
+         double changePoints = MathAbs(mid - tickVelPrice) / (point > 0 ? point : 0.01);
+         if(changePoints >= InpTickVelocityThresholdPoints)
+         {
+            ChartStatus("TICK VELOCITY SPIKE! " + DoubleToString(changePoints, 0) + " pts - closing & removing EA");
+            Print("Tick Velocity Spike! ", DoubleToString(changePoints, 1), " pts in 500ms - closing and removing EA");
+            CloseBasket(TradeSymbol);
+            ExpertRemove();
+            return;
+         }
+         tickVelPrice = mid;
+         tickVelTime = now;
+      }
+      else if(tickVelTime == 0)
+      {
+         tickVelPrice = mid;
+         tickVelTime = now;
+      }
+   }
 
    int totalTrades = PositionsCount(TradeSymbol) + PendingOrdersCount(TradeSymbol);
    
@@ -997,7 +1202,10 @@ void OnTick()
    // Check trade limit
    int maxForMode = UseLimitOrders ? (MarketOrdersAtExecution + LimitOrderCount) : maxTrades;
    if(totalTrades >= maxForMode)
+   {
+      ChartStatus("Max trades: " + IntegerToString(totalTrades) + "/" + IntegerToString(maxForMode) + "\nSpread: " + DoubleToString(spreadPts, 0) + " pts");
       return;
+   }
    
    // Momentum Breakout Entry - Simple and effective for scalping
    int entryDirection = DetectMomentumBreakout(TradeSymbol, atr);
@@ -1026,99 +1234,105 @@ void OnTick()
       lastMomentumLog = TimeCurrent();
    }
    
-   // Open trade if momentum breakout detected
+   // Open trade if momentum breakout detected (1 trade per tick - staggered entry)
    if(entryDirection != 0)
    {
-      // Same-direction rule: do not add opposite direction to basket
-      int basketDir = GetBasketDirection(TradeSymbol);
+      // Same-direction rule: no mixed BUY/SELL (positions or pendings)
+      int basketDir = GetBasketOrPendingDirection(TradeSymbol);
       if(basketDir != 0 && entryDirection != basketDir)
+      {
+         ChartStatus("Signal " + (entryDirection > 0 ? "BUY" : "SELL") + " but basket is " + (basketDir > 0 ? "BUY" : "SELL") + "\nSpread: " + DoubleToString(spreadPts, 0) + " pts");
          return;
+      }
       
+      int posCount = PositionsCount(TradeSymbol);
       int pendingCount = PendingOrdersCount(TradeSymbol);
       
+      // Cancel pendings on direction change (after min hold) or timeout (not filled)
+      if(pendingCount > 0)
+      {
+         int pendingDir = GetPendingOrdersDirection(TradeSymbol);
+         datetime oldestPending = GetOldestPendingOrderTime(TradeSymbol);
+         int pendingAgeSec = (int)(TimeCurrent() - oldestPending);
+         bool cancelOnDirection = (pendingDir != 0 && entryDirection != pendingDir && pendingAgeSec >= MinPendingHoldSeconds);
+         bool cancelOnTimeout = (pendingAgeSec >= PendingOrderTimeoutSeconds);
+         if(cancelOnDirection || cancelOnTimeout)
+         {
+            DeletePendingOrdersOnly(TradeSymbol);
+            ChartStatus("Cancelled pendings (direction/timeout)\nSpread: " + DoubleToString(spreadPts, 0) + " pts");
+            return;
+         }
+      }
+      
+      // Staggered: min seconds between each new trade
+      if(TimeCurrent() - lastTradeOpenTime < MinSecondsBetweenTrades)
+      {
+         ChartStatus("Cooldown: " + IntegerToString(MinSecondsBetweenTrades - (int)(TimeCurrent() - lastTradeOpenTime)) + "s left\nSignal: " + (entryDirection > 0 ? "BUY" : "SELL") + " | Spread: " + DoubleToString(spreadPts, 0) + " pts");
+         return;
+      }
+      if(TimeCurrent() - lastEntryTime < MinSecondsBetweenEntries)
+      {
+         ChartStatus("Entry cooldown\nSpread: " + DoubleToString(spreadPts, 0) + " pts");
+         return;
+      }
+      if(OneEntryPerBar)
+      {
+         datetime barTime = iTime(TradeSymbol, MomentumTF, 0);
+         if(lastEntryBar == barTime)
+         {
+            ChartStatus("One entry per bar - wait for new bar\nSignal: " + (entryDirection > 0 ? "BUY" : "SELL") + " | Spread: " + DoubleToString(spreadPts, 0) + " pts");
+            return;
+         }
+      }
+      
+      if(totalTrades >= maxForMode)
+      {
+         ChartStatus("Max trades: " + IntegerToString(totalTrades) + "/" + IntegerToString(maxForMode) + "\nSpread: " + DoubleToString(spreadPts, 0) + " pts");
+         return;
+      }
+      
+      // Institutional timing: only trade 07:00-20:00 broker time
+      MqlDateTime dt;
+      TimeToStruct(TimeCurrent(), dt);
+      int hour = dt.hour;
+      if(hour < TradingStartHour || hour >= TradingEndHour)
+      {
+         ChartStatus("Outside hours: " + IntegerToString(hour) + ":00 (trade " + IntegerToString(TradingStartHour) + "-" + IntegerToString(TradingEndHour) + ")\nSignal: " + (entryDirection > 0 ? "BUY" : "SELL") + " | Spread: " + DoubleToString(spreadPts, 0) + " pts");
+         return;
+      }
+      
+      bool opened = false;
       if(UseLimitOrders)
       {
-         // Cancel pendings on direction change (after min hold) or timeout (not filled)
-         if(pendingCount > 0)
+         // Markets first (1 per tick), then limits (1 per tick)
+         if(posCount < MarketOrdersAtExecution)
          {
-            int pendingDir = GetPendingOrdersDirection(TradeSymbol);
-            datetime oldestPending = GetOldestPendingOrderTime(TradeSymbol);
-            int pendingAgeSec = (int)(TimeCurrent() - oldestPending);
-            bool cancelOnDirection = (pendingDir != 0 && entryDirection != pendingDir && pendingAgeSec >= MinPendingHoldSeconds);
-            bool cancelOnTimeout = (pendingAgeSec >= PendingOrderTimeoutSeconds);
-            if(cancelOnDirection || cancelOnTimeout)
-            {
-               DeletePendingOrdersOnly(TradeSymbol);
-               return;
-            }
-            return;  // Place only when no pendings (avoid duplicates)
+            opened = OpenMarket(TradeSymbol, entryDirection, atr);
          }
-         // Entry cooldown
-         if(TimeCurrent() - lastEntryTime < MinSecondsBetweenEntries)
-            return;
-         if(OneEntryPerBar)
+         else if(pendingCount < LimitOrderCount)
          {
-            datetime barTime = iTime(TradeSymbol, MomentumTF, 0);
-            if(lastEntryBar == barTime)
-               return;
+            opened = PlaceSingleLimitOrder(TradeSymbol, entryDirection, atr);
          }
-         
-         double currentPrice = (SymbolInfoDouble(TradeSymbol, SYMBOL_BID) + SymbolInfoDouble(TradeSymbol, SYMBOL_ASK)) / 2.0;
-         Print("Momentum Entry Signal: ", (entryDirection > 0 ? "BUY" : "SELL"),
-               " | Price: ", DoubleToString(currentPrice, 5),
-               " | Opening ", MarketOrdersAtExecution, " market + ", LimitOrderCount, " limit");
-         
-         // 1. Open 2 market orders immediately
-         int marketOpened = 0;
-         for(int m = 0; m < MarketOrdersAtExecution; m++)
-         {
-            int currentTotal = PositionsCount(TradeSymbol) + PendingOrdersCount(TradeSymbol);
-            if(currentTotal >= maxForMode) break;
-            if(OpenMarket(TradeSymbol, entryDirection, atr))
-               marketOpened++;
-         }
-         
-         // 2. Place 5 limit orders
-         bool limitsOk = PlaceLimitOrders(TradeSymbol, entryDirection, atr);
-         
-         if(marketOpened > 0 || limitsOk)
-         {
-            lastEntryTime = TimeCurrent();
-            if(OneEntryPerBar)
-               lastEntryBar = iTime(TradeSymbol, MomentumTF, 0);
-            Print("✓ Opened ", marketOpened, " market + ", (limitsOk ? LimitOrderCount : 0), " limits");
-         }
-         else
-            Print("✗ Failed to place orders.");
       }
       else
       {
-         // Market order path
-         if(TimeCurrent() - lastEntryTime < MinSecondsBetweenEntries)
-            return;
-         if(OneEntryPerBar)
-         {
-            datetime barTime = iTime(TradeSymbol, MomentumTF, 0);
-            if(lastEntryBar == barTime)
-               return;
-         }
-         
-         double currentPrice = (SymbolInfoDouble(TradeSymbol, SYMBOL_BID) + SymbolInfoDouble(TradeSymbol, SYMBOL_ASK)) / 2.0;
-         Print("Momentum Breakout Entry Signal: ", (entryDirection > 0 ? "BUY" : "SELL"),
-               " | Current Price: ", DoubleToString(currentPrice, 5),
-               " | Total trades: ", totalTrades, "/", maxTrades);
-         
-         if(OpenMarket(TradeSymbol, entryDirection, atr))
-         {
-            lastEntryTime = TimeCurrent();
-            if(OneEntryPerBar)
-               lastEntryBar = iTime(TradeSymbol, MomentumTF, 0);
-            Print("✓ Trade opened successfully");
-         }
-         else
-            Print("✗ Failed to open trade.");
+         opened = OpenMarket(TradeSymbol, entryDirection, atr);
       }
+      
+      if(opened)
+      {
+         lastTradeOpenTime = TimeCurrent();
+         lastEntryTime = TimeCurrent();
+         if(OneEntryPerBar)
+            lastEntryBar = iTime(TradeSymbol, MomentumTF, 0);
+         Print("✓ Staggered entry: 1 trade opened | Total: ", (posCount + pendingCount + 1), "/", maxForMode);
+         ChartStatus("Opened " + (entryDirection > 0 ? "BUY" : "SELL") + " | Total: " + IntegerToString(posCount + pendingCount + 1) + "/" + IntegerToString(maxForMode) + "\nSpread: " + DoubleToString(spreadPts, 0) + " pts");
+      }
+      else
+         ChartStatus("Failed to open " + (entryDirection > 0 ? "BUY" : "SELL") + " (check logs)\nSpread: " + DoubleToString(spreadPts, 0) + " pts");
    }
+   else
+      ChartStatus("Waiting for signal\nSpread: " + DoubleToString(spreadPts, 0) + " pts | Trades: " + IntegerToString(totalTrades) + "/" + IntegerToString(maxForMode));
 }
 
 // Safety: clean up dangling pendings on stop

@@ -1,64 +1,67 @@
-#property copyright "Copyright 2025, Hyperactive HFT MT5 Scalper"
+#property copyright "Copyright 2025, Hyperactive HFT MT5 Scalper FTMO"
 #property link      "https://www.mcgibsdigitalsolutions.com"
-#property version   "2.00"
+#property version   "3.10"
 
 #include <Trade/Trade.mqh>
 
 CTrade trade;
 
 // =====================================================================================================
-// HYPERACTIVE HFT MT5 SCALPER
-// Strategy: Ultra-fast momentum breakout scalping
-// - One trade at a time
-// - Dynamic profit exit (close immediately when profit, hold up to 20 seconds)
-// - Loss protection (max 100 points, close after 10 seconds if losing)
-// - Momentum breakout entry
-// - Fast execution (quick open/close)
-// - Dynamic or fixed lot sizing
-// - Multi-instrument support
+// HYPERACTIVE HFT MT5 SCALPER - FTMO EDITION (Optimized for 8% Daily Profit)
+// Strategy: FULLY REVERSED - Mean reversion scalping (counter-trend)
+// - REVERSED SIGNALS: Bullish patterns -> SELL, Bearish patterns -> BUY
+// - REVERSED ENTRIES: Enter on pullbacks/retracements instead of breakouts
+// - REVERSED EXITS: Close losers quickly (3s), let winners run longer
+// - Maximum 10 simultaneous trades (progressive reduction as approaching 8%)
+// - 5-second time-based exit (extended for very profitable trades)
+// - 2% capital-based stop loss (FTMO requirement)
+// - Progressive risk management (0.05-0.08% per trade)
+// - Conservative lot scaling after wins (1.1x-1.2x multiplier)
+// - 8% daily profit target
 // =====================================================================================================
 
 // ===== Core Trading Settings =====
 input group "===== Core Trading Settings ====="
 input int      MagicNumber         = 202510;
 input string   TradeSymbol         = "";      // Symbol to trade (empty = current chart symbol)
-input bool     UseFixedLot         = true;     // Use fixed lot size (false = dynamic)
-input double   FixedLotSize        = 0.1;      // Fixed lot size (if UseFixedLot = true)
-input double   DynamicLotBase     = 0.05;     // Base lot for dynamic sizing
-input double   DynamicLotMultiplier = 1.2;    // Multiplier for dynamic lot (based on balance)
-input double   MaxLotSize          = 1.00;     // Maximum lot size (safety limit)
-input double   MinLotSize          = 0.01;     // Minimum lot size (safety limit)
+input int      MaxSimultaneousTrades = 10;    // Maximum simultaneous trades (FTMO: 10 max)
+input int      TimeBasedExitSeconds = 5;      // Base exit time in seconds
+input double   BaseRiskPercentPerTrade = 0.05; // Base risk % per trade
+input double   StopLossPercentCapital = 2.0;  // Stop loss as % of capital (FTMO: 2%)
+input double   DailyProfitTargetPercent = 8.0; // Daily profit target % (8% for FTMO)
 
 // ===== Entry Settings =====
-input group "===== Momentum Breakout Entry ====="
-input int      MomentumPeriod      = 18;       // Period for momentum calculation (ticks) - Reduced from 30 for more opportunities
-input double   BreakoutThreshold   = 0.00035;  // Minimum price movement for breakout (reduced for more entries)
-input int      MinTickSpeed        = 3;        // Minimum ticks per second for entry (reduced from 5)
-input bool     UseTickSpeedFilter  = true;     // Enable tick speed filter
-input double   StrongBreakoutMultiplier = 1.8; // Enter immediately if breakout >= threshold * multiplier (bypass pullback)
+input group "===== Price Action Entry (Selective) ====="
+input double   PriceVelocityThreshold = 4.5;    // Minimum points/second (increased for quality)
+input int      SwingPeriod           = 20;      // Period for swing high/low detection
+input double   ConsolidationMaxSpread = 1.5;    // Maximum spread for consolidation (tightened)
+input double   BreakoutMinPoints     = 4.0;     // Minimum points beyond break (increased)
+input int      MinTickSpeed          = 5;       // Minimum ticks per second
+input int      EntryCooldownSeconds  = 1;       // Seconds between entries
 
-// ===== Exit Settings =====
-input group "===== Profit Exit Settings ====="
-input double   MinProfitPoints     = 10.0;     // Minimum profit in points to exit
-input int      MaxProfitHoldSeconds = 200;     // Maximum seconds to hold profitable trade
-input bool     ExitImmediatelyOnProfit = true; // Exit immediately when profit target reached
+// ===== Entry Quality Filters =====
+input group "===== Entry Quality Filters ====="
+input double   MinVolatilityForEntry = 1.2;     // Minimum volatility (increased for quality)
+input double   MaxSpreadForEntry     = 10.0;    // Maximum spread in points
+input int      LossCooldownSeconds   = 2;       // Seconds to wait after closing at loss
+input double   MinPatternScore       = 60.0;    // Minimum pattern quality score (0-100)
+input bool     RequireMultiPatternConfirmation = false; // Require 2+ patterns to agree
 
-input group "===== Loss Protection Settings ====="
-input double   MaxLossPoints       = 250.0;    // Maximum loss in points (stop loss) - Reduced from 100
-input int      MaxLossHoldSeconds  = 100;      // Close losing trade after N seconds
-input bool     UseTimeBasedLossExit = true;    // Enable time-based loss exit
+// ===== Extended Exit Settings =====
+input group "===== Extended Exit Settings ====="
+input double   ExtendedExitProfitPips = 100.0;  // Profit threshold for extended exit (pips)
+input int      ExtendedExitSeconds = 12;        // Extended exit time for profitable trades (seconds)
+input double   VeryProfitablePips = 200.0;      // Very profitable threshold (pips)
+input int      VeryProfitableExitSeconds = 18;  // Exit time for very profitable trades
 
-// ===== Stop Loss Settings =====
-input group "===== Stop Loss Settings ====="
-input bool     UseStopLoss         = false;    // Use hard stop loss
-input double   StopLossPoints      = 250.0;    // Stop loss in points (if UseStopLoss = true) - Reduced from 100
-input bool     UseTrailingStop     = true;     // Use trailing stop loss
-input double   TrailingStartPoints = 44.0;     // Start trailing after X points profit
-input double   TrailingStepPoints  = 10.0;     // Trailing step in points (tighter for HFT)
+// ===== Lot Scaling Settings =====
+input group "===== Lot Scaling After Wins ====="
+input bool     UseLotScaling = true;            // Enable lot scaling after wins
+input double   LotScalingMultiplier = 1.15;     // Lot multiplier per consecutive win (1.15 = 15% increase)
+input double   MaxLotMultiplier = 2.0;          // Maximum lot multiplier cap
 
 // ===== Spread & Slippage =====
 input group "===== Spread & Execution ====="
-input double   MaxSpreadPoints     = 50.0;     // Maximum spread in points
 input int      MaxSlippagePoints   = 10;       // Maximum slippage in points
 input int      OrderRetries        = 3;        // Number of order retries
 
@@ -66,49 +69,13 @@ input int      OrderRetries        = 3;        // Number of order retries
 input group "===== Risk Management ====="
 input double   MaxDrawdownPercent  = 30.0;      // Maximum drawdown % (stop trading)
 input bool     UseDrawdownProtection = true;    // Enable drawdown protection
-input double   DailyProfitTarget   = 0.0;       // Daily profit target (0 = disabled)
+input double   DailyLossLimitPercent = 4.0;    // Daily loss limit % (FTMO: 4%)
+input bool     UseDailyLossLimit   = true;      // Enable daily loss limit
 
-// ===== Session Filter =====
-input group "===== Session Filter ====="
-input bool     UseSessionFilter    = false;     // Enable session filter
-input int      SessionStartHour    = 8;         // Session start hour (GMT)
-input int      SessionEndHour      = 20;        // Session end hour (GMT)
-
-// ===== Pullback Entry Filter =====
-input group "===== Pullback Entry Filter ====="
-input bool     UsePullbackFilter  = true;       // Enable micro-pullback filter
-input double   PullbackPoints     = 1.5;        // Retrace points after breakout (reduced from 2.5 for faster entries)
-input int      PullbackTimeoutSeconds = 6;      // Timeout for pullback wait (reduced from 10 for faster reset)
-
-// ===== Volatility Cycle Filter =====
-input group "===== Volatility Cycle Filter ====="
-input bool     UseVolatilityCycleFilter = true; // Enable volatility cycle filter
-input int      VolatilityCycleSeconds = 2;      // Tick speed must be rising for N seconds (reduced from 4 for more entries)
-
-// ===== Spread Normalized Filter =====
-input group "===== Spread Normalized Filter ====="
-input bool     UseSpreadNormalizedFilter = true; // Enable spread-normalized filter
-input double   SpreadMultiplier = 1.5;           // Block when spread > avg * multiplier
-
-// ===== Liquidity Time Filter =====
-input group "===== Liquidity Time Filter ====="
-input bool     UseLiquidityTimeFilter = true;   // Enable liquidity time filter
-input int      BlockStartHour1 = 22;            // First blocked period start (GMT)
-input int      BlockEndHour1 = 2;               // First blocked period end (GMT)
-input int      BlockStartHour2 = 0;             // Second blocked period start (0 = disabled)
-input int      BlockEndHour2 = 0;               // Second blocked period end
-
-// ===== Dynamic Breakeven =====
-input group "===== Dynamic Breakeven ====="
-input bool     UseDynamicBreakeven = true;      // Enable dynamic breakeven
-input double   BreakevenTriggerPoints = 2.0;    // Move SL when profit > X points
-input double   BreakevenOffsetPoints = 2.0;     // Move SL to entry - X points
-
-// ===== Partial Exit =====
-input group "===== Partial Exit ====="
-input bool     UsePartialExit = true;           // Enable partial exit
-input double   PartialExitProfitPoints = 30.0; // Close 50% at X points profit
-input double   PartialExitPercent = 50.0;      // Percentage to close (50% = half position)
+// ===== Profit Targets =====
+input group "===== Profit Targets ====="
+input double   IndividualProfitTargetPips = 500.0; // Individual profit target in pips
+input bool     UseProfitTarget     = true;      // Enable individual profit target
 
 // =====================================================================================================
 // STRUCTURES & GLOBALS
@@ -120,31 +87,35 @@ struct TradeInfo {
    datetime openTime;
    int      direction;  // 1=BUY, -1=SELL
    double   lotSize;
-   double   highestProfitPoints;  // Track highest profit for trailing
-   bool     wasProfitable;  // Track if trade was ever profitable
-   bool     breakevenMoved;  // Track if breakeven has been moved
-   bool     partialExitDone; // Track if partial exit has been executed
+   double   stopLoss;   // Stop loss price (FTMO requirement)
 };
 
-TradeInfo currentTrade;
-bool hasActiveTrade = false;
+TradeInfo activeTrades[10];  // Maximum 10 trades
+int activeTradeCount = 0;
 
-// Tick tracking for momentum
-double tickPrices[50];
-datetime tickTimes[50];
-int tickIndex = 0;
-bool tickBufferReady = false;
+// Time-based price tracking structure
+struct PricePoint {
+   double price;
+   datetime time;
+};
 
-// Momentum tracking
-double lastBid = 0.0;
-double lastAsk = 0.0;
-int momentumDirection = 0;  // 1=bullish, -1=bearish, 0=neutral
-int consecutiveMomentumTicks = 0;
+PricePoint priceHistory[100];
+int priceHistoryCount = 0;
+double tickPrices[20];
+datetime lastTickTime;
+double currentTicksPerSecond = 0;
+int tickCounter = 0;
+double currentVolatility = 0.0;
 
-// Tick speed tracking
-int tickCountInWindow = 0;
-datetime lastTickSpeedCheck = 0;
-double ticksPerSecond = 0.0;
+int basketDirection = 0;
+datetime lastEntryTime = 0;
+datetime lastBasketCloseTime = 0;
+double lastBasketCloseProfit = 0.0;
+
+// Consecutive win tracking for lot scaling
+int consecutiveWins = 0;
+double recentTradeProfits[10];
+int recentTradeIndex = 0;
 
 // Market data
 string tradeSymbol = "";
@@ -159,26 +130,11 @@ double currentSpread = 0.0;
 double initialBalance = 0.0;
 double highestBalance = 0.0;
 double dailyProfit = 0.0;
+double dailyLoss = 0.0;
+double dailyStartBalance = 0.0;
+double dailyProfitTarget = 0.0;  // 8% target in dollars
 datetime lastDayReset = 0;
 bool tradingStopped = false;
-
-// Pullback tracking
-double breakoutPeakPrice = 0.0;
-bool breakoutDetected = false;
-int breakoutDirection = 0;
-datetime breakoutTime = 0;
-
-// Volatility cycle tracking
-double tickSpeedHistory[10];
-datetime tickSpeedHistoryTime[10];
-int tickSpeedHistoryIndex = 0;
-int tickSpeedHistoryCount = 0;
-
-// Spread history
-double spreadHistory[100];
-int spreadHistoryIndex = 0;
-int spreadHistoryCount = 0;
-double averageSpread = 0.0;
 
 // =====================================================================================================
 // INITIALIZATION
@@ -187,13 +143,13 @@ double averageSpread = 0.0;
 int OnInit()
 {
    Print("========================================");
-   Print("Hyperactive HFT MT5 Scalper V2.00");
-   Print("Ultra-fast momentum breakout scalping with advanced filters");
+   Print("Hyperactive HFT MT5 Scalper FTMO V3.10");
+   Print("Optimized for 8% Daily Profit Target");
    Print("========================================");
    
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(MaxSlippagePoints);
-   trade.SetTypeFilling(ORDER_FILLING_FOK);  // Fast execution
+   trade.SetTypeFilling(ORDER_FILLING_FOK);
    
    // Determine trade symbol
    if(TradeSymbol == "" || TradeSymbol == NULL)
@@ -214,60 +170,40 @@ int OnInit()
       point *= 10.0;
    
    // Initialize trading state
-   hasActiveTrade = false;
-   currentTrade.ticket = 0;
+   activeTradeCount = 0;
+   for(int i = 0; i < 10; i++)
+      activeTrades[i].ticket = 0;
    
    // Initialize risk management
    initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    highestBalance = initialBalance;
    dailyProfit = 0.0;
+   dailyLoss = 0.0;
+   dailyStartBalance = initialBalance;
+   dailyProfitTarget = dailyStartBalance * (DailyProfitTargetPercent / 100.0);
    lastDayReset = TimeCurrent();
    tradingStopped = false;
    
-   // Initialize arrays
-   for(int i = 0; i < 50; i++)
-   {
-      tickPrices[i] = 0.0;
-      tickTimes[i] = 0;
-   }
+   // Initialize price tracking
+   priceHistoryCount = 0;
+   tickCounter = 0;
+   lastTickTime = TimeCurrent();
+   basketDirection = 0;
+   lastEntryTime = 0;
    
-   tickIndex = 0;
-   tickBufferReady = false;
-   lastBid = 0.0;
-   lastAsk = 0.0;
-   momentumDirection = 0;
-   consecutiveMomentumTicks = 0;
+   // Initialize consecutive win tracking
+   consecutiveWins = 0;
+   ArrayInitialize(recentTradeProfits, 0.0);
+   recentTradeIndex = 0;
    
-   // Initialize pullback tracking
-   breakoutPeakPrice = 0.0;
-   breakoutDetected = false;
-   breakoutDirection = 0;
-   breakoutTime = 0;
-   
-   // Initialize volatility cycle tracking
-   for(int i = 0; i < 10; i++)
-   {
-      tickSpeedHistory[i] = 0.0;
-      tickSpeedHistoryTime[i] = 0;
-   }
-   tickSpeedHistoryIndex = 0;
-   tickSpeedHistoryCount = 0;
-   
-   // Initialize spread history
-   for(int i = 0; i < 100; i++)
-   {
-      spreadHistory[i] = 0.0;
-   }
-   spreadHistoryIndex = 0;
-   spreadHistoryCount = 0;
-   averageSpread = 0.0;
+   // Sync with existing positions
+   SyncWithExistingPositions();
    
    Print("Trade Symbol: ", tradeSymbol);
-   Print("Lot Mode: ", (UseFixedLot ? "FIXED" : "DYNAMIC"));
-   Print("Fixed Lot: ", FixedLotSize);
-   Print("Max Loss Points: ", MaxLossPoints);
-   Print("Max Loss Hold: ", MaxLossHoldSeconds, " seconds");
-   Print("Max Profit Hold: ", MaxProfitHoldSeconds, " seconds");
+   Print("Max Simultaneous Trades: ", MaxSimultaneousTrades);
+   Print("Daily Profit Target: ", DoubleToString(DailyProfitTargetPercent, 1), "% ($", DoubleToString(dailyProfitTarget, 2), ")");
+   Print("Base Risk Per Trade: ", DoubleToString(BaseRiskPercentPerTrade, 2), "%");
+   Print("Stop Loss: ", StopLossPercentCapital, "% of capital");
    Print("========================================");
    
    return(INIT_SUCCEEDED);
@@ -275,7 +211,7 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
-   Print("Hyperactive HFT MT5 Scalper deinitialized. Reason: ", reason);
+   Print("Hyperactive HFT MT5 Scalper FTMO deinitialized. Reason: ", reason);
 }
 
 // =====================================================================================================
@@ -284,17 +220,10 @@ void OnDeinit(const int reason)
 
 void OnTick()
 {
-   // Update market data
    if(!UpdateMarketData())
       return;
    
-   // Update tick buffers
-   UpdateTickBuffers();
-   
-   // Calculate tick speed
-   CalculateTickSpeed();
-   
-   // Check risk management
+   UpdateVelocity();
    CheckRiskManagement();
    
    if(tradingStopped)
@@ -303,32 +232,32 @@ void OnTick()
       return;
    }
    
-   // Manage active trade
-   if(hasActiveTrade)
-   {
-      ManageTrade();
-   }
+   // Manage exits
+   ManageActiveExits();
    
-   // Look for new entry if no active trade
-   if(!hasActiveTrade && !tradingStopped)
+   // Look for new entries
+   int currentMaxTrades = CalculateProgressiveMaxTrades();
+   if(!tradingStopped && activeTradeCount < currentMaxTrades)
    {
-      int direction = GetMomentumBreakoutSignal();
-      
-      if(direction != 0)
+      if(TimeCurrent() - lastEntryTime >= EntryCooldownSeconds)
       {
-         if(ShouldOpenTrade(direction))
+         int signal = GetHFTMove();
+         if(signal != 0)
          {
-            OpenTrade(direction);
+            if(basketDirection == 0 || signal == basketDirection)
+            {
+               if(OpenTrade(signal))
+                  lastEntryTime = TimeCurrent();
+            }
          }
       }
    }
    
-   // Update display
    UpdateDisplay();
 }
 
 // =====================================================================================================
-// MARKET DATA & TICK TRACKING
+// MARKET DATA & VELOCITY TRACKING
 // =====================================================================================================
 
 bool UpdateMarketData()
@@ -343,246 +272,350 @@ bool UpdateMarketData()
    return (currentBid > 0.0 && currentAsk > 0.0);
 }
 
-void UpdateTickBuffers()
+void UpdateVelocity()
 {
-   double midPrice = (currentBid + currentAsk) / 2.0;
+   tickCounter++;
    datetime now = TimeCurrent();
-   
-   // Shift tick buffer (ring buffer)
-   for(int i = 49; i > 0; i--)
+   if(now > lastTickTime)
    {
+      currentTicksPerSecond = tickCounter;
+      tickCounter = 0;
+      lastTickTime = now;
+   }
+   
+   for(int i = 19; i > 0; i--)
       tickPrices[i] = tickPrices[i-1];
-      tickTimes[i] = tickTimes[i-1];
-   }
+   tickPrices[0] = currentBid;
    
-   tickPrices[0] = midPrice;
-   tickTimes[0] = now;
+   double midPrice = (currentBid + currentAsk) / 2.0;
    
-   tickIndex++;
-   if(tickIndex >= MomentumPeriod)
-      tickBufferReady = true;
-   
-   // Update momentum direction
-   if(lastBid > 0.0 && lastAsk > 0.0)
+   if(priceHistoryCount < 100)
    {
-      if(currentBid > lastBid)
-      {
-         if(momentumDirection == 1)
-            consecutiveMomentumTicks++;
-         else
-         {
-            momentumDirection = 1;
-            consecutiveMomentumTicks = 1;
-         }
-      }
-      else if(currentBid < lastBid)
-      {
-         if(momentumDirection == -1)
-            consecutiveMomentumTicks++;
-         else
-         {
-            momentumDirection = -1;
-            consecutiveMomentumTicks = 1;
-         }
-      }
-      else
-      {
-         // Price unchanged, maintain momentum but don't increment
-      }
+      priceHistory[priceHistoryCount].price = midPrice;
+      priceHistory[priceHistoryCount].time = now;
+      priceHistoryCount++;
+   }
+   else
+   {
+      for(int i = 0; i < 99; i++)
+         priceHistory[i] = priceHistory[i+1];
+      priceHistory[99].price = midPrice;
+      priceHistory[99].time = now;
    }
    
-   lastBid = currentBid;
-   lastAsk = currentAsk;
-   
-   // Update spread history
-   UpdateSpreadHistory();
+   CleanOldPriceHistory(now);
+   UpdateVolatility();
 }
 
-void CalculateTickSpeed()
+void CleanOldPriceHistory(datetime currentTime)
 {
-   datetime now = TimeCurrent();
-   
-   if(lastTickSpeedCheck == 0)
+   int writeIndex = 0;
+   for(int i = 0; i < priceHistoryCount; i++)
    {
-      lastTickSpeedCheck = now;
-      tickCountInWindow = 0;
-      return;
+      if(currentTime - priceHistory[i].time <= 10)
+      {
+         if(writeIndex != i)
+            priceHistory[writeIndex] = priceHistory[i];
+         writeIndex++;
+      }
+   }
+   priceHistoryCount = writeIndex;
+}
+
+void UpdateVolatility()
+{
+   if(SwingPeriod < 2) return;
+   
+   double minPrice = tickPrices[0];
+   double maxPrice = tickPrices[0];
+   
+   int checkPeriod = MathMin(SwingPeriod, 20);
+   for(int i = 0; i < checkPeriod && i < 20; i++)
+   {
+      if(tickPrices[i] < minPrice) minPrice = tickPrices[i];
+      if(tickPrices[i] > maxPrice) maxPrice = tickPrices[i];
    }
    
-   tickCountInWindow++;
-   
-   int elapsedSeconds = (int)(now - lastTickSpeedCheck);
-   if(elapsedSeconds >= 1)
-   {
-      ticksPerSecond = (double)tickCountInWindow / (double)elapsedSeconds;
-      
-      // Store tick speed in history for volatility cycle filter
-      if(tickSpeedHistoryCount < 10)
-      {
-         tickSpeedHistory[tickSpeedHistoryCount] = ticksPerSecond;
-         tickSpeedHistoryTime[tickSpeedHistoryCount] = now;
-         tickSpeedHistoryCount++;
-      }
-      else
-      {
-         // Shift array (ring buffer)
-         for(int i = 0; i < 9; i++)
-         {
-            tickSpeedHistory[i] = tickSpeedHistory[i+1];
-            tickSpeedHistoryTime[i] = tickSpeedHistoryTime[i+1];
-         }
-         tickSpeedHistory[9] = ticksPerSecond;
-         tickSpeedHistoryTime[9] = now;
-      }
-      
-      tickCountInWindow = 0;
-      lastTickSpeedCheck = now;
-   }
+   currentVolatility = (maxPrice - minPrice) / point;
 }
 
 // =====================================================================================================
-// SPREAD HISTORY TRACKING
+// ENTRY QUALITY FILTERS
 // =====================================================================================================
 
-void UpdateSpreadHistory()
+bool CheckLossCooldown()
 {
-   // Add current spread to history
-   spreadHistory[spreadHistoryIndex] = currentSpread;
-   spreadHistoryIndex = (spreadHistoryIndex + 1) % 100;
-   
-   if(spreadHistoryCount < 100)
-      spreadHistoryCount++;
-   
-   // Calculate average spread
-   if(spreadHistoryCount > 0)
+   if(lastBasketCloseProfit < 0 && lastBasketCloseTime > 0)
    {
-      double sum = 0.0;
-      for(int i = 0; i < spreadHistoryCount; i++)
-      {
-         sum += spreadHistory[i];
-      }
-      averageSpread = sum / spreadHistoryCount;
+      int secondsSinceClose = (int)(TimeCurrent() - lastBasketCloseTime);
+      if(secondsSinceClose < LossCooldownSeconds)
+         return false;
    }
+   return true;
+}
+
+bool CheckVolatilityFilter()
+{
+   // REVERSED: Prefer lower volatility for mean reversion (opposite of breakout strategy)
+   // Allow entry when volatility is moderate (not too high, not too low)
+   double maxVolatility = MinVolatilityForEntry * 2.0;  // Upper limit
+   return (currentVolatility >= MinVolatilityForEntry * 0.5 && currentVolatility <= maxVolatility);
+}
+
+bool CheckSpreadFilter()
+{
+   return (currentSpread <= MaxSpreadForEntry);
 }
 
 // =====================================================================================================
-// VOLATILITY CYCLE FILTER
+// PATTERN SCORING SYSTEM
 // =====================================================================================================
 
-bool CheckVolatilityCycle()
+double CalculatePatternScore(int patternType, double velocity, double volatility)
 {
-   if(!UseVolatilityCycleFilter)
-      return true;  // Filter disabled, allow entry
+   double score = 0.0;
    
-   // In strategy tester, tick speed history might be limited
-   // Allow entry if we don't have enough data yet (more lenient)
-   if(tickSpeedHistoryCount < 2)
-      return true;  // Not enough data yet, allow entry (don't block)
+   // Velocity strength (0-50 points)
+   double velocityRatio = MathAbs(velocity) / PriceVelocityThreshold;
+   score += MathMin(velocityRatio * 25.0, 50.0);
    
-   datetime now = TimeCurrent();
-   
-   // Check if tick speed has been rising for the required duration
-   // Look at tick speeds within the VolatilityCycleSeconds window
-   int validSamples = 0;
-   double previousSpeed = 0.0;
-   bool isRising = true;
-   bool hasRecentData = false;
-   
-   for(int i = tickSpeedHistoryCount - 1; i >= 0; i--)
+   // Volatility bonus (0-25 points)
+   if(volatility > 0)
    {
-      int ageSeconds = (int)(now - tickSpeedHistoryTime[i]);
-      
-      if(ageSeconds <= VolatilityCycleSeconds)
-      {
-         hasRecentData = true;
-         if(validSamples > 0)
-         {
-            // Check if current speed is higher than previous
-            if(tickSpeedHistory[i] <= previousSpeed)
-            {
-               isRising = false;
-               break;
-            }
-         }
-         previousSpeed = tickSpeedHistory[i];
-         validSamples++;
-      }
+      double volatilityBonus = MathMin((volatility / (PriceVelocityThreshold * 2.0)) * 25.0, 25.0);
+      score += volatilityBonus;
    }
    
-   // If we don't have recent data within the window, allow entry (don't block)
-   if(!hasRecentData)
-      return true;
+   // Pattern type bonus (0-25 points)
+   if(patternType == 1)      // Velocity pattern (primary)
+      score += 25.0;
+   else if(patternType == 2) // Consolidation breakout
+      score += 15.0;
+   else if(patternType == 3) // Swing breakout
+      score += 10.0;
    
-   // Need at least 2 samples showing rising trend, OR if tick speed is stable/acceptable
-   // More lenient: allow if speed is not declining significantly
-   if(validSamples >= 2)
-   {
-      // Check if speed is rising OR at least stable (not declining)
-      if(isRising)
-         return true;
-      
-      // Allow if speed is stable (not declining more than 20%)
-      if(validSamples >= 2 && tickSpeedHistory[tickSpeedHistoryCount - 1] >= (previousSpeed * 0.8))
-         return true;
-   }
-   
-   // If we have some data but not enough for rising trend, be lenient
-   if(validSamples >= 1 && ticksPerSecond >= MinTickSpeed)
-      return true;
-   
-   return false;
+   return MathMin(score, 100.0);
 }
 
 // =====================================================================================================
-// LIQUIDITY TIME FILTER
+// ENTRY LOGIC - PRICE ACTION PATTERNS
 // =====================================================================================================
 
-bool CheckLiquidityTime()
+int GetHFTMove()
 {
-   if(!UseLiquidityTimeFilter)
-      return true;  // Filter disabled, allow trading
+   if(currentTicksPerSecond < MinTickSpeed) return 0;
+   if(priceHistoryCount < 3) return 0;
    
-   MqlDateTime dt;
-   TimeToStruct(TimeCurrent(), dt);
-   int currentHour = dt.hour;
+   if(!CheckLossCooldown()) return 0;
+   if(!CheckSpreadFilter()) return 0;
+   if(!CheckVolatilityFilter()) return 0;
    
-   // Check first blocked period (handles wraparound)
-   if(BlockStartHour1 != BlockEndHour1)
+   datetime currentTime = TimeCurrent();
+   double currentPrice = priceHistory[priceHistoryCount-1].price;
+   
+   int signal1 = 0, signal2 = 0, signal3 = 0;
+   double score1 = 0.0, score2 = 0.0, score3 = 0.0;
+   
+   // Pattern 1: Price Velocity
+   signal1 = CheckPriceVelocity(currentPrice, currentTime);
+   if(signal1 != 0)
    {
-      bool inBlock1 = false;
-      if(BlockStartHour1 < BlockEndHour1)
-      {
-         // Normal case: 8-20 (8 to 20)
-         inBlock1 = (currentHour >= BlockStartHour1 && currentHour < BlockEndHour1);
-      }
-      else
-      {
-         // Wraparound case: 22-2 (22 to 2 next day)
-         inBlock1 = (currentHour >= BlockStartHour1 || currentHour < BlockEndHour1);
-      }
-      
-      if(inBlock1)
-         return false;  // Blocked
+      double velocity1s = 0.0;
+      double price1sAgo = GetPriceAtTime(currentTime - 1);
+      if(price1sAgo > 0)
+         velocity1s = (currentPrice - price1sAgo) / point;
+      score1 = CalculatePatternScore(1, velocity1s, currentVolatility);
    }
    
-   // Check second blocked period (if enabled)
-   if(BlockStartHour2 != BlockEndHour2 && BlockStartHour2 != 0)
+   // Pattern 2: Consolidation Breakout
+   signal2 = CheckConsolidationBreakout(currentPrice, currentTime);
+   if(signal2 != 0)
    {
-      bool inBlock2 = false;
-      if(BlockStartHour2 < BlockEndHour2)
-      {
-         inBlock2 = (currentHour >= BlockStartHour2 && currentHour < BlockEndHour2);
-      }
-      else
-      {
-         inBlock2 = (currentHour >= BlockStartHour2 || currentHour < BlockEndHour2);
-      }
-      
-      if(inBlock2)
-         return false;  // Blocked
+      double velocity1s = 0.0;
+      double price1sAgo = GetPriceAtTime(currentTime - 1);
+      if(price1sAgo > 0)
+         velocity1s = (currentPrice - price1sAgo) / point;
+      score2 = CalculatePatternScore(2, velocity1s, currentVolatility);
    }
    
-   return true;  // Not blocked, allow trading
+   // Pattern 3: Swing Breakout
+   signal3 = CheckSwingBreakout(currentPrice, currentTime);
+   if(signal3 != 0)
+   {
+      double velocity1s = 0.0;
+      double price1sAgo = GetPriceAtTime(currentTime - 1);
+      if(price1sAgo > 0)
+         velocity1s = (currentPrice - price1sAgo) / point;
+      score3 = CalculatePatternScore(3, velocity1s, currentVolatility);
+   }
+   
+   // REVERSED STRATEGY: Flip all signals (bullish -> sell, bearish -> buy)
+   // Multi-pattern confirmation
+   if(RequireMultiPatternConfirmation)
+   {
+      int buyVotes = 0, sellVotes = 0;
+      // Reverse: original buy signal (1) becomes sell vote (-1), original sell signal (-1) becomes buy vote (1)
+      if(signal1 == 1 && score1 >= MinPatternScore) sellVotes++;  // Reversed
+      else if(signal1 == -1 && score1 >= MinPatternScore) buyVotes++;  // Reversed
+      if(signal2 == 1 && score2 >= MinPatternScore) sellVotes++;  // Reversed
+      else if(signal2 == -1 && score2 >= MinPatternScore) buyVotes++;  // Reversed
+      if(signal3 == 1 && score3 >= MinPatternScore) sellVotes++;  // Reversed
+      else if(signal3 == -1 && score3 >= MinPatternScore) buyVotes++;  // Reversed
+      
+      if(buyVotes >= 2) return 1;
+      if(sellVotes >= 2) return -1;
+      return 0;
+   }
+   
+   // Return best signal above threshold (reversed)
+   if(signal1 != 0 && score1 >= MinPatternScore) return -signal1;  // Reverse signal
+   if(signal2 != 0 && score2 >= MinPatternScore) return -signal2;  // Reverse signal
+   if(signal3 != 0 && score3 >= MinPatternScore) return -signal3;  // Reverse signal
+   
+   return 0;
+}
+
+int CheckPriceVelocity(double currentPrice, datetime currentTime)
+{
+   if(priceHistoryCount < 3) return 0;
+   
+   double velocity1s = 0.0;
+   double velocity2s = 0.0;
+   
+   double price1sAgo = GetPriceAtTime(currentTime - 1);
+   double price2sAgo = GetPriceAtTime(currentTime - 2);
+   
+   if(price1sAgo > 0)
+      velocity1s = (currentPrice - price1sAgo) / point;
+   if(price2sAgo > 0)
+      velocity2s = (currentPrice - price2sAgo) / (point * 2.0);
+   
+   if(velocity1s >= PriceVelocityThreshold && velocity2s >= PriceVelocityThreshold * 0.7)
+      return 1;
+   if(velocity1s <= -PriceVelocityThreshold && velocity2s <= -PriceVelocityThreshold * 0.7)
+      return -1;
+   
+   return 0;
+}
+
+int CheckConsolidationBreakout(double currentPrice, datetime currentTime)
+{
+   if(priceHistoryCount < SwingPeriod) return 0;
+   
+   double recentHigh = currentPrice;
+   double recentLow = currentPrice;
+   
+   int checkCount = MathMin(SwingPeriod, priceHistoryCount);
+   for(int i = priceHistoryCount - checkCount; i < priceHistoryCount; i++)
+   {
+      if(priceHistory[i].price > recentHigh) recentHigh = priceHistory[i].price;
+      if(priceHistory[i].price < recentLow) recentLow = priceHistory[i].price;
+   }
+   
+   double consolidationSpread = (recentHigh - recentLow) / point;
+   
+   if(consolidationSpread > ConsolidationMaxSpread)
+      return 0;
+   
+   // REVERSED: Enter on pullback instead of breakout
+   // If price was at high but now pulling back, that's a buy signal (mean reversion)
+   // If price was at low but now bouncing up, that's a sell signal (mean reversion)
+   double pullbackThreshold = BreakoutMinPoints * 0.5;  // Smaller threshold for pullbacks
+   
+   // Check if price pulled back from recent high (buy signal - mean reversion)
+   if(currentPrice < recentHigh - (pullbackThreshold * point) && currentPrice > (recentHigh + recentLow) / 2.0)
+      return 1;  // Buy on pullback from high
+   
+   // Check if price bounced from recent low (sell signal - mean reversion)
+   if(currentPrice > recentLow + (pullbackThreshold * point) && currentPrice < (recentHigh + recentLow) / 2.0)
+      return -1;  // Sell on bounce from low
+   
+   return 0;
+}
+
+int CheckSwingBreakout(double currentPrice, datetime currentTime)
+{
+   if(priceHistoryCount < SwingPeriod) return 0;
+   
+   double swingHigh = currentPrice;
+   double swingLow = currentPrice;
+   
+   int checkCount = MathMin(SwingPeriod, priceHistoryCount);
+   for(int i = priceHistoryCount - checkCount; i < priceHistoryCount; i++)
+   {
+      if(priceHistory[i].price > swingHigh) swingHigh = priceHistory[i].price;
+      if(priceHistory[i].price < swingLow) swingLow = priceHistory[i].price;
+   }
+   
+   // REVERSED: Enter on retracement instead of breakout
+   // Mean reversion: buy when price retraces from swing high, sell when bounces from swing low
+   double retracementThreshold = BreakoutMinPoints * 0.6;
+   double swingRange = swingHigh - swingLow;
+   
+   // Buy signal: Price retraced from swing high (mean reversion opportunity)
+   if(swingRange > 0 && currentPrice < swingHigh - (retracementThreshold * point) && 
+      currentPrice > swingLow + (swingRange * 0.3))  // At least 30% retracement but not too deep
+      return 1;
+   
+   // Sell signal: Price bounced from swing low (mean reversion opportunity)
+   if(swingRange > 0 && currentPrice > swingLow + (retracementThreshold * point) && 
+      currentPrice < swingHigh - (swingRange * 0.3))  // At least 30% bounce but not too high
+      return -1;
+   
+   return 0;
+}
+
+double GetPriceAtTime(datetime targetTime)
+{
+   double closestPrice = 0.0;
+   long minTimeDiff = LONG_MAX;
+   
+   for(int i = 0; i < priceHistoryCount; i++)
+   {
+      long timeDiff = MathAbs((long)(priceHistory[i].time - targetTime));
+      if(timeDiff < minTimeDiff)
+      {
+         minTimeDiff = timeDiff;
+         closestPrice = priceHistory[i].price;
+      }
+   }
+   
+   if(minTimeDiff <= 2)
+      return closestPrice;
+   
+   return 0.0;
+}
+
+// =====================================================================================================
+// PROGRESSIVE RISK MANAGEMENT
+// =====================================================================================================
+
+double CalculateProgressiveRisk()
+{
+   double progress = (dailyProfit / dailyProfitTarget) * 100.0;
+   
+   if(progress < 50.0)
+      return BaseRiskPercentPerTrade * 1.6;  // 0.08% (slightly increased)
+   else if(progress < 75.0)
+      return BaseRiskPercentPerTrade * 1.2;  // 0.06%
+   else if(progress < 90.0)
+      return BaseRiskPercentPerTrade;         // 0.05%
+   else
+      return BaseRiskPercentPerTrade * 0.6;  // 0.03% (very conservative near target)
+}
+
+int CalculateProgressiveMaxTrades()
+{
+   double progress = (dailyProfit / dailyProfitTarget) * 100.0;
+   
+   if(progress < 50.0)
+      return MaxSimultaneousTrades;      // 10 trades
+   else if(progress < 75.0)
+      return 7;                          // 7 trades
+   else if(progress < 90.0)
+      return 5;                          // 5 trades
+   else
+      return 3;                          // 3 trades (very conservative)
 }
 
 // =====================================================================================================
@@ -591,7 +624,6 @@ bool CheckLiquidityTime()
 
 void CheckRiskManagement()
 {
-   // Reset daily profit at start of new day
    datetime currentTime = TimeCurrent();
    MqlDateTime dt;
    TimeToStruct(currentTime, dt);
@@ -601,7 +633,37 @@ void CheckRiskManagement()
    if(dt.day != lastDt.day || dt.mon != lastDt.mon || dt.year != lastDt.year)
    {
       dailyProfit = 0.0;
+      dailyLoss = 0.0;
+      dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      dailyProfitTarget = dailyStartBalance * (DailyProfitTargetPercent / 100.0);
       lastDayReset = currentTime;
+      consecutiveWins = 0;  // Reset on new day
+   }
+   
+   double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double dailyChange = currentBalance - dailyStartBalance;
+   if(dailyChange > 0.0)
+   {
+      dailyProfit = dailyChange;
+      dailyLoss = 0.0;
+   }
+   else
+   {
+      dailyProfit = 0.0;
+      dailyLoss = MathAbs(dailyChange);
+   }
+   
+   // Check daily loss limit
+   if(UseDailyLossLimit)
+   {
+      double dailyLossPercent = (dailyLoss / dailyStartBalance) * 100.0;
+      if(dailyLossPercent >= DailyLossLimitPercent)
+      {
+         tradingStopped = true;
+         Print("TRADING STOPPED: Daily loss limit reached: ", DoubleToString(dailyLossPercent, 2), "%");
+         CloseAllTrades();
+         return;
+      }
    }
    
    // Check drawdown
@@ -612,294 +674,99 @@ void CheckRiskManagement()
          highestBalance = currentEquity;
       
       double drawdown = ((highestBalance - currentEquity) / highestBalance) * 100.0;
-      
       if(drawdown >= MaxDrawdownPercent)
       {
          tradingStopped = true;
-         Print("TRADING STOPPED: Drawdown ", DoubleToString(drawdown, 2), "% exceeds limit ", DoubleToString(MaxDrawdownPercent, 1), "%");
-         
-         // Close any open trade
-         if(hasActiveTrade)
-         {
-            CloseTrade("Drawdown limit reached");
-         }
+         Print("TRADING STOPPED: Drawdown ", DoubleToString(drawdown, 2), "%");
+         CloseAllTrades();
       }
    }
    
-   // Check daily profit target
-   if(DailyProfitTarget > 0.0)
+   // Check 8% profit target
+   if(dailyProfit >= dailyProfitTarget)
    {
-      double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-      dailyProfit = currentBalance - initialBalance;
-      
-      if(dailyProfit >= DailyProfitTarget)
-      {
-         tradingStopped = true;
-         Print("TRADING STOPPED: Daily profit target reached: $", DoubleToString(dailyProfit, 2));
-         
-         if(hasActiveTrade)
-         {
-            CloseTrade("Daily profit target reached");
-         }
-      }
+      tradingStopped = true;
+      Print("TRADING STOPPED: 8% Daily profit target reached: $", DoubleToString(dailyProfit, 2));
+      CloseAllTrades();
    }
-}
-
-// =====================================================================================================
-// ENTRY LOGIC - MOMENTUM BREAKOUT
-// =====================================================================================================
-
-int GetMomentumBreakoutSignal()
-{
-   if(!tickBufferReady || tickIndex < MomentumPeriod)
-      return 0;
-   
-   // Check liquidity time filter first
-   if(!CheckLiquidityTime())
-      return 0;
-   
-   // Check session filter
-   if(UseSessionFilter)
-   {
-      MqlDateTime dt;
-      TimeToStruct(TimeCurrent(), dt);
-      int currentHour = dt.hour;
-      
-      if(currentHour < SessionStartHour || currentHour >= SessionEndHour)
-         return 0;
-   }
-   
-   // Check tick speed
-   if(UseTickSpeedFilter && ticksPerSecond < MinTickSpeed)
-      return 0;
-   
-   // Check volatility cycle filter
-   if(!CheckVolatilityCycle())
-      return 0;
-   
-   // Check spread
-   if(currentSpread > MaxSpreadPoints)
-      return 0;
-   
-   double midPrice = (currentBid + currentAsk) / 2.0;
-   
-   // Calculate momentum breakout
-   double priceChange = 0.0;
-   
-   if(tickIndex >= MomentumPeriod)
-   {
-      // Calculate price change over momentum period
-      double oldestPrice = tickPrices[MomentumPeriod - 1];
-      double newestPrice = tickPrices[0];
-      priceChange = newestPrice - oldestPrice;
-      
-      // Check for breakout: strong movement in momentum direction
-      double breakoutThreshold = BreakoutThreshold;
-      
-      if(momentumDirection == 1 && priceChange >= breakoutThreshold)
-      {
-         // Bullish breakout detected
-         if(consecutiveMomentumTicks >= 1)  // Reduced from 2 to 1 for more entries
-         {
-            // Check for strong breakout - enter immediately if momentum is very strong
-            double strongBreakoutThreshold = breakoutThreshold * StrongBreakoutMultiplier;
-            bool isStrongBreakout = (priceChange >= strongBreakoutThreshold && consecutiveMomentumTicks >= 2);
-            
-            if(isStrongBreakout)
-            {
-               // Strong breakout - enter immediately (sniper entry on strong momentum)
-               breakoutDetected = false;  // Reset any pending pullback
-               return 1;  // BUY immediately
-            }
-            
-            if(UsePullbackFilter)
-            {
-               // Track breakout peak
-               if(!breakoutDetected || breakoutDirection != 1)
-               {
-                  breakoutDetected = true;
-                  breakoutDirection = 1;
-                  breakoutPeakPrice = midPrice;
-                  breakoutTime = TimeCurrent();
-                  return 0;  // Wait for pullback
-               }
-               else if(breakoutDirection == 1)
-               {
-                  // Update peak if price goes higher
-                  if(midPrice > breakoutPeakPrice)
-                  {
-                     breakoutPeakPrice = midPrice;
-                     breakoutTime = TimeCurrent();
-                     
-                     // If price continues strongly upward, enter immediately (strong momentum)
-                     double continuedMomentum = midPrice - breakoutPeakPrice;
-                     if(continuedMomentum >= (breakoutThreshold * 0.5))
-                     {
-                        breakoutDetected = false;
-                        return 1;  // BUY - momentum too strong, don't wait for pullback
-                     }
-                     
-                     return 0;  // Still in breakout, wait for pullback
-                  }
-                  
-                  // Check for pullback: price retraced PullbackPoints from peak
-                  double retraceFromPeak = breakoutPeakPrice - midPrice;
-                  if(retraceFromPeak >= (PullbackPoints * point))
-                  {
-                     // Pullback occurred, enter immediately
-                     breakoutDetected = false;  // Reset for next breakout
-                     return 1;  // BUY
-                  }
-                  
-                  return 0;  // Still waiting for pullback
-               }
-            }
-            else
-            {
-               // No pullback filter, enter immediately
-               return 1;  // BUY
-            }
-         }
-      }
-      else if(momentumDirection == -1 && priceChange <= -breakoutThreshold)
-      {
-         // Bearish breakout detected
-         if(consecutiveMomentumTicks >= 1)  // Reduced from 2 to 1 for more entries
-         {
-            // Check for strong breakout - enter immediately if momentum is very strong
-            double strongBreakoutThreshold = breakoutThreshold * StrongBreakoutMultiplier;
-            bool isStrongBreakout = (priceChange <= -strongBreakoutThreshold && consecutiveMomentumTicks >= 2);
-            
-            if(isStrongBreakout)
-            {
-               // Strong breakout - enter immediately (sniper entry on strong momentum)
-               breakoutDetected = false;  // Reset any pending pullback
-               return -1;  // SELL immediately
-            }
-            
-            if(UsePullbackFilter)
-            {
-               // Track breakout peak (lowest point for SELL)
-               if(!breakoutDetected || breakoutDirection != -1)
-               {
-                  breakoutDetected = true;
-                  breakoutDirection = -1;
-                  breakoutPeakPrice = midPrice;
-                  breakoutTime = TimeCurrent();
-                  return 0;  // Wait for pullback
-               }
-               else if(breakoutDirection == -1)
-               {
-                  // Update peak (lowest point) if price goes lower
-                  if(midPrice < breakoutPeakPrice)
-                  {
-                     breakoutPeakPrice = midPrice;
-                     breakoutTime = TimeCurrent();
-                     
-                     // If price continues strongly downward, enter immediately (strong momentum)
-                     double continuedMomentum = breakoutPeakPrice - midPrice;
-                     if(continuedMomentum >= (breakoutThreshold * 0.5))
-                     {
-                        breakoutDetected = false;
-                        return -1;  // SELL - momentum too strong, don't wait for pullback
-                     }
-                     
-                     return 0;  // Still in breakout, wait for pullback
-                  }
-                  
-                  // Check for pullback: price retraced PullbackPoints from peak (lowest point)
-                  double retraceFromPeak = midPrice - breakoutPeakPrice;
-                  if(retraceFromPeak >= (PullbackPoints * point))
-                  {
-                     // Pullback occurred, enter immediately
-                     breakoutDetected = false;  // Reset for next breakout
-                     return -1;  // SELL
-                  }
-                  
-                  return 0;  // Still waiting for pullback
-               }
-            }
-            else
-            {
-               // No pullback filter, enter immediately
-               return -1;  // SELL
-            }
-         }
-      }
-   }
-   
-   // Reset breakout if too much time has passed (timeout) - shorter timeout for faster reset
-   if(breakoutDetected && (TimeCurrent() - breakoutTime) > PullbackTimeoutSeconds)
-   {
-      breakoutDetected = false;
-      breakoutPeakPrice = 0.0;
-      breakoutDirection = 0;
-   }
-   
-   return 0;
-}
-
-bool ShouldOpenTrade(int direction)
-{
-   // Ensure only one trade at a time
-   if(hasActiveTrade)
-      return false;
-   
-   // Check if trading is stopped
-   if(tradingStopped)
-      return false;
-   
-   // Check spread
-   if(currentSpread > MaxSpreadPoints)
-      return false;
-   
-   // Check spread-normalized filter
-   if(UseSpreadNormalizedFilter && averageSpread > 0.0)
-   {
-      if(currentSpread > (averageSpread * SpreadMultiplier))
-         return false;  // Spread too high relative to average
-   }
-   
-   // Check tick speed
-   if(UseTickSpeedFilter && ticksPerSecond < MinTickSpeed)
-      return false;
-   
-   return true;
 }
 
 // =====================================================================================================
 // LOT SIZING
 // =====================================================================================================
 
-double CalculateLotSize()
+double CalculateLotSize(int direction, double entryPrice, double stopLossPrice)
 {
-   double lotSize = 0.0;
+   // Calculate progressive risk
+   double riskPercent = CalculateProgressiveRisk();
    
-   if(UseFixedLot)
+   // Apply lot scaling multiplier if enabled
+   double lotMultiplier = 1.0;
+   if(UseLotScaling && consecutiveWins > 0)
    {
-      lotSize = FixedLotSize;
+      lotMultiplier = MathPow(LotScalingMultiplier, consecutiveWins);
+      if(lotMultiplier > MaxLotMultiplier)
+         lotMultiplier = MaxLotMultiplier;
    }
+   
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskAmount = balance * (riskPercent / 100.0);
+   
+   double slDistance = 0.0;
+   if(direction == 1)
+      slDistance = (entryPrice - stopLossPrice) / point;
    else
+      slDistance = (stopLossPrice - entryPrice) / point;
+   
+   if(slDistance <= 0.0)
+      return 0.0;
+   
+   double tickValue = SymbolInfoDouble(tradeSymbol, SYMBOL_TRADE_TICK_VALUE);
+   if(tickValue <= 0.0)
    {
-      // Dynamic lot sizing based on account balance
-      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-      lotSize = DynamicLotBase * (balance / 1000.0) * DynamicLotMultiplier;
+      double contractSize = SymbolInfoDouble(tradeSymbol, SYMBOL_TRADE_CONTRACT_SIZE);
+      tickValue = contractSize * point;
    }
    
-   // Normalize lot size
+   double lotSize = (riskAmount / (slDistance * tickValue)) * lotMultiplier;
+   
    double lotStep = SymbolInfoDouble(tradeSymbol, SYMBOL_VOLUME_STEP);
    double minLot = SymbolInfoDouble(tradeSymbol, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(tradeSymbol, SYMBOL_VOLUME_MAX);
    
-   // Apply safety limits
-   lotSize = MathMax(MinLotSize, MathMin(MaxLotSize, lotSize));
    lotSize = MathMax(minLot, MathMin(maxLot, lotSize));
    
-   // Round to lot step
    if(lotStep > 0.0)
       lotSize = MathFloor(lotSize / lotStep) * lotStep;
    
    return NormalizeDouble(lotSize, 2);
+}
+
+double CalculateStopLoss(int direction, double entryPrice)
+{
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double slAmount = balance * (StopLossPercentCapital / 100.0);
+   
+   double tickValue = SymbolInfoDouble(tradeSymbol, SYMBOL_TRADE_TICK_VALUE);
+   if(tickValue <= 0.0)
+   {
+      double contractSize = SymbolInfoDouble(tradeSymbol, SYMBOL_TRADE_CONTRACT_SIZE);
+      tickValue = contractSize * point;
+   }
+   
+   double standardLot = 0.01;
+   double slDistancePoints = slAmount / (standardLot * tickValue);
+   
+   if(slDistancePoints < 10.0) slDistancePoints = 10.0;
+   if(slDistancePoints > 500.0) slDistancePoints = 500.0;
+   
+   double sl = 0.0;
+   if(direction == 1)
+      sl = entryPrice - (slDistancePoints * point);
+   else
+      sl = entryPrice + (slDistancePoints * point);
+   
+   return NormalizeDouble(sl, symbolDigits);
 }
 
 // =====================================================================================================
@@ -908,72 +775,53 @@ double CalculateLotSize()
 
 bool OpenTrade(int direction)
 {
-   if(direction == 0)
-      return false;
+   if(direction == 0) return false;
    
-   if(hasActiveTrade)
-      return false;
+   int currentMaxTrades = CalculateProgressiveMaxTrades();
+   if(activeTradeCount >= currentMaxTrades) return false;
    
-   double lotSize = CalculateLotSize();
-   double price = (direction == 1) ? currentAsk : currentBid;
+   double entryPrice = (direction == 1) ? currentAsk : currentBid;
+   double sl = CalculateStopLoss(direction, entryPrice);
+   double lotSize = CalculateLotSize(direction, entryPrice, sl);
    
-   // Calculate stop loss
-   double sl = 0.0;
-   if(UseStopLoss)
-   {
-      if(direction == 1)  // BUY
-         sl = price - (StopLossPoints * point);
-      else  // SELL
-         sl = price + (StopLossPoints * point);
-      
-      sl = NormalizeDouble(sl, symbolDigits);
-   }
+   if(lotSize <= 0.0) return false;
    
-   // No take profit (using dynamic exit)
-   double tp = 0.0;
-   
-   string comment = "HyperHFT_" + (direction == 1 ? "BUY" : "SELL");
-   
-   ENUM_ORDER_TYPE orderType = (direction == 1) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   string comment = "HFT_FTMO_" + (direction == 1 ? "BUY" : "SELL");
    
    bool sent = false;
    int retries = 0;
    
    while(retries < OrderRetries && !sent)
    {
-      if(orderType == ORDER_TYPE_BUY)
-         sent = trade.Buy(lotSize, tradeSymbol, 0.0, sl, tp, comment);
+      if(direction == 1)
+         sent = trade.Buy(lotSize, tradeSymbol, 0.0, sl, 0.0, comment);
       else
-         sent = trade.Sell(lotSize, tradeSymbol, 0.0, sl, tp, comment);
+         sent = trade.Sell(lotSize, tradeSymbol, 0.0, sl, 0.0, comment);
       
       if(!sent)
       {
          retries++;
          if(retries < OrderRetries)
          {
-            Sleep(50);  // Small delay before retry
-            // Update market data before retry
+            Sleep(50);
             SymbolInfoTick(tradeSymbol, currentTick);
             currentBid = currentTick.bid;
             currentAsk = currentTick.ask;
-            price = (direction == 1) ? currentAsk : currentBid;
+            entryPrice = (direction == 1) ? currentAsk : currentBid;
+            sl = CalculateStopLoss(direction, entryPrice);
          }
       }
    }
    
    if(sent)
    {
-      // Get position ticket
       ulong ticket = 0;
       if(trade.ResultDeal() > 0)
       {
          if(HistoryDealSelect(trade.ResultDeal()))
-         {
             ticket = HistoryDealGetInteger(trade.ResultDeal(), DEAL_POSITION_ID);
-         }
       }
       
-      // If still no ticket, find position by symbol and magic
       if(ticket == 0)
       {
          for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -993,276 +841,313 @@ bool OpenTrade(int direction)
       
       if(ticket > 0)
       {
-         double actualEntryPrice = price;
+         double actualEntryPrice = entryPrice;
+         double actualSL = sl;
          if(PositionSelectByTicket(ticket))
          {
             actualEntryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            actualSL = PositionGetDouble(POSITION_SL);
+            
+            if(actualSL == 0.0)
+            {
+               Print("WARNING: Position opened without stop loss! Attempting to set...");
+               trade.PositionModify(ticket, sl, 0.0);
+            }
          }
          
-         currentTrade.ticket = ticket;
-         currentTrade.entryPrice = actualEntryPrice;
-         currentTrade.openTime = TimeCurrent();
-         currentTrade.direction = direction;
-         currentTrade.lotSize = lotSize;
-         currentTrade.highestProfitPoints = 0.0;
-         currentTrade.wasProfitable = false;
-         currentTrade.breakevenMoved = false;
-         currentTrade.partialExitDone = false;
-         hasActiveTrade = true;
+         activeTrades[activeTradeCount].ticket = ticket;
+         activeTrades[activeTradeCount].entryPrice = actualEntryPrice;
+         activeTrades[activeTradeCount].openTime = TimeCurrent();
+         activeTrades[activeTradeCount].direction = direction;
+         activeTrades[activeTradeCount].lotSize = lotSize;
+         activeTrades[activeTradeCount].stopLoss = actualSL;
+         activeTradeCount++;
          
-         // Reset breakout tracking when trade opens
-         breakoutDetected = false;
-         breakoutPeakPrice = 0.0;
-         breakoutDirection = 0;
-         breakoutTime = 0;
+         if(basketDirection == 0)
+            basketDirection = direction;
          
          Print("TRADE OPENED: ", (direction == 1 ? "BUY" : "SELL"), 
-               " | Lot: ", lotSize, " | Price: ", actualEntryPrice, " | SL: ", sl);
+               " | Lot: ", lotSize, " | Price: ", actualEntryPrice, " | SL: ", actualSL);
          return true;
       }
-   }
-   else
-   {
-      Print("Trade open failed: ", trade.ResultRetcode(), " -> ", trade.ResultRetcodeDescription());
    }
    
    return false;
 }
 
 // =====================================================================================================
-// MANAGE TRADE (EXIT LOGIC)
+// MANAGE ACTIVE EXITS
 // =====================================================================================================
 
-void ManageTrade()
+void ManageActiveExits()
 {
-   if(!hasActiveTrade || currentTrade.ticket == 0)
-      return;
+   SyncWithExistingPositions();
    
-   if(!PositionSelectByTicket(currentTrade.ticket))
+   // Remove invalid trades
+   for(int i = activeTradeCount - 1; i >= 0; i--)
    {
-      // Position closed externally
-      hasActiveTrade = false;
-      currentTrade.ticket = 0;
-      return;
-   }
-   
-   // Get current position data
-   double positionProfit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
-   datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
-   int holdSeconds = (int)(TimeCurrent() - openTime);
-   
-   // Calculate profit/loss in points
-   double currentPrice = (currentTrade.direction == 1) ? currentBid : currentAsk;
-   double priceDiff = currentPrice - currentTrade.entryPrice;
-   if(currentTrade.direction == -1)
-      priceDiff = -priceDiff;  // For SELL, reverse the difference
-   
-   double profitPoints = priceDiff / point;
-   double lossPoints = (profitPoints < 0) ? MathAbs(profitPoints) : 0.0;
-   
-   // Update highest profit tracking
-   if(profitPoints > currentTrade.highestProfitPoints)
-   {
-      currentTrade.highestProfitPoints = profitPoints;
-      if(profitPoints > 0.0)
-         currentTrade.wasProfitable = true;
-   }
-   
-   // =====================================================================
-   // EXIT CONDITION 1: Maximum loss points (hard stop)
-   // =====================================================================
-   if(lossPoints >= MaxLossPoints)
-   {
-      CloseTrade("Maximum loss points reached (" + DoubleToString(lossPoints, 1) + " pts)");
-      return;
-   }
-   
-   // =====================================================================
-   // EXIT CONDITION 2: Time-based loss exit (close losing trade after 10 seconds)
-   // =====================================================================
-   if(UseTimeBasedLossExit && positionProfit < 0.0 && holdSeconds >= MaxLossHoldSeconds)
-   {
-      CloseTrade("Loss timeout (" + IntegerToString(holdSeconds) + " seconds)");
-      return;
-   }
-   
-   // =====================================================================
-   // EXIT CONDITION 3: Immediate profit exit
-   // =====================================================================
-   if(ExitImmediatelyOnProfit && positionProfit > 0.0 && profitPoints >= MinProfitPoints)
-   {
-      CloseTrade("Profit target reached (" + DoubleToString(profitPoints, 1) + " pts)");
-      return;
-   }
-   
-   // =====================================================================
-   // EXIT CONDITION 4: Maximum profit hold time (20 seconds)
-   // =====================================================================
-   if(positionProfit > 0.0 && holdSeconds >= MaxProfitHoldSeconds)
-   {
-      CloseTrade("Maximum profit hold time reached (" + IntegerToString(holdSeconds) + " seconds)");
-      return;
-   }
-   
-   // =====================================================================
-   // EXIT CONDITION 5: Dynamic Breakeven
-   // =====================================================================
-   if(UseDynamicBreakeven && !currentTrade.breakevenMoved && profitPoints >= BreakevenTriggerPoints)
-   {
-      MoveToBreakeven();
-   }
-   
-   // =====================================================================
-   // EXIT CONDITION 6: Partial Exit
-   // =====================================================================
-   if(UsePartialExit && !currentTrade.partialExitDone && profitPoints >= PartialExitProfitPoints)
-   {
-      ExecutePartialExit();
-   }
-   
-   // =====================================================================
-   // EXIT CONDITION 7: Trailing stop (if enabled)
-   // =====================================================================
-   if(UseTrailingStop && currentTrade.highestProfitPoints >= TrailingStartPoints)
-   {
-      // Use tighter trailing after partial exit
-      double trailingStep = currentTrade.partialExitDone ? (TrailingStepPoints * 0.5) : TrailingStepPoints;
-      double trailingStopLevel = currentTrade.highestProfitPoints - trailingStep;
-      if(profitPoints < trailingStopLevel)
+      if(!PositionSelectByTicket(activeTrades[i].ticket))
       {
-         CloseTrade("Trailing stop hit");
-         return;
+         double closedProfit = 0.0;
+         datetime closeTime = TimeCurrent();
+         
+         HistorySelect(closeTime - 3600, closeTime);
+         int totalDeals = HistoryDealsTotal();
+         for(int j = totalDeals - 1; j >= 0; j--)
+         {
+            ulong dealTicket = HistoryDealGetTicket(j);
+            if(dealTicket > 0)
+            {
+               if(HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID) == activeTrades[i].ticket &&
+                  HistoryDealGetString(dealTicket, DEAL_SYMBOL) == tradeSymbol &&
+                  HistoryDealGetInteger(dealTicket, DEAL_MAGIC) == MagicNumber)
+               {
+                  if(HistoryDealGetInteger(dealTicket, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+                  {
+                     closedProfit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT) + HistoryDealGetDouble(dealTicket, DEAL_SWAP);
+                     break;
+                  }
+               }
+            }
+         }
+         
+         // Update consecutive wins
+         if(closedProfit > 0.0)
+         {
+            consecutiveWins++;
+            recentTradeProfits[recentTradeIndex] = closedProfit;
+            recentTradeIndex = (recentTradeIndex + 1) % 10;
+         }
+         else if(closedProfit < 0.0)
+         {
+            consecutiveWins = 0;
+         }
+         
+         // Update daily tracking
+         if(closedProfit > 0.0)
+         {
+            dailyProfit += closedProfit;
+            dailyLoss = 0.0;
+         }
+         else if(closedProfit < 0.0)
+         {
+            dailyLoss += MathAbs(closedProfit);
+            dailyProfit = 0.0;
+         }
+         
+         RemoveTrade(i);
+         if(activeTradeCount == 0)
+            basketDirection = 0;
       }
    }
-}
-
-// =====================================================================================================
-// MOVE TO BREAKEVEN
-// =====================================================================================================
-
-void MoveToBreakeven()
-{
-   if(!hasActiveTrade || currentTrade.ticket == 0)
-      return;
    
-   if(!PositionSelectByTicket(currentTrade.ticket))
-      return;
+   if(activeTradeCount == 0) return;
    
-   double newSL = 0.0;
+   datetime currentTime = TimeCurrent();
    
-   if(currentTrade.direction == 1)  // BUY
+   for(int i = activeTradeCount - 1; i >= 0; i--)
    {
-      newSL = currentTrade.entryPrice - (BreakevenOffsetPoints * point);
-   }
-   else  // SELL
-   {
-      newSL = currentTrade.entryPrice + (BreakevenOffsetPoints * point);
-   }
-   
-   newSL = NormalizeDouble(newSL, symbolDigits);
-   
-   double currentSL = PositionGetDouble(POSITION_SL);
-   double currentTP = PositionGetDouble(POSITION_TP);
-   
-   // Only modify if new SL is better than current (closer to entry for profit protection)
-   bool shouldModify = false;
-   if(currentTrade.direction == 1)  // BUY
-   {
-      shouldModify = (currentSL == 0.0 || newSL > currentSL);
-   }
-   else  // SELL
-   {
-      shouldModify = (currentSL == 0.0 || newSL < currentSL);
-   }
-   
-   if(shouldModify)
-   {
-      if(trade.PositionModify(currentTrade.ticket, newSL, currentTP))
+      if(activeTrades[i].ticket > 0 && PositionSelectByTicket(activeTrades[i].ticket))
       {
-         currentTrade.breakevenMoved = true;
-         Print("Breakeven moved: SL set to ", DoubleToString(newSL, symbolDigits), " (entry - ", BreakevenOffsetPoints, " points)");
+         double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+         int holdSeconds = (int)(currentTime - activeTrades[i].openTime);
+         
+         double currentPrice = (activeTrades[i].direction == 1) ? currentBid : currentAsk;
+         double priceDiff = currentPrice - activeTrades[i].entryPrice;
+         if(activeTrades[i].direction == -1)
+            priceDiff = -priceDiff;
+         
+         double profitPoints = priceDiff / point;
+         
+         // Exit condition 1: Profit target
+         if(UseProfitTarget && profitPoints >= IndividualProfitTargetPips)
+         {
+            if(trade.PositionClose(activeTrades[i].ticket))
+            {
+               Print("TRADE CLOSED (Profit Target): ", profitPoints, " pips | P&L: $", DoubleToString(profit, 2));
+               
+               if(profit > 0.0)
+               {
+                  consecutiveWins++;
+                  dailyProfit += profit;
+                  dailyLoss = 0.0;
+               }
+               else
+               {
+                  consecutiveWins = 0;
+                  dailyLoss += MathAbs(profit);
+                  dailyProfit = 0.0;
+               }
+               
+               RemoveTrade(i);
+               continue;
+            }
+         }
+         
+         // REVERSED EXIT STRATEGY: Close losing trades quickly, let winners run longer
+         // Exit condition 2a: Close losing trades quickly (3 seconds)
+         if(holdSeconds >= 3 && profit < 0.0)
+         {
+            if(trade.PositionClose(activeTrades[i].ticket))
+            {
+               Print("TRADE CLOSED (Loss Time-based): ", holdSeconds, "s | ", profitPoints, " pips | P&L: $", DoubleToString(profit, 2));
+               
+               consecutiveWins = 0;
+               dailyLoss += MathAbs(profit);
+               dailyProfit = 0.0;
+               
+               RemoveTrade(i);
+               continue;
+            }
+         }
+         
+         // Exit condition 2b: Extended time-based exit for VERY profitable trades only
+         int exitTime = VeryProfitableExitSeconds;  // Only close very profitable trades after extended time
+         if(profitPoints >= VeryProfitablePips && holdSeconds >= exitTime && profit > 0.0)
+         {
+            if(trade.PositionClose(activeTrades[i].ticket))
+            {
+               Print("TRADE CLOSED (Extended Profit): ", holdSeconds, "s | ", profitPoints, " pips | P&L: $", DoubleToString(profit, 2));
+               
+               consecutiveWins++;
+               dailyProfit += profit;
+               dailyLoss = 0.0;
+               
+               RemoveTrade(i);
+               continue;
+            }
+         }
+         
+         // Let smaller profitable trades run indefinitely (no time-based exit for them)
       }
    }
+   
+   if(activeTradeCount == 0)
+      basketDirection = 0;
+}
+
+void CloseAllTrades()
+{
+   double totalProfit = 0.0;
+   int totalPositions = PositionsTotal();
+   for(int j = totalPositions - 1; j >= 0; j--)
+   {
+      ulong ticket = PositionGetTicket(j);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+      {
+         if(PositionGetString(POSITION_SYMBOL) == tradeSymbol && 
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         {
+            totalProfit += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+         }
+      }
+   }
+   
+   lastBasketCloseTime = TimeCurrent();
+   lastBasketCloseProfit = totalProfit;
+   
+   if(totalProfit > 0.0)
+   {
+      dailyProfit += totalProfit;
+      dailyLoss = 0.0;
+   }
+   else if(totalProfit < 0.0)
+   {
+      dailyLoss += MathAbs(totalProfit);
+      dailyProfit = 0.0;
+   }
+   
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+      {
+         if(PositionGetString(POSITION_SYMBOL) == tradeSymbol && 
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         {
+            trade.PositionClose(ticket);
+         }
+      }
+   }
+   
+   activeTradeCount = 0;
+   for(int i = 0; i < 10; i++)
+      activeTrades[i].ticket = 0;
+   
+   basketDirection = 0;
+}
+
+void RemoveTrade(int index)
+{
+   for(int i = index; i < activeTradeCount - 1; i++)
+      activeTrades[i] = activeTrades[i+1];
+   activeTradeCount--;
 }
 
 // =====================================================================================================
-// EXECUTE PARTIAL EXIT
+// SYNC FUNCTIONS
 // =====================================================================================================
 
-void ExecutePartialExit()
+void SyncWithExistingPositions()
 {
-   if(!hasActiveTrade || currentTrade.ticket == 0)
-      return;
+   activeTradeCount = 0;
+   for(int i = 0; i < 10; i++)
+      activeTrades[i].ticket = 0;
    
-   if(!PositionSelectByTicket(currentTrade.ticket))
-      return;
-   
-   double currentLots = PositionGetDouble(POSITION_VOLUME);
-   double partialLots = currentLots * (PartialExitPercent / 100.0);
-   
-   // Normalize partial lots
-   double lotStep = SymbolInfoDouble(tradeSymbol, SYMBOL_VOLUME_STEP);
-   if(lotStep > 0.0)
-      partialLots = MathFloor(partialLots / lotStep) * lotStep;
-   
-   // Ensure partial lots is at least minimum lot
-   double minLot = SymbolInfoDouble(tradeSymbol, SYMBOL_VOLUME_MIN);
-   if(partialLots < minLot)
-      partialLots = minLot;
-   
-   // Ensure we don't close more than available
-   if(partialLots >= currentLots)
-      partialLots = currentLots * 0.5;  // Default to 50% if calculation is off
-   
-   partialLots = NormalizeDouble(partialLots, 2);
-   
-   // Close partial position
-   if(trade.PositionClosePartial(currentTrade.ticket, partialLots))
+   int totalPositions = PositionsTotal();
+   for(int i = totalPositions - 1; i >= 0; i--)
    {
-      currentTrade.partialExitDone = true;
-      currentTrade.lotSize = currentLots - partialLots;  // Update remaining lot size
-      Print("Partial exit executed: Closed ", DoubleToString(partialLots, 2), " lots (", DoubleToString(PartialExitPercent, 1), "%)");
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+      {
+         if(PositionGetString(POSITION_SYMBOL) == tradeSymbol && 
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         {
+            if(activeTradeCount < 10)
+            {
+               activeTrades[activeTradeCount].ticket = ticket;
+               activeTrades[activeTradeCount].entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+               activeTrades[activeTradeCount].openTime = (datetime)PositionGetInteger(POSITION_TIME);
+               activeTrades[activeTradeCount].direction = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1 : -1;
+               activeTrades[activeTradeCount].lotSize = PositionGetDouble(POSITION_VOLUME);
+               activeTrades[activeTradeCount].stopLoss = PositionGetDouble(POSITION_SL);
+               activeTradeCount++;
+            }
+         }
+      }
    }
-   else
-   {
-      Print("Partial exit failed: ", trade.ResultRetcode(), " -> ", trade.ResultRetcodeDescription());
-   }
+   
+   RecalculateBasketDirection();
 }
 
-// =====================================================================================================
-// CLOSE TRADE
-// =====================================================================================================
-
-void CloseTrade(string reason)
+void RecalculateBasketDirection()
 {
-   if(!hasActiveTrade || currentTrade.ticket == 0)
-      return;
+   int totalPositions = PositionsTotal();
+   int buyCount = 0, sellCount = 0;
    
-   if(!PositionSelectByTicket(currentTrade.ticket))
+   for(int i = totalPositions - 1; i >= 0; i--)
    {
-      hasActiveTrade = false;
-      currentTrade.ticket = 0;
-      return;
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+      {
+         if(PositionGetString(POSITION_SYMBOL) == tradeSymbol && 
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         {
+            ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            if(posType == POSITION_TYPE_BUY) buyCount++;
+            else if(posType == POSITION_TYPE_SELL) sellCount++;
+         }
+      }
    }
    
-   double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
-   
-   bool closed = trade.PositionClose(currentTrade.ticket);
-   
-   if(closed)
-   {
-      Print("TRADE CLOSED: ", reason, " | P&L: $", DoubleToString(profit, 2));
-      
-      // Update daily profit
-      dailyProfit += profit;
-      
-      hasActiveTrade = false;
-      currentTrade.ticket = 0;
-   }
+   if(buyCount > 0 && sellCount == 0)
+      basketDirection = 1;
+   else if(sellCount > 0 && buyCount == 0)
+      basketDirection = -1;
+   else if(buyCount == 0 && sellCount == 0)
+      basketDirection = 0;
    else
-   {
-      Print("Close failed: ", trade.ResultRetcode(), " -> ", trade.ResultRetcodeDescription());
-   }
+      basketDirection = (buyCount > sellCount) ? 1 : -1;
 }
 
 // =====================================================================================================
@@ -1271,51 +1156,31 @@ void CloseTrade(string reason)
 
 void UpdateDisplay()
 {
-   string status = "\n=== Hyperactive HFT MT5 Scalper V2.00 ===\n";
+   string status = "\n=== Hyperactive HFT MT5 Scalper FTMO V3.10 ===\n";
    status += "Symbol: " + tradeSymbol + "\n";
-   status += "Lot Mode: " + (UseFixedLot ? "FIXED" : "DYNAMIC") + "\n";
-   if(UseFixedLot)
-      status += "Lot Size: " + DoubleToString(FixedLotSize, 2) + "\n";
-   else
-      status += "Dynamic Lot: " + DoubleToString(CalculateLotSize(), 2) + "\n";
    
-   status += "Tick Speed: " + DoubleToString(ticksPerSecond, 2) + " ticks/sec";
-   if(UseTickSpeedFilter && ticksPerSecond < MinTickSpeed)
+   int currentMaxTrades = CalculateProgressiveMaxTrades();
+   double currentRisk = CalculateProgressiveRisk();
+   double progress = (dailyProfit / dailyProfitTarget) * 100.0;
+   
+   status += "Active Trades: " + IntegerToString(activeTradeCount) + " / " + IntegerToString(currentMaxTrades) + "\n";
+   status += "Risk Per Trade: " + DoubleToString(currentRisk, 2) + "%\n";
+   status += "Progress to 8%: " + DoubleToString(progress, 1) + "%\n";
+   
+   if(UseLotScaling)
+   {
+      double currentMultiplier = (consecutiveWins > 0) ? MathPow(LotScalingMultiplier, consecutiveWins) : 1.0;
+      if(currentMultiplier > MaxLotMultiplier) currentMultiplier = MaxLotMultiplier;
+      status += "Consecutive Wins: " + IntegerToString(consecutiveWins) + " | Lot Multiplier: " + DoubleToString(currentMultiplier, 2) + "x\n";
+   }
+   
+   status += "Tick Speed: " + DoubleToString(currentTicksPerSecond, 2) + " ticks/sec";
+   if(currentTicksPerSecond < MinTickSpeed)
       status += " [LOW]";
    status += "\n";
    
-   status += "Spread: " + DoubleToString(currentSpread, 1) + " points";
-   if(currentSpread > MaxSpreadPoints)
-      status += " [HIGH]";
-   if(UseSpreadNormalizedFilter && averageSpread > 0.0)
-   {
-      status += " (Avg: " + DoubleToString(averageSpread, 1);
-      if(currentSpread > (averageSpread * SpreadMultiplier))
-         status += " [SPIKE]";
-      status += ")";
-   }
-   status += "\n";
-   
-   status += "Momentum: " + (momentumDirection == 1 ? "BULLISH" : (momentumDirection == -1 ? "BEARISH" : "NEUTRAL"));
-   status += " (" + IntegerToString(consecutiveMomentumTicks) + " ticks)\n";
-   
-   // Show filter statuses
-   if(UsePullbackFilter && breakoutDetected)
-   {
-      status += "Breakout: " + (breakoutDirection == 1 ? "BULLISH" : "BEARISH");
-      status += " | Peak: " + DoubleToString(breakoutPeakPrice, symbolDigits);
-      status += " | Waiting for pullback...\n";
-   }
-   
-   if(UseVolatilityCycleFilter)
-   {
-      status += "Volatility Cycle: " + (CheckVolatilityCycle() ? "RISING" : "NOT RISING") + "\n";
-   }
-   
-   if(UseLiquidityTimeFilter)
-   {
-      status += "Liquidity Time: " + (CheckLiquidityTime() ? "ALLOWED" : "BLOCKED") + "\n";
-   }
+   status += "Spread: " + DoubleToString(currentSpread, 1) + " points\n";
+   status += "Volatility: " + DoubleToString(currentVolatility, 1) + " points\n";
    
    if(tradingStopped)
    {
@@ -1332,56 +1197,70 @@ void UpdateDisplay()
       status += "STATUS: ACTIVE\n";
    }
    
-   if(hasActiveTrade)
+   if(activeTradeCount > 0)
    {
-      if(PositionSelectByTicket(currentTrade.ticket))
+      status += "\n--- Active Trades ---\n";
+      double totalProfit = 0.0;
+      for(int i = 0; i < activeTradeCount; i++)
       {
-         double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
-         datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
-         int holdSeconds = (int)(TimeCurrent() - openTime);
-         
-         double currentPrice = (currentTrade.direction == 1) ? currentBid : currentAsk;
-         double priceDiff = currentPrice - currentTrade.entryPrice;
-         if(currentTrade.direction == -1)
-            priceDiff = -priceDiff;
-         double profitPoints = priceDiff / point;
-         
-         status += "\n--- Active Trade ---\n";
-         status += "Direction: " + (currentTrade.direction == 1 ? "BUY" : "SELL") + "\n";
-         status += "P&L: $" + DoubleToString(profit, 2) + "\n";
-         status += "Points: " + DoubleToString(profitPoints, 1);
-         if(profitPoints < 0)
-            status += " / SL: " + DoubleToString(MaxLossPoints, 0) + "\n";
-         else
-            status += " (Profit)\n";
-         status += "Hold Time: " + IntegerToString(holdSeconds) + " seconds\n";
-         if(profitPoints > 0)
-            status += "Max Hold: " + IntegerToString(MaxProfitHoldSeconds) + " seconds\n";
-         else
-            status += "Max Hold: " + IntegerToString(MaxLossHoldSeconds) + " seconds\n";
-         
-         // Show breakeven and partial exit status
-         if(currentTrade.breakevenMoved)
-            status += "Breakeven: MOVED\n";
-         if(currentTrade.partialExitDone)
-            status += "Partial Exit: DONE (" + DoubleToString(PartialExitPercent, 0) + "%)\n";
+         if(activeTrades[i].ticket > 0 && PositionSelectByTicket(activeTrades[i].ticket))
+         {
+            double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+            datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
+            int holdSeconds = (int)(TimeCurrent() - openTime);
+            
+            totalProfit += profit;
+            
+            double currentPrice = (activeTrades[i].direction == 1) ? currentBid : currentAsk;
+            double priceDiff = currentPrice - activeTrades[i].entryPrice;
+            if(activeTrades[i].direction == -1) priceDiff = -priceDiff;
+            double profitPoints = priceDiff / point;
+            
+            int exitTime = TimeBasedExitSeconds;
+            if(profitPoints >= VeryProfitablePips)
+               exitTime = VeryProfitableExitSeconds;
+            else if(profitPoints >= ExtendedExitProfitPips)
+               exitTime = ExtendedExitSeconds;
+            
+            status += "Trade " + IntegerToString(i+1) + ": " + 
+                     (activeTrades[i].direction == 1 ? "BUY" : "SELL") + 
+                     " | P&L: $" + DoubleToString(profit, 2) + 
+                     " (" + DoubleToString(profitPoints, 1) + " pips)" +
+                     " | Hold: " + IntegerToString(holdSeconds) + "s";
+            
+            if(profit > 0.0 && holdSeconds >= exitTime)
+               status += " [READY TO CLOSE]";
+            else if(UseProfitTarget && profitPoints >= IndividualProfitTargetPips)
+               status += " [PROFIT TARGET]";
+            else if(profitPoints >= VeryProfitablePips && holdSeconds >= VeryProfitableExitSeconds)
+               status += " [EXTENDED PROFIT - READY TO CLOSE]";
+            else if(profit > 0.0)
+               status += " [WINNER - LETTING RUN]";
+            else if(profit < 0.0)
+               status += " [WAITING FOR SL]";
+            
+            status += "\n";
+         }
       }
+      status += "Total P&L: $" + DoubleToString(totalProfit, 2) + "\n";
    }
    else
    {
-      status += "\nNo active trade\n";
-      status += "Waiting for momentum breakout signal...\n";
+      status += "\nNo active trades\n";
    }
    
    status += "\n--- Account ---\n";
    status += "Balance: $" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + "\n";
    status += "Equity: $" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + "\n";
-   if(DailyProfitTarget > 0.0)
+   
+   status += "Daily Profit: $" + DoubleToString(dailyProfit, 2) + " / $" + DoubleToString(dailyProfitTarget, 2);
+   status += " (" + DoubleToString(progress, 1) + "%)\n";
+   
+   if(UseDailyLossLimit && dailyLoss > 0.0)
    {
-      status += "Daily Profit: $" + DoubleToString(dailyProfit, 2);
-      status += " / $" + DoubleToString(DailyProfitTarget, 2) + "\n";
+      double dailyLossPercent = (dailyLoss / dailyStartBalance) * 100.0;
+      status += "Daily Loss: $" + DoubleToString(dailyLoss, 2) + " (" + DoubleToString(dailyLossPercent, 2) + "%)\n";
    }
    
    Comment(status);
 }
-

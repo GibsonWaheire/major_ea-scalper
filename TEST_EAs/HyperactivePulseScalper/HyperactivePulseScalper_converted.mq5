@@ -1,1194 +1,1208 @@
-#property copyright "Copyright 2025, Hyperactive Pulse Scalper V2 - Ultra High Frequency Micro-Scalper"
-#property link      "https://www.mcgibsdigitalsolutions.com"
+// DynamicXauBasketMT5.mq5
+// Momentum Breakout EA - Dynamic lot (min to max), 1-20 trades per basket, bulk close
+#property copyright "Dynamic XAU Momentum Breakout EA"
+#property link      "local"
 #property version   "3.00"
 #property strict
 
-// =====================================================================================================
-// HYPERACTIVE PULSE SCALPER V3 - ULTRA HIGH FREQUENCY MICRO-SCALPER (MT5 VERSION - CONVERTED FROM MT4)
-// Strategy: True HFT micro-scalper using 3-in-1 entry system
-// - Tick-based only (no candles, no indicators)
-// - 3 entry models: Tick Momentum, Micro Pullback, Spread Compression
-// - Ultra-fast exits (3-10 seconds)
-// - Fixed lot sizing for speed
-// - Dozens to hundreds of trades per hour
-// - Perfect for XAUUSD HFT scalping
-// =====================================================================================================
+#include <Trade/Trade.mqh>
+#include <Trade/PositionInfo.mqh>
 
-// ===== Trading Settings =====
-input double   RiskPercentPerTrade   = 1.5;    // Risk % per trade (1.5% balanced for HFT)
-input int      MagicNumber           = 202503;
-input int      MaxHoldSeconds        = 5;      // Maximum hold time (3-10 seconds for HFT)
+// --- Inputs ---
+input string   TradeSymbol           = "XAUUSD";
+input int      MagicNumber           = 905533;
+input double   BaseLot               = 0.01;   // Lot for first trade (min)
+input double   MaxLot                = 0.50;   // Cap (scale up to this)
+input double   ProfitPerLotStep       = 10.0;  // Every $X realized profit adds LotIncrement
+input double   LotIncrement          = 0.01;   // Lot added per profit step
+input int      MinTotalTrades        = 1;      // Min trades per basket
+input int      MaxTotalTrades        = 10;     // Max trades per basket (1-20 dynamic)
+input int      ATRPeriod             = 14;
+input ENUM_TIMEFRAMES MomentumTF     = PERIOD_M1; // Momentum timeframe (M1 for scalping)
+input ENUM_TIMEFRAMES ATRTimeframe   = PERIOD_M1;
+input double   MomentumThresholdATR  = 0.15;   // Minimum momentum to trigger breakout entry (ATR fraction)
+input int      MomentumLookback      = 2;      // Number of candles to look back for momentum
+input bool     RequireVolumeConfirmation = false; // Require volume confirmation for breakout
+input int      DeviationPoints       = 30;     // Slippage guard
+input double   SpreadLimitPoints     = 900;    // Skip trading if spread too wide
+input int      MinSecondsBetweenEntries = 0;   // Min seconds between opening new trades (0 = HFT)
+input bool     OneEntryPerBar       = false;  // Max one entry per M1 bar (false = HFT)
+input bool     UseLimitOrders       = true;   // Use limit orders instead of market
+input int      MarketOrdersAtExecution = 4;    // Market orders to open immediately on signal
+input int      LimitOrderCount      = 5;      // Number of limit orders per basket
+input int      MinPendingHoldSeconds = 3;     // Min seconds before cancelling pendings on direction change
+input int      PendingOrderTimeoutSeconds = 60; // Cancel pendings if not filled after this many seconds
+input double   InpTickVelocityThresholdPoints = 500.0; // Tick Velocity: spike if price moves more than this in 500ms
 
-// ===== Risk Management Settings =====
-input double   TrailingStopPips         = 10.0;   // Trailing stop distance (pips)
-input double   BreakevenTriggerPips     = 5.0;    // Move to breakeven after profit (pips)
-input double   DailyLossLimitPercent    = 10.0;   // Stop trading if daily loss exceeds (%)
-input double   MaxDrawdownPercent       = 15.0;   // Stop all trading if drawdown exceeds (%)
-input double   MaxSpreadPips            = 4.0;    // Don't trade if spread exceeds (pips)
-input int      ConsecutiveLossLimit     = 3;      // Pause after X consecutive losses
-input int      CooldownSeconds          = 45;     // Seconds to pause after consecutive losses
-input double   MinProfitToClose         = 0.50;   // Minimum profit to close trade ($)
+// --- Stop Loss Settings ---
+input bool     UseStopLoss           = true;   // Enable stop loss
+input double   StopLossPointsXAU     = 3000.0; // Stop loss in points for XAUUSD (~300 pips)
+input double   StopLossPointsOther   = 300.0;  // Stop loss in points for other symbols (~30 pips)
 
-// ===== Pattern Strategy Settings =====
-input int      PatternSequenceLength = 4;      // Number of trades in each pattern sequence (3-5)
-input int      MomentumLookbackTicks = 15;     // Number of ticks to analyze for momentum (10-20)
-input double   MomentumThreshold     = 0.60;   // Momentum threshold (0.60 = 60% ticks in direction)
-input bool     UsePatternStrategy    = true;   // Enable pattern-based entry strategy
-input bool     ValidateWithMomentum  = true;   // Validate pattern entry with momentum check
+// --- Basket Profit Settings ---
+input bool     UseBasketProfit       = true;   // Close all trades when basket profit target reached
+input double   BasketProfitATRMultiplier = 2.5; // Basket profit target as multiple of ATR
+input double   BasketProfitPercent   = 2.0;    // Alternative: Basket profit as % of account balance
+input bool     UsePercentForBasket   = false;  // If true use %, if false use ATR multiplier
+input bool     IncludeAllTrades      = true;   // Include all trades (even pre-existing) in basket profit
+input bool     CloseEarlyWhenProfitable = true; // Close basket early when profitable (even below target)
+input double   EarlyCloseProfitATR   = 1.5;    // Close basket early at this ATR multiplier (if profitable)
+input double   EarlyCloseProfitPercent = 1.0;  // Alternative: Close early at this % profit
+input bool     UsePercentForEarlyClose = false; // If true use % for early close, if false use ATR
+input bool     CloseAtAnyProfit        = true;  // Close basket as soon as profit > 0
+input double   MinProfitToClose       = 0.01;   // Minimum profit (currency) to trigger close
+input bool     UseTimeBasedClose      = true;  // Dynamic hold (0.5-4 sec by profit %)
+input double   MinHoldSeconds         = 0.5;   // Min hold when profit % is high (close fast)
+input double   MaxHoldSeconds         = 4.0;   // Max hold when profit % is low (wait for profit)
+input double   ProfitPctForFastClose  = 0.5;   // When profit >= this % of balance, use min hold
+input int      CloseMode             = 2;     // 0=basket only, 1=individual only, 2=both
 
-// =====================================================================================================
-// STRUCTURES & GLOBALS
-// =====================================================================================================
+// --- Exit Settings ---
+input bool     UseBreakEven          = false;  // Move stop loss to break-even (disables wide SL)
+input double   BreakEvenTriggerATR   = 0.5;    // Move to BE when profit reaches this ATR
+input bool     UseTrailingStop       = false;  // Use trailing stop (disables wide SL)
+input double   TrailingStopATR        = 1.0;    // Trailing stop distance in ATR
+input double   TrailingStepATR       = 0.3;    // Trailing step in ATR
 
-struct HFTrade {
-   ulong    ticket;           // MQ5 uses ulong for ticket
-   double   entryPrice;
-   datetime openTime;
-   int      direction;  // 1=BUY, -1=SELL
-   double   lotSize;
-   double   previousProfit;  // Track previous tick profit for spike detection
-   double   stopLoss;         // Current stop loss level
-   bool     breakevenSet;     // Whether breakeven stop has been set
-};
+// --- Globals ---
+CTrade         trade;
+CPositionInfo  pos;
+int            atrHandle     = -1;
+bool           eaInitialized = false;
+double         lastPrice     = 0.0;  // Track last price for momentum calculation
+datetime       lastEntryTime = 0;    // Entry cooldown
+datetime       lastEntryBar  = 0;    // One entry per bar
+double         cumulativeRealizedProfit = 0;  // Realized profit from closed trades (for lot scaling)
+double         tickVelPrice  = 0.0;  // Tick Velocity Filter: price at last sample
+ulong          tickVelTime   = 0;    // Tick Velocity Filter: last sample time (ms)
 
-HFTrade currentTrade;
-bool hasActiveTrade = false;
-
-// Tick buffers for momentum breakout - REDUCED for faster signals
-double bidBuffer[3];
-double askBuffer[3];
-int tickIndex = 0;
-bool buffersInitialized = false;
-
-// Spread buffer for compression detection - REDUCED for faster signals
-double spreadBuffer[5];
-int spreadIndex = 0;
-bool spreadBufferInitialized = false;
-
-// Micro pullback tracking
-double lastSwingHigh = 0.0;
-double lastSwingLow = 0.0;
-int pullbackTicks = 0;
-int lastMoveDirection = 0;  // 1=up, -1=down, 0=none
-
-// Price data
-double pipToPoint = 0.0;
-int digits = 0;
-
-// Pattern strategy tracking
-int patternSequence[10];  // Store current pattern sequence (max 10 trades)
-int patternIndex = 0;      // Current position in pattern
-int tradesInSequence = 0;  // Number of trades completed in current sequence
-int lastPatternMomentum = 0;  // Last detected momentum (-1=bearish, 0=neutral, 1=bullish)
-int recentTradeDirections[20]; // Track last 20 trade directions for pattern generation
-int recentTradeCount = 0;
-
-// Risk management tracking
-double dailyStartBalance = 0.0;
-double dailyProfitLoss = 0.0;
-double sessionHighEquity = 0.0;
-int consecutiveLosses = 0;
-datetime cooldownUntil = 0;
-bool breakevenSet = false;
-double highestProfit = 0.0;
-
-// =====================================================================================================
-// INITIALIZATION
-// =====================================================================================================
-
-int OnInit()
+// ---------------------------------------------------------------------------
+// Utility helpers
+// ---------------------------------------------------------------------------
+bool EnsureSymbolReady(const string symbol)
 {
-   Print("========================================");
-   Print("ULTRA HIGH FREQUENCY MICRO-SCALPER V3.00");
-   Print("AGGRESSIVE MODE: 5-IN-1 ENTRY SYSTEM");
-   Print("Tick Momentum | Direction Change | Micro Pullback | Spread Compression | Continuous Momentum");
-   Print("========================================");
-   Print("Risk per Trade: ", RiskPercentPerTrade, "%");
-   Print("Max Hold Time: ", MaxHoldSeconds, " seconds");
-   Print("Risk Management: ENABLED");
-   Print("  - Trailing Stop: ", TrailingStopPips, " pips");
-   Print("  - Breakeven Trigger: ", BreakevenTriggerPips, " pips");
-   Print("  - Daily Loss Limit: ", DailyLossLimitPercent, "%");
-   Print("  - Max Drawdown: ", MaxDrawdownPercent, "%");
-   Print("  - Max Spread: ", MaxSpreadPips, " pips");
-   Print("  - Consecutive Loss Limit: ", ConsecutiveLossLimit, " trades");
-   Print("  - Min Profit to Close: $", MinProfitToClose);
-   if(UsePatternStrategy)
+   if(!SymbolSelect(symbol, true))
    {
-      Print("Entry Strategy: PATTERN-BASED (Sequence Length: ", PatternSequenceLength, " trades)");
-      Print("Momentum Lookback: ", MomentumLookbackTicks, " ticks | Threshold: ", DoubleToString(MomentumThreshold * 100, 0), "%");
-      Print("Momentum Validation: ", (ValidateWithMomentum ? "ON" : "OFF"));
+      Print("Failed to select symbol ", symbol);
+      return false;
    }
-   else
+   if(SymbolInfoInteger(symbol, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_DISABLED)
    {
-      Print("Entry Strategy: TICK-BASED (Random Entry)");
+      Print("Symbol trading disabled: ", symbol);
+      return false;
    }
-   Print("Buffer Init: 2 ticks (was 5) | Spread Init: 3 ticks (was 10)");
-   Print("Exit: Instant profit exit (never close at loss)");
-   Print("No indicators | No candles | Maximum frequency");
-   Print("========================================");
-   
-   // Initialize symbol data
-   digits = Digits;
-   pipToPoint = Point;
-   if(digits == 3 || digits == 5)
-      pipToPoint *= 10.0;
-   
-   // Initialize trading state
-   hasActiveTrade = false;
-   
-   // Initialize risk management
-   dailyStartBalance = AccountBalance();
-   dailyProfitLoss = 0.0;
-   sessionHighEquity = AccountEquity();
-   consecutiveLosses = 0;
-   cooldownUntil = 0;
-   breakevenSet = false;
-   highestProfit = 0.0;
-   
-   // Initialize pattern strategy
-   patternIndex = 0;
-   tradesInSequence = 0;
-   lastPatternMomentum = 0;
-   recentTradeCount = 0;
-   for(int i = 0; i < 10; i++)
-      patternSequence[i] = 0;
-   for(int i = 0; i < 20; i++)
-      recentTradeDirections[i] = 0;
-   
-   // Initialize buffers - REDUCED SIZE for faster initialization
-   for(int i = 0; i < 3; i++)
-   {
-      bidBuffer[i] = 0.0;
-      askBuffer[i] = 0.0;
-   }
-   for(int i = 0; i < 5; i++)
-   {
-      spreadBuffer[i] = 0.0;
-   }
-   
-   Print("EA initialized - ready for ultra high-frequency trading");
-   
-   // Initialize pattern strategy if enabled
-   if(UsePatternStrategy)
-   {
-      Print("Pattern Strategy: ENABLED");
-      Print("  - Sequence Length: ", PatternSequenceLength, " trades");
-      Print("  - Momentum Validation: ", (ValidateWithMomentum ? "ON" : "OFF"));
-      Print("  - Pattern will be generated after buffers initialize (2+ ticks)");
-   }
-   else
-   {
-      Print("Pattern Strategy: DISABLED - Using tick-based entry");
-   }
-   
-   // Check AutoTrading
-   if(IsTradeAllowed())
-   {
-      Print("✓ AutoTrading is ENABLED - Ready to trade");
-   }
-   else
-   {
-      Print("⚠ AutoTrading is DISABLED - Please enable AutoTrading button in MT5!");
-   }
-   
-   return(INIT_SUCCEEDED);
+   return true;
 }
 
-void OnDeinit(const int reason)
+// Close all existing trades (any magic number) when EA is activated
+void CloseAllExistingTrades(const string symbol)
 {
-   Print("HFT Micro-Scalper V3 deinitialized. Reason: ", reason);
-}
-
-// =====================================================================================================
-// MAIN TICK FUNCTION
-// =====================================================================================================
-
-void OnTick()
-{
-   // Update tick buffers
-   UpdateTickBuffers();
+   int closed = 0;
+   int deleted = 0;
    
-   // Manage active trade (ultra-fast exits)
-   if(hasActiveTrade)
+   // Close all market positions
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
    {
-      ManageHFTrade();
-   }
-   
-   // Open new trade if no active trade
-   if(!hasActiveTrade)
-   {
-      int direction = 0;
+      if(!pos.SelectByIndex(i)) continue;
+      if(pos.Symbol() != symbol) continue;
       
-      if(UsePatternStrategy)
+      ulong ticket = pos.Ticket();
+      if(trade.PositionClose(ticket, DeviationPoints))
       {
-         // Use pattern-based entry strategy
-         direction = GetPatternEntrySignal();
-      }
-      else
-      {
-         // Use old tick-based entry strategy (fallback)
-         direction = GetHFEntrySignal();
-      }
-      
-      // Debug logging (every 100 ticks)
-      static int debugCounter = 0;
-      debugCounter++;
-      if(debugCounter % 100 == 0)
-      {
-         Print("DEBUG: Direction=", direction, " | HasActiveTrade=", hasActiveTrade, 
-               " | TickIndex=", tickIndex, " | PatternIndex=", patternIndex,
-               " | UsePatternStrategy=", UsePatternStrategy);
-      }
-      
-      if(direction != 0)
-      {
-         Print("Signal detected: ", (direction == 1 ? "BUY" : "SELL"), " - Attempting to open trade...");
-         
-         if(OpenHFTrade(direction))
-         {
-            // Track trade direction for pattern (only if trade opened successfully)
-            if(UsePatternStrategy)
-            {
-               // Advance pattern index for next trade
-               patternIndex++;
-            }
-         }
+         closed++;
+         Print("Closed existing position: ", ticket);
       }
    }
    
-   // Update display
-   UpdateDisplay();
+   // Delete all pending orders
+   for(int i = OrdersTotal() - 1; i >= 0; --i)
+   {
+      ulong oticket = OrderGetTicket(i);
+      if(oticket == 0) continue;
+      if(!OrderSelect(oticket)) continue;
+      if(OrderGetString(ORDER_SYMBOL) != symbol) continue;
+      
+      ulong ticket = OrderGetInteger(ORDER_TICKET);
+      if(trade.OrderDelete(ticket))
+      {
+         deleted++;
+         Print("Deleted existing order: ", ticket);
+      }
+   }
+   
+   if(closed > 0 || deleted > 0)
+      Print("Closed ", closed, " positions and deleted ", deleted, " orders on EA activation");
 }
 
-// =====================================================================================================
-// PATTERN-BASED ENTRY STRATEGY
-// =====================================================================================================
-
-int DetectMomentum()
+double GetATR()
 {
-   // Simple momentum detection using available buffer data
-   // We only have 3 ticks in buffer, so use what we have
-   
-   if(tickIndex < 2)
-      return 0;  // Neutral - not enough data
-   
-   int bullishTicks = 0;
-   int bearishTicks = 0;
-   
-   // Check recent tick movements (we have 3 ticks: current, previous, before that)
-   if(tickIndex >= 2)
-   {
-      // Compare current vs previous
-      if(Bid > bidBuffer[1])
-         bullishTicks++;
-      else if(Bid < bidBuffer[1])
-         bearishTicks++;
-      
-      // Compare previous vs before that
-      if(bidBuffer[1] > bidBuffer[2])
-         bullishTicks++;
-      else if(bidBuffer[1] < bidBuffer[2])
-         bearishTicks++;
-   }
-   else if(tickIndex >= 1)
-   {
-      // Only one comparison available
-      if(Bid > bidBuffer[1])
-         bullishTicks++;
-      else if(Bid < bidBuffer[1])
-         bearishTicks++;
-   }
-   
-   double totalTicks = bullishTicks + bearishTicks;
-   if(totalTicks == 0)
-      return 0;  // Neutral
-   
-   double bullishRatio = bullishTicks / totalTicks;
-   
-   // Determine momentum based on ratio
-   if(bullishRatio >= MomentumThreshold)
-      return 1;  // Bullish momentum
-   else if(bullishRatio <= (1.0 - MomentumThreshold))
-      return -1;  // Bearish momentum
-   else
-      return 0;  // Neutral/ranging
+   if(atrHandle < 0)
+      return 0.0;
+   double buffer[2];
+   if(CopyBuffer(atrHandle, 0, 0, 2, buffer) < 1)
+      return 0.0;
+   return buffer[0];
 }
 
-void GeneratePattern(int momentum)
+// Detect Momentum Breakout - Simple and effective for scalping
+int DetectMomentumBreakout(const string symbol, double atr)
 {
-   // Clear existing pattern
-   for(int i = 0; i < 10; i++)
-      patternSequence[i] = 0;
-   
-   patternIndex = 0;
-   lastPatternMomentum = momentum;
-   
-   // Generate pattern based on momentum
-   if(momentum == 1)  // Bullish - more buys
-   {
-      // Pattern: Buy-Buy-Sell-Buy-Buy or Buy-Buy-Buy-Sell-Buy
-      if(PatternSequenceLength == 3)
-      {
-         patternSequence[0] = 1;  // BUY
-         patternSequence[1] = 1;  // BUY
-         patternSequence[2] = -1; // SELL
-      }
-      else if(PatternSequenceLength == 4)
-      {
-         patternSequence[0] = 1;  // BUY
-         patternSequence[1] = 1;  // BUY
-         patternSequence[2] = -1; // SELL
-         patternSequence[3] = 1;  // BUY
-      }
-      else if(PatternSequenceLength == 5)
-      {
-         patternSequence[0] = 1;  // BUY
-         patternSequence[1] = 1;  // BUY
-         patternSequence[2] = 1;  // BUY
-         patternSequence[3] = -1; // SELL
-         patternSequence[4] = 1;  // BUY
-      }
-   }
-   else if(momentum == -1)  // Bearish - more sells
-   {
-      // Pattern: Sell-Sell-Buy-Sell-Sell or Sell-Sell-Sell-Buy-Sell
-      if(PatternSequenceLength == 3)
-      {
-         patternSequence[0] = -1; // SELL
-         patternSequence[1] = -1; // SELL
-         patternSequence[2] = 1;  // BUY
-      }
-      else if(PatternSequenceLength == 4)
-      {
-         patternSequence[0] = -1; // SELL
-         patternSequence[1] = -1; // SELL
-         patternSequence[2] = 1;  // BUY
-         patternSequence[3] = -1; // SELL
-      }
-      else if(PatternSequenceLength == 5)
-      {
-         patternSequence[0] = -1; // SELL
-         patternSequence[1] = -1; // SELL
-         patternSequence[2] = -1; // SELL
-         patternSequence[3] = 1;  // BUY
-         patternSequence[4] = -1; // SELL
-      }
-   }
-   else  // Neutral - alternating pattern
-   {
-      // Pattern: Buy-Sell-Buy-Sell-Buy
-      for(int i = 0; i < PatternSequenceLength; i++)
-      {
-         patternSequence[i] = (i % 2 == 0) ? 1 : -1;  // Alternating
-      }
-   }
-   
-   Print("Pattern Generated - Momentum: ", (momentum == 1 ? "BULLISH" : (momentum == -1 ? "BEARISH" : "NEUTRAL")), 
-         " | Sequence Length: ", PatternSequenceLength);
-}
-
-bool ValidatePatternEntryWithMomentum(int direction)
-{
-   if(!ValidateWithMomentum)
-      return true;  // Skip validation if disabled
-   
-   // Quick momentum check - ensure direction aligns with recent momentum
-   if(tickIndex < 2)
-      return true;  // Not enough data - allow anyway
-   
-   // Very lenient validation - only block if momentum is strongly against
-   int recentMomentum = 0;
-   if(tickIndex >= 2)
-   {
-      if(Bid > bidBuffer[1] && bidBuffer[1] > bidBuffer[2])
-         recentMomentum = 1;  // Strong bullish
-      else if(Bid < bidBuffer[1] && bidBuffer[1] < bidBuffer[2])
-         recentMomentum = -1;  // Strong bearish
-      else if(Bid > bidBuffer[1])
-         recentMomentum = 1;  // Mild bullish
-      else if(Bid < bidBuffer[1])
-         recentMomentum = -1;  // Mild bearish
-   }
-   
-   // Allow entry if momentum aligns or is neutral
-   if(recentMomentum == 0)
-      return true;  // Neutral momentum - allow
-   
-   // Only block if momentum is strongly against (very lenient)
-   // For BUY: only block if strongly bearish
-   if(direction == 1)
-      return (recentMomentum >= -1);  // Allow even if slightly bearish
-   
-   // For SELL: only block if strongly bullish
-   if(direction == -1)
-      return (recentMomentum <= 1);  // Allow even if slightly bullish
-   
-   return true;  // Default allow
-}
-
-int GetPatternEntrySignal()
-{
-   // Check if pattern needs to be generated (first time or sequence complete)
-   if(tradesInSequence >= PatternSequenceLength || patternIndex >= PatternSequenceLength || patternSequence[0] == 0)
-   {
-      // Generate initial pattern or regenerate after sequence completion
-      if(tickIndex < 2)
-      {
-         return 0;  // Not enough ticks to detect momentum
-      }
-      
-      int currentMomentum = DetectMomentum();
-      GeneratePattern(currentMomentum);
-      tradesInSequence = 0;
-      patternIndex = 0;
-   }
-   
-   // Get next entry from pattern
-   if(patternIndex < PatternSequenceLength && patternSequence[patternIndex] != 0)
-   {
-      int nextDirection = patternSequence[patternIndex];
-      
-      // Validate with momentum if enabled (but don't be too strict)
-      if(ValidatePatternEntryWithMomentum(nextDirection))
-      {
-         return nextDirection;
-      }
-      else
-      {
-         // Momentum doesn't align - but don't skip too many times
-         static int skipCount = 0;
-         skipCount++;
-         
-         // If we've skipped too many times, just take the pattern entry anyway
-         if(skipCount >= 5)
-         {
-            skipCount = 0;
-            return nextDirection;  // Force entry after 5 skips
-         }
-         
-         // Skip this entry, try next in sequence
-         patternIndex++;
-         return 0;  // Wait for next tick
-      }
-   }
-   
-   return 0;  // No pattern signal
-}
-
-// =====================================================================================================
-// 3-IN-1 HIGH FREQUENCY ENTRY SYSTEM (FALLBACK - if pattern strategy disabled)
-// =====================================================================================================
-
-int GetHFEntrySignal()
-{
-   // AGGRESSIVE: Only need 2 ticks to start trading (much faster)
-   if(tickIndex < 2)
+   if(atr <= 0)
       return 0;
    
-   int buySignal = 0;
-   int sellSignal = 0;
+   double close[];
+   long volume[];
+   ArraySetAsSeries(close, true);
+   ArraySetAsSeries(volume, true);
    
-   // ===== (A) ULTRA-SENSITIVE TICK MOMENTUM (1-2 tick comparison) =====
-   // BUY if current Bid > previous Bid (immediate momentum)
-   if(tickIndex >= 1 && Bid > bidBuffer[1])
-      buySignal = 1;
+   int lookback = MomentumLookback + 1;
+   if(CopyClose(symbol, MomentumTF, 0, lookback, close) < lookback)
+      return 0;
    
-   // SELL if current Ask < previous Ask (immediate momentum)
-   if(tickIndex >= 1 && Ask < askBuffer[1])
-      sellSignal = 1;
-   
-   // Also check 2-tick momentum for stronger signals
-   if(tickIndex >= 2)
+   if(RequireVolumeConfirmation)
    {
-      if(Bid > bidBuffer[2])
-         buySignal = MathMax(buySignal, 1);
-      if(Ask < askBuffer[2])
-         sellSignal = MathMax(sellSignal, 1);
+      if(CopyTickVolume(symbol, MomentumTF, 0, lookback, volume) < lookback)
+         return 0;
    }
    
-   // ===== (B) INSTANT DIRECTION CHANGE DETECTION =====
-   // If price reverses direction, enter immediately
-   if(tickIndex >= 2)
+   // Calculate momentum over lookback period
+   double momentum = close[0] - close[MomentumLookback];
+   double momentumThreshold = atr * MomentumThresholdATR;
+   
+   // Check if momentum exceeds threshold
+   if(MathAbs(momentum) < momentumThreshold)
+      return 0;
+   
+   // Volume confirmation (if enabled)
+   if(RequireVolumeConfirmation && lookback > 1)
    {
-      // BUY on any upward tick movement
-      if(Bid > bidBuffer[1] && bidBuffer[1] <= bidBuffer[2])
-         buySignal = MathMax(buySignal, 1);
+      long currentVolume = volume[0];
+      long avgVolume = 0;
+      for(int i = 1; i < lookback; i++)
+         avgVolume += volume[i];
+      avgVolume = avgVolume / (lookback - 1);
       
-      // SELL on any downward tick movement
-      if(Ask < askBuffer[1] && askBuffer[1] >= askBuffer[2])
-         sellSignal = MathMax(sellSignal, 1);
+      // Require current volume to be above average
+      if(currentVolume < avgVolume * 0.8)
+         return 0;
    }
    
-   // ===== (C) MICRO PULLBACK ENTRY - SIMPLIFIED & AGGRESSIVE =====
-   if(tickIndex >= 2)
-   {
-      // Any tiny pullback followed by continuation = signal
-      if(Bid > bidBuffer[1] && bidBuffer[1] < bidBuffer[2])
-         buySignal = MathMax(buySignal, 1);
-      
-      if(Ask < askBuffer[1] && askBuffer[1] > askBuffer[2])
-         sellSignal = MathMax(sellSignal, 1);
-   }
-   
-   // ===== (D) SPREAD COMPRESSION ENTRY - MORE AGGRESSIVE =====
-   if(spreadIndex >= 3)
-   {
-      double currentSpread = Ask - Bid;
-      double avgSpread = 0.0;
-      
-      for(int i = 0; i < 5; i++)
-      {
-         avgSpread += spreadBuffer[i];
-      }
-      avgSpread = avgSpread / 5.0;
-      
-      // AGGRESSIVE: Trigger at 80% of average (was 50%) - much more frequent
-      if(avgSpread > 0.0 && currentSpread < avgSpread * 0.8)
-      {
-         // Spread compression detected - enter in momentum direction
-         if(buySignal == 0 && sellSignal == 0)
-         {
-            // No other signal, use immediate momentum
-            if(Bid > bidBuffer[1])
-               buySignal = 1;
-            else if(Ask < askBuffer[1])
-               sellSignal = 1;
-         }
-         // Strengthen existing signals
-         else if(buySignal > 0)
-            buySignal = 2;
-         else if(sellSignal > 0)
-            sellSignal = 2;
-      }
-   }
-   
-   // ===== (E) CONTINUOUS MOMENTUM DETECTION =====
-   // If price is consistently moving in one direction, keep entering
-   if(tickIndex >= 2)
-   {
-      if(Bid > bidBuffer[1] && bidBuffer[1] > bidBuffer[2])
-         buySignal = MathMax(buySignal, 1);
-      
-      if(Ask < askBuffer[1] && askBuffer[1] < askBuffer[2])
-         sellSignal = MathMax(sellSignal, 1);
-   }
-   
-   // Return combined signal - AGGRESSIVE: any signal triggers trade
-   if(buySignal > 0 && buySignal >= sellSignal)
-      return 1;  // BUY
-   else if(sellSignal > 0 && sellSignal > buySignal)
-      return -1;  // SELL
-   
-   return 0;  // No signal
+   // Return direction: 1 = BUY, -1 = SELL
+   return (momentum > 0) ? 1 : -1;
 }
 
-// =====================================================================================================
-// TICK BUFFER MANAGEMENT
-// =====================================================================================================
+// GetEMA and GetRSI removed - not used in order block strategy
 
-void UpdateTickBuffers()
+double NormalizeVolume(const string symbol, double lots)
 {
-   // Shift bid buffer - REDUCED SIZE (3 instead of 5)
-   for(int i = 2; i > 0; i--)
-   {
-      bidBuffer[i] = bidBuffer[i-1];
-   }
-   bidBuffer[0] = Bid;
-   
-   // Shift ask buffer - REDUCED SIZE (3 instead of 5)
-   for(int i = 2; i > 0; i--)
-   {
-      askBuffer[i] = askBuffer[i-1];
-   }
-   askBuffer[0] = Ask;
-   
-   // Update spread buffer - REDUCED SIZE (5 instead of 10)
-   double currentSpread = Ask - Bid;
-   for(int i = 4; i > 0; i--)
-   {
-      spreadBuffer[i] = spreadBuffer[i-1];
-   }
-   spreadBuffer[0] = currentSpread;
-   
-   tickIndex++;
-   spreadIndex++;
-   
-   // AGGRESSIVE: Mark buffers as initialized after just 2 ticks (was 5)
-   if(tickIndex >= 2)
-      buffersInitialized = true;
-   
-   // AGGRESSIVE: Mark spread buffer initialized after 3 ticks (was 10)
-   if(spreadIndex >= 3)
-      spreadBufferInitialized = true;
+   double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+   double step   = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   lots = MathMax(minLot, MathMin(maxLot, lots));
+   if(step > 0)
+      lots = MathFloor(lots / step) * step;
+   lots = MathMax(minLot, lots);  // Re-apply min after rounding
+   return NormalizeDouble(lots, 2);
 }
 
-// =====================================================================================================
-// ULTRA FAST EXIT SYSTEM
-// =====================================================================================================
-
-void ManageHFTrade()
+// Lot scaling: fixed BaseLot, scale up by cumulative realized profit
+double GetScaledLot(const string symbol)
 {
-   if(!hasActiveTrade || currentTrade.ticket <= 0)
-      return;
-   
-   if(!PositionSelectByTicket(currentTrade.ticket))
+   double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   if(ProfitPerLotStep <= 0) return NormalizeVolume(symbol, BaseLot);
+   int steps = (int)MathFloor(cumulativeRealizedProfit / ProfitPerLotStep);
+   double lot = BaseLot + (steps * LotIncrement);
+   lot = MathMin(MaxLot, MathMax(minLot, lot));
+   return NormalizeVolume(symbol, lot);
+}
+
+// Count all positions (including pre-existing if IncludeAllTrades is true)
+int PositionsCount(const string symbol)
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
    {
-      hasActiveTrade = false;
-      currentTrade.ticket = 0;
-      return;
-   }
-   
-   if(PositionGetInteger(POSITION_TIME) == 0)
-   {
-      hasActiveTrade = false;
-      currentTrade.ticket = 0;
-      return;
-   }
-   
-   double currentProfit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP) + PositionGetDouble(POSITION_COMMISSION);
-   int holdSeconds = (int)(TimeCurrent() - currentTrade.openTime);
-   
-   // Track highest profit for trailing stop
-   if(currentProfit > highestProfit)
-      highestProfit = currentProfit;
-   
-   // ===== 1. MAXIMUM HOLD TIME ENFORCEMENT =====
-   if(holdSeconds >= MaxHoldSeconds)
-   {
-      if(currentProfit >= MinProfitToClose)
-      {
-         CloseHFTrade("Max hold time reached");
-      }
-      else
-      {
-         // Force close even at loss if max hold time exceeded
-         CloseHFTrade("Max hold time exceeded (forced close)");
-      }
-      return;
-   }
-   
-   // ===== 2. MINIMUM PROFIT CHECK =====
-   // Only close if profit meets minimum threshold
-   if(currentProfit < MinProfitToClose)
-   {
-      // Don't close yet - wait for minimum profit or max hold time
-      return;
-   }
-   
-   // ===== 3. BREAKEVEN STOP =====
-   if(!currentTrade.breakevenSet && currentProfit > 0)
-   {
-      double priceDistance = 0.0;
-      if(currentTrade.direction == 1)  // BUY
-      {
-         priceDistance = (Bid - currentTrade.entryPrice) / pipToPoint;
-      }
-      else  // SELL
-      {
-         priceDistance = (currentTrade.entryPrice - Ask) / pipToPoint;
-      }
+      if(!pos.SelectByIndex(i)) continue;
+      if(pos.Symbol() != symbol) continue;
       
-      if(priceDistance >= BreakevenTriggerPips)
-      {
-         double breakevenPrice = currentTrade.entryPrice;
-         double newStopLoss = breakevenPrice;
-         
-         MqlTradeRequest request = {};
-         MqlTradeResult result = {};
-         request.action = TRADE_ACTION_SLTP;
-         request.position = currentTrade.ticket;
-         request.symbol = Symbol();
-         request.sl = newStopLoss;
-         request.tp = PositionGetDouble(POSITION_TP);
-         
-         if(OrderSend(request, result))
-         {
-            currentTrade.stopLoss = newStopLoss;
-            currentTrade.breakevenSet = true;
-            Print("Breakeven stop set at entry price: ", DoubleToString(breakevenPrice, digits));
-         }
-      }
-   }
-   
-   // ===== 4. TRAILING STOP =====
-   if(currentProfit > 0 && TrailingStopPips > 0)
-   {
-      double trailDistance = TrailingStopPips * pipToPoint;
-      double newStopLoss = 0.0;
+      // Include all trades if enabled, otherwise only EA trades
+      if(!IncludeAllTrades && pos.Magic() != MagicNumber)
+         continue;
       
-      if(currentTrade.direction == 1)  // BUY
+      count++;
+   }
+   return count;
+}
+
+// Count all pending orders (including pre-existing if IncludeAllTrades is true)
+int PendingOrdersCount(const string symbol)
+{
+   int count = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; --i)
+   {
+      ulong oticket = OrderGetTicket(i);
+      if(oticket == 0) continue;
+      if(!OrderSelect(oticket)) continue;
+      if(OrderGetString(ORDER_SYMBOL) != symbol) continue;
+      
+      // Include all orders if enabled, otherwise only EA orders
+      if(!IncludeAllTrades && OrderGetInteger(ORDER_MAGIC) != MagicNumber)
+         continue;
+      
+      count++;
+   }
+   return count;
+}
+
+// Returns: 1 = any BUY limit, -1 = any SELL limit, 0 = none or mixed
+int GetPendingOrdersDirection(const string symbol)
+{
+   int buys = 0, sells = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; --i)
+   {
+      ulong oticket = OrderGetTicket(i);
+      if(oticket == 0) continue;
+      if(!OrderSelect(oticket)) continue;
+      if(OrderGetString(ORDER_SYMBOL) != symbol) continue;
+      if(!IncludeAllTrades && OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+      ENUM_ORDER_TYPE otype = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      if(otype == ORDER_TYPE_BUY_LIMIT) buys++;
+      else if(otype == ORDER_TYPE_SELL_LIMIT) sells++;
+   }
+   if(buys == 0 && sells == 0) return 0;
+   return (buys >= sells) ? 1 : -1;
+}
+
+datetime GetOldestPendingOrderTime(const string symbol)
+{
+   datetime oldest = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; --i)
+   {
+      ulong oticket = OrderGetTicket(i);
+      if(oticket == 0) continue;
+      if(!OrderSelect(oticket)) continue;
+      if(OrderGetString(ORDER_SYMBOL) != symbol) continue;
+      if(!IncludeAllTrades && OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+      datetime t = (datetime)OrderGetInteger(ORDER_TIME_SETUP);
+      if(oldest == 0 || t < oldest)
+         oldest = t;
+   }
+   return oldest;
+}
+
+void DeletePendingOrdersOnly(const string symbol)
+{
+   for(int i = OrdersTotal() - 1; i >= 0; --i)
+   {
+      ulong oticket = OrderGetTicket(i);
+      if(oticket == 0) continue;
+      if(!OrderSelect(oticket)) continue;
+      if(OrderGetString(ORDER_SYMBOL) != symbol) continue;
+      if(!IncludeAllTrades && OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+      ulong ticket = OrderGetInteger(ORDER_TICKET);
+      if(trade.OrderDelete(ticket))
+         Print("Deleted pending order ", ticket, " (direction change)");
+   }
+}
+
+// Returns: 1 = BUY, -1 = SELL, 0 = none. Uses positions first, else pendings (one direction only)
+int GetBasketOrPendingDirection(const string symbol)
+{
+   int posDir = GetBasketDirection(symbol);
+   if(posDir != 0) return posDir;
+   return GetPendingOrdersDirection(symbol);
+}
+
+// Returns: 1 = all BUY, -1 = all SELL, 0 = no positions
+int GetBasketDirection(const string symbol)
+{
+   int buys = 0, sells = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      if(!pos.SelectByIndex(i)) continue;
+      if(pos.Symbol() != symbol) continue;
+      if(!IncludeAllTrades && pos.Magic() != MagicNumber) continue;
+      if(pos.PositionType() == POSITION_TYPE_BUY) buys++; else sells++;
+   }
+   if(buys == 0 && sells == 0) return 0;
+   return (buys >= sells) ? 1 : -1;
+}
+
+// Calculate total profit for all trades (basket)
+double BasketProfit(const string symbol)
+{
+   double profit = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      if(!pos.SelectByIndex(i)) continue;
+      if(pos.Symbol() != symbol) continue;
+      
+      // Include all trades if enabled, otherwise only EA trades
+      if(!IncludeAllTrades && pos.Magic() != MagicNumber)
+         continue;
+      
+      profit += pos.Profit();
+      profit += pos.Swap();
+      profit += pos.Commission();
+   }
+   return profit;
+}
+
+// Calculate total lots for all trades (basket)
+double BasketLots(const string symbol)
+{
+   double lots = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      if(!pos.SelectByIndex(i)) continue;
+      if(pos.Symbol() != symbol) continue;
+      
+      // Include all trades if enabled, otherwise only EA trades
+      if(!IncludeAllTrades && pos.Magic() != MagicNumber)
+         continue;
+      
+      lots += pos.Volume();
+   }
+   return lots;
+}
+
+// Calculate dynamic basket profit target
+double CalculateBasketProfitTarget(const string symbol, double atr, double totalLots)
+{
+   if(!UseBasketProfit)
+      return 0.0;
+   
+   double target = 0.0;
+   
+   if(UsePercentForBasket)
+   {
+      // Use percentage of account balance
+      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+      target = balance * (BasketProfitPercent / 100.0);
+   }
+   else
+   {
+      // Use ATR-based calculation
+      if(atr > 0 && totalLots > 0)
       {
-         newStopLoss = Bid - trailDistance;
-         if(newStopLoss > currentTrade.entryPrice && (currentTrade.stopLoss == 0 || newStopLoss > currentTrade.stopLoss))
+         double tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+         double tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+         if(tickSize > 0)
          {
-            MqlTradeRequest request = {};
-            MqlTradeResult result = {};
-            request.action = TRADE_ACTION_SLTP;
-            request.position = currentTrade.ticket;
-            request.symbol = Symbol();
-            request.sl = newStopLoss;
-            request.tp = PositionGetDouble(POSITION_TP);
-            
-            if(OrderSend(request, result))
-            {
-               currentTrade.stopLoss = newStopLoss;
-               Print("Trailing stop updated: ", DoubleToString(newStopLoss, digits));
-            }
-         }
-      }
-      else  // SELL
-      {
-         newStopLoss = Ask + trailDistance;
-         if(newStopLoss < currentTrade.entryPrice && (currentTrade.stopLoss == 0 || newStopLoss < currentTrade.stopLoss))
-         {
-            MqlTradeRequest request = {};
-            MqlTradeResult result = {};
-            request.action = TRADE_ACTION_SLTP;
-            request.position = currentTrade.ticket;
-            request.symbol = Symbol();
-            request.sl = newStopLoss;
-            request.tp = PositionGetDouble(POSITION_TP);
-            
-            if(OrderSend(request, result))
-            {
-               currentTrade.stopLoss = newStopLoss;
-               Print("Trailing stop updated: ", DoubleToString(newStopLoss, digits));
-            }
+            double valuePerPoint = tickValue / tickSize;
+            double atrTarget = atr * BasketProfitATRMultiplier;
+            target = atrTarget * valuePerPoint * totalLots;
          }
       }
    }
    
-   // ===== 5. INSTANT PROFIT EXIT (if minimum profit met) =====
-   if(currentProfit >= MinProfitToClose)
-   {
-      CloseHFTrade("Profit target reached");
-      return;
-   }
+   return MathMax(target, 1.0); // Minimum target of $1
 }
 
-// =====================================================================================================
-// RISK MANAGEMENT CHECKS
-// =====================================================================================================
-
-void UpdateDailyTracking()
+datetime BasketOldestOpen(const string symbol)
 {
-   // Check if new trading day (reset daily tracking)
-   static int lastDay = 0;
-   MqlDateTime dt;
-   TimeToStruct(TimeCurrent(), dt);
-   int currentDay = dt.day;
-   
-   if(currentDay != lastDay)
+   datetime oldest = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
    {
-      dailyStartBalance = AccountBalance();
-      dailyProfitLoss = 0.0;
-      consecutiveLosses = 0;
-      cooldownUntil = 0;
-      lastDay = currentDay;
-      Print("New trading day - Daily tracking reset");
+      if(!pos.SelectByIndex(i)) continue;
+      if(pos.Symbol() != symbol) continue;
+      if(!IncludeAllTrades && pos.Magic() != MagicNumber) continue;
+      datetime opentime = pos.Time();
+      if(oldest == 0 || opentime < oldest)
+         oldest = opentime;
    }
-   
-   // Update daily P&L
-   dailyProfitLoss = AccountBalance() - dailyStartBalance;
-   
-   // Update session high equity
-   double currentEquity = AccountEquity();
-   if(currentEquity > sessionHighEquity)
-      sessionHighEquity = currentEquity;
+   return oldest;
 }
 
-bool CheckRiskManagement()
+// Velocity: current bar range / ATR (0-1). High = fast market.
+double GetVelocity(const string symbol, double atr)
 {
-   // Update daily tracking
-   UpdateDailyTracking();
-   
-   // Check cooldown period
-   if(cooldownUntil > 0 && TimeCurrent() < cooldownUntil)
+   if(atr <= 0) return 0;
+   double high[], low[];
+   ArraySetAsSeries(high, true);
+   ArraySetAsSeries(low, true);
+   if(CopyHigh(symbol, MomentumTF, 0, 1, high) < 1 || CopyLow(symbol, MomentumTF, 0, 1, low) < 1)
+      return 0;
+   double range = high[0] - low[0];
+   return MathMin(1.0, range / atr);
+}
+
+// Removed - not used in new strategy
+
+// Close all trades in basket (including pre-existing if IncludeAllTrades is true)
+// Uses async mode for near-simultaneous bulk close
+bool CloseBasket(const string symbol)
+{
+   // Collect position tickets first (positions may disappear during async close)
+   ulong posTickets[];
+   int nPos = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
    {
-      int remainingSeconds = (int)(cooldownUntil - TimeCurrent());
-      static int lastWarning = 0;
-      if(TimeCurrent() - lastWarning > 10)  // Warn every 10 seconds
-      {
-         Print("Trading paused - Cooldown active. Remaining: ", remainingSeconds, " seconds");
-         lastWarning = TimeCurrent();
-      }
-      return false;
+      if(!pos.SelectByIndex(i)) continue;
+      if(pos.Symbol() != symbol) continue;
+      if(!IncludeAllTrades && pos.Magic() != MagicNumber) continue;
+      ArrayResize(posTickets, nPos + 1);
+      posTickets[nPos++] = pos.Ticket();
    }
    
-   // Check daily loss limit
-   double dailyLossPercent = (dailyProfitLoss / dailyStartBalance) * 100.0;
-   if(dailyLossPercent <= -DailyLossLimitPercent)
+   // Collect order tickets
+   ulong ordTickets[];
+   int nOrd = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; --i)
    {
-      static int lastWarning = 0;
-      if(TimeCurrent() - lastWarning > 60)  // Warn once per minute
-      {
-         Print("Trading BLOCKED - Daily loss limit reached: ", DoubleToString(dailyLossPercent, 2), "%");
-         lastWarning = TimeCurrent();
-      }
-      return false;
+      ulong oticket = OrderGetTicket(i);
+      if(oticket == 0) continue;
+      if(!OrderSelect(oticket)) continue;
+      if(OrderGetString(ORDER_SYMBOL) != symbol) continue;
+      if(!IncludeAllTrades && OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+      ArrayResize(ordTickets, nOrd + 1);
+      ordTickets[nOrd++] = OrderGetInteger(ORDER_TICKET);
    }
    
-   // Check maximum drawdown
-   double currentDrawdown = ((sessionHighEquity - AccountEquity()) / sessionHighEquity) * 100.0;
-   if(currentDrawdown >= MaxDrawdownPercent)
-   {
-      static int lastWarning = 0;
-      if(TimeCurrent() - lastWarning > 60)  // Warn once per minute
-      {
-         Print("Trading BLOCKED - Maximum drawdown exceeded: ", DoubleToString(currentDrawdown, 2), "%");
-         lastWarning = TimeCurrent();
-      }
-      return false;
-   }
+   // Bulk close: async mode for near-simultaneous execution
+   trade.SetAsyncMode(true);
+   for(int i = 0; i < nPos; i++)
+      trade.PositionClose(posTickets[i], DeviationPoints);
+   for(int i = 0; i < nOrd; i++)
+      trade.OrderDelete(ordTickets[i]);
+   trade.SetAsyncMode(false);
    
-   // Check spread
-   double currentSpread = (Ask - Bid) / pipToPoint;
-   if(currentSpread > MaxSpreadPips)
+   if(nPos > 0 || nOrd > 0)
    {
-      static int lastWarning = 0;
-      if(TimeCurrent() - lastWarning > 30)  // Warn every 30 seconds
-      {
-         Print("Trading BLOCKED - Spread too wide: ", DoubleToString(currentSpread, 1), " pips (Max: ", MaxSpreadPips, ")");
-         lastWarning = TimeCurrent();
-      }
-      return false;
+      Print("Basket closed: ", nPos, " positions and ", nOrd, " orders closed/deleted for ", symbol);
+      Print("All trades closed - profit booked.");
    }
    
    return true;
 }
 
-// =====================================================================================================
-// RISK-BASED LOT SIZE CALCULATION
-// =====================================================================================================
-
-double CalculateRiskLotSize()
+double GetStopLossPrice(const string symbol, int direction)
 {
-   double balance = AccountBalance();
-   double riskMoney = balance * (RiskPercentPerTrade / 100.0);
+   if(!UseStopLoss)
+      return 0;
    
-   double tickValue = MarketInfo(Symbol(), MODE_TICKVALUE);
-   double tickSize = MarketInfo(Symbol(), MODE_TICKSIZE);
-   double pipValuePerLot = 0.0;
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double stopLossPoints = 0;
    
-   if(tickSize > 0)
-      pipValuePerLot = (tickValue / tickSize) * pipToPoint;
-   
-   if(pipValuePerLot <= 0.0)
-   {
-      Print("ERROR: Cannot calculate pip value. Using minimum lot.");
-      return MarketInfo(Symbol(), MODE_MINLOT);
-   }
-   
-   double virtualSL_Pips = 10.0;   // virtual stop to size lots for HFT
-   double lot = riskMoney / (virtualSL_Pips * pipValuePerLot);
-   
-   double minLot = MarketInfo(Symbol(), MODE_MINLOT);
-   double maxLot = MarketInfo(Symbol(), MODE_MAXLOT);
-   double lotStep = MarketInfo(Symbol(), MODE_LOTSTEP);
-   
-   lot = MathFloor(lot / lotStep) * lotStep;
-   if(lot < minLot) lot = minLot;
-   if(lot > maxLot) lot = maxLot;
-   
-   return NormalizeDouble(lot, 2);
-}
-
-// =====================================================================================================
-// TRADE OPENING
-// =====================================================================================================
-
-bool OpenHFTrade(int direction)
-{
-   if(direction == 0)
-      return false;
-   
-   // Check risk management conditions
-   if(!CheckRiskManagement())
-      return false;
-   
-   // Check if AutoTrading is enabled
-   if(!IsTradeAllowed())
-   {
-      static int lastWarningTime = 0;
-      if(TimeCurrent() - lastWarningTime > 60)  // Warn once per minute
-      {
-         Print("ERROR: AutoTrading is disabled in MT5. Please enable AutoTrading button!");
-         lastWarningTime = TimeCurrent();
-      }
-      return false;
-   }
-   
-   double tradeLots = CalculateRiskLotSize();
-   if(tradeLots <= 0.0)
-   {
-      Print("ERROR: Invalid lot size calculated");
-      return false;
-   }
-   
-   double price = (direction == 1) ? Ask : Bid;
-   double sl = 0.0;  // NO STOP LOSS
-   double tp = 0.0;  // NO TAKE PROFIT
-   
-   string comment = "HFT_V3_" + (direction == 1 ? "BUY" : "SELL");
-   ENUM_ORDER_TYPE orderType = (direction == 1) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-   
-   MqlTradeRequest request = {};
-   MqlTradeResult result = {};
-   request.action = TRADE_ACTION_DEAL;
-   request.symbol = Symbol();
-   request.volume = tradeLots;
-   request.type = orderType;
-   request.price = price;
-   request.sl = sl;
-   request.tp = tp;
-   request.comment = comment;
-   request.magic = MagicNumber;
-   request.deviation = 3;
-   
-   ulong ticket = 0;
-   if(OrderSend(request, result))
-   {
-      if(result.retcode == TRADE_RETCODE_DONE || result.retcode == TRADE_RETCODE_PLACED)
-      {
-         ticket = result.order;
-      }
-      else
-      {
-         Print("OrderSend returned retcode: ", result.retcode, " | Comment: ", result.comment);
-      }
-   }
-   
-   if(ticket > 0)
-   {
-      if(PositionSelectByTicket(ticket))
-      {
-         currentTrade.ticket = ticket;
-         currentTrade.entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-         currentTrade.openTime = (datetime)PositionGetInteger(POSITION_TIME);
-         currentTrade.direction = direction;
-         currentTrade.lotSize = tradeLots;
-         currentTrade.previousProfit = 0.0;
-         currentTrade.stopLoss = 0.0;
-         currentTrade.breakevenSet = false;
-         hasActiveTrade = true;
-         highestProfit = 0.0;
-         
-         Print("HFT TRADE OPENED: ", (direction == 1 ? "BUY" : "SELL"), 
-               " | Lot: ", tradeLots, " | Risk: ", RiskPercentPerTrade, "% | Price: ", price);
-         return true;
-      }
-   }
+   // Determine stop loss based on symbol
+   if(symbol == "XAUUSD" || symbol == "GOLD")
+      stopLossPoints = StopLossPointsXAU;
    else
+      stopLossPoints = StopLossPointsOther;
+   
+   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+   double stopLoss = 0;
+   
+   if(direction > 0) // BUY
    {
-      Print("OrderSend FAILED: Retcode=", result.retcode, " | Symbol=", Symbol(), " | Type=", (direction == 1 ? "BUY" : "SELL"),
-            " | Lot=", tradeLots, " | Price=", price, " | Comment: ", result.comment);
-      
-      // Common error messages
-      if(result.retcode == TRADE_RETCODE_INVALID_STOPS)
-         Print("ERROR: Invalid stops. Check price and stop levels.");
-      else if(result.retcode == TRADE_RETCODE_INVALID_VOLUME)
-         Print("ERROR: Invalid trade volume. Check lot size limits.");
-      else if(result.retcode == TRADE_RETCODE_NO_MONEY)
-         Print("ERROR: Not enough money to open trade.");
-      else if(result.retcode == TRADE_RETCODE_TRADE_DISABLED)
-         Print("ERROR: Trading is disabled.");
-      else if(result.retcode == TRADE_RETCODE_REQUOTE)
-         Print("ERROR: Requote occurred. Price changed during order execution.");
+      stopLoss = ask - (stopLossPoints * point);
+   }
+   else // SELL
+   {
+      stopLoss = bid + (stopLossPoints * point);
    }
    
-   return false;
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   return NormalizeDouble(stopLoss, digits);
 }
 
-// =====================================================================================================
-// TRADE CLOSING
-// =====================================================================================================
-
-void CloseHFTrade(string reason)
+bool OpenMarket(const string symbol, int direction, double atr)
 {
-   if(!hasActiveTrade || currentTrade.ticket <= 0)
-      return;
-   
-   if(!PositionSelectByTicket(currentTrade.ticket))
+   // Check total trades limit (dynamic 1-10)
+   int totalTrades = PositionsCount(symbol) + PendingOrdersCount(symbol);
+   int maxTrades = MathMax(MinTotalTrades, MathMin(10, MaxTotalTrades));
+   if(totalTrades >= maxTrades)
    {
-      hasActiveTrade = false;
-      currentTrade.ticket = 0;
-      return;
+      Print("Maximum trades limit reached: ", totalTrades, "/", maxTrades);
+      return false;
    }
    
-   if(PositionGetInteger(POSITION_TIME) == 0)
+   double lot = GetScaledLot(symbol);
+   if(lot <= 0)
    {
-      hasActiveTrade = false;
-      currentTrade.ticket = 0;
-      return;
+      Print("Lot calculation failed, aborting entry");
+      return false;
    }
    
-   double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP) + PositionGetDouble(POSITION_COMMISSION);
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(DeviationPoints);
    
-   // Allow closing at loss only if max hold time exceeded (handled in ManageHFTrade)
-   // Otherwise, only close if profit meets minimum threshold
-   if(profit < MinProfitToClose && profit > 0)
-   {
-      // Profit is positive but below minimum threshold - wait
-      return;
-   }
+   double stopLoss = GetStopLossPrice(symbol, direction);
+   // NO TAKE PROFIT - Let trades run until basket profit target is reached
+   double takeProfit = 0; // No individual TP - basket management only
+   bool result = false;
    
-   bool result = PositionClose(currentTrade.ticket);
+   if(direction > 0)
+      result = trade.Buy(lot, symbol, 0, stopLoss, 0, "Momentum BUY");
+   else
+      result = trade.Sell(lot, symbol, 0, stopLoss, 0, "Momentum SELL");
    
    if(result)
    {
-      int holdSeconds = (int)(TimeCurrent() - currentTrade.openTime);
-      Print("HFT TRADE CLOSED: ", reason, " | P&L: $", DoubleToString(profit, 2), 
-            " | Hold: ", IntegerToString(holdSeconds), "s");
+      double slPoints = (symbol == "XAUUSD" || symbol == "GOLD") ? StopLossPointsXAU : StopLossPointsOther;
+      Print("Opened trade: ", (direction > 0 ? "BUY" : "SELL"), 
+            " | Lot: ", DoubleToString(lot, 2),
+            " | SL: ", DoubleToString(stopLoss, 5), " (", DoubleToString(slPoints, 1), " pts)",
+            " | TP: NONE (Basket management only)");
+   }
+   else
+      Print("Failed to open trade. Error: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+   return result;
+}
+
+bool PlaceLimitOrders(const string symbol, int direction, double atr)
+{
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(DeviationPoints);
+   
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   long stopsLevel = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double stopLossPoints = (symbol == "XAUUSD" || symbol == "GOLD") ? StopLossPointsXAU : StopLossPointsOther;
+   
+   double offsets[] = {0.2, 0.4, 0.6, 0.8, 1.0};
+   double minOffset = MathMax(atr * 0.2, (double)stopsLevel * point);
+   int placed = 0;
+   int n = MathMin(5, LimitOrderCount);
+   
+   for(int i = 0; i < n; i++)
+   {
+      double lot = GetScaledLot(symbol);
+      double offset = MathMax(atr * offsets[i], minOffset);
+      double limitPrice = 0;
+      double sl = 0;
       
-      // Update risk management tracking
-      UpdateDailyTracking();
-      
-      // Track consecutive losses
-      if(profit < 0)
+      if(direction > 0)  // BUY LIMIT
       {
-         consecutiveLosses++;
-         Print("Consecutive losses: ", consecutiveLosses, "/", ConsecutiveLossLimit);
-         
-         // Activate cooldown if consecutive loss limit reached
-         if(consecutiveLosses >= ConsecutiveLossLimit)
+         limitPrice = NormalizeDouble(bid - offset, digits);
+         sl = NormalizeDouble(limitPrice - stopLossPoints * point, digits);
+         if(trade.BuyLimit(lot, limitPrice, symbol, sl, 0, ORDER_TIME_GTC, 0, "Limit BUY"))
+            placed++;
+         else
+            Print("BuyLimit failed: ", trade.ResultRetcode(), " at ", limitPrice);
+      }
+      else  // SELL LIMIT
+      {
+         limitPrice = NormalizeDouble(ask + offset, digits);
+         sl = NormalizeDouble(limitPrice + stopLossPoints * point, digits);
+         if(trade.SellLimit(lot, limitPrice, symbol, sl, 0, ORDER_TIME_GTC, 0, "Limit SELL"))
+            placed++;
+         else
+            Print("SellLimit failed: ", trade.ResultRetcode(), " at ", limitPrice);
+      }
+   }
+   if(placed > 0)
+      Print("Placed ", placed, "/", n, " limit orders (", (direction > 0 ? "BUY" : "SELL"), ")");
+   return (placed == n);
+}
+
+bool SpreadOK(const string symbol)
+{
+   double spread = (SymbolInfoDouble(symbol, SYMBOL_ASK) - SymbolInfoDouble(symbol, SYMBOL_BID)) / SymbolInfoDouble(symbol, SYMBOL_POINT);
+   return spread <= SpreadLimitPoints;
+}
+
+// Basket Exit Management - Close individual or basket when profitable
+void ManageExits(const string symbol, double atr)
+{
+   if(atr <= 0) return;
+   
+   // Calculate basket profit and target
+   double basketProfit = BasketProfit(symbol);
+   double totalLots = BasketLots(symbol);
+   double profitTarget = CalculateBasketProfitTarget(symbol, atr, totalLots);
+   datetime basketOldest = BasketOldestOpen(symbol);
+   int basketAgeSec = (int)(TimeCurrent() - basketOldest);
+   
+   // Dynamic hold: 0.5-4 sec by profit % (high profit = close fast, low = wait)
+   double holdSeconds = MinHoldSeconds;
+   if(UseTimeBasedClose)
+   {
+      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+      double profitPct = (balance > 0 && basketProfit > 0) ? (basketProfit / balance) * 100.0 : 0;
+      if(ProfitPctForFastClose > 0)
+         holdSeconds = MaxHoldSeconds - (profitPct / ProfitPctForFastClose) * (MaxHoldSeconds - MinHoldSeconds);
+      holdSeconds = MathMax(MinHoldSeconds, MathMin(MaxHoldSeconds, holdSeconds));
+   }
+   else
+      holdSeconds = 0;
+   
+   // CloseMode 1 or 2: Bulk close all individually profitable positions (async)
+   int individualClosed = 0;
+   if(CloseMode == 1 || CloseMode == 2)
+   {
+      ulong profitTickets[];
+      double totalProfitToAdd = 0;
+      int nProfit = 0;
+      for(int i = PositionsTotal() - 1; i >= 0; --i)
+      {
+         if(!pos.SelectByIndex(i)) continue;
+         if(pos.Symbol() != symbol) continue;
+         if(!IncludeAllTrades && pos.Magic() != MagicNumber) continue;
+         double posProfit = pos.Profit() + pos.Swap() + pos.Commission();
+         int posAgeSec = (int)(TimeCurrent() - pos.Time());
+         if(posProfit >= MinProfitToClose && posAgeSec >= (int)holdSeconds)
          {
-            cooldownUntil = TimeCurrent() + CooldownSeconds;
-            Print("COOLDOWN ACTIVATED - Pausing trading for ", CooldownSeconds, " seconds after ", consecutiveLosses, " consecutive losses");
-            consecutiveLosses = 0;  // Reset counter
+            ArrayResize(profitTickets, nProfit + 1);
+            profitTickets[nProfit++] = pos.Ticket();
+            totalProfitToAdd += posProfit;
+         }
+      }
+      if(nProfit > 0)
+      {
+         cumulativeRealizedProfit += totalProfitToAdd;
+         trade.SetAsyncMode(true);
+         for(int i = 0; i < nProfit; i++)
+            trade.PositionClose(profitTickets[i], DeviationPoints);
+         trade.SetAsyncMode(false);
+         individualClosed = nProfit;
+         Print("Bulk closed ", nProfit, " profitable positions | +", DoubleToString(totalProfitToAdd, 2), " realized");
+      }
+      if(individualClosed > 0 && CloseMode == 2)
+         return;  // For CLOSE_BOTH, skip basket close this tick after individual closes
+   }
+   
+   // CloseMode 0 or 2: Close basket when profitable (dynamic hold)
+   if((CloseMode == 0 || CloseMode == 2) && CloseAtAnyProfit && basketProfit >= MinProfitToClose && basketProfit > 0)
+   {
+      bool canClose = (holdSeconds <= 0 || basketAgeSec >= (int)holdSeconds);
+      if(canClose)
+      {
+         cumulativeRealizedProfit += basketProfit;
+         Print("Basket profitable - closing all. Profit: ", DoubleToString(basketProfit, 2));
+         CloseBasket(symbol);
+         return;
+      }
+   }
+   
+   // Check if basket profit target is reached (full target)
+   if(UseBasketProfit && profitTarget > 0 && basketProfit >= profitTarget && basketProfit > 0)
+   {
+      cumulativeRealizedProfit += basketProfit;
+      Print("Basket profit target reached! Closing all trades.");
+      Print("Basket Profit: ", DoubleToString(basketProfit, 2), 
+            " | Target: ", DoubleToString(profitTarget, 2),
+            " | Total Lots: ", DoubleToString(totalLots, 2));
+      
+      CloseBasket(symbol);
+      return;
+   }
+   
+   // Early close when profitable (even if below full target)
+   if(CloseEarlyWhenProfitable && basketProfit > 0)
+   {
+      double earlyCloseTarget = 0.0;
+      
+      if(UsePercentForEarlyClose)
+      {
+         // Use percentage of account balance
+         double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+         earlyCloseTarget = balance * (EarlyCloseProfitPercent / 100.0);
+      }
+      else
+      {
+         // Use ATR-based calculation
+         if(atr > 0 && totalLots > 0)
+         {
+            double tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+            double tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+            if(tickSize > 0)
+            {
+               double valuePerPoint = tickValue / tickSize;
+               double atrTarget = atr * EarlyCloseProfitATR;
+               earlyCloseTarget = atrTarget * valuePerPoint * totalLots;
+            }
+         }
+      }
+      
+      // Close basket if early profit target reached
+      if(earlyCloseTarget > 0 && basketProfit >= earlyCloseTarget)
+      {
+         cumulativeRealizedProfit += basketProfit;
+         Print("Early basket close triggered! Basket is profitable.");
+         Print("Basket Profit: ", DoubleToString(basketProfit, 2), 
+               " | Early Close Target: ", DoubleToString(earlyCloseTarget, 2),
+               " | Full Target: ", DoubleToString(profitTarget, 2),
+               " | Total Lots: ", DoubleToString(totalLots, 2));
+         
+         CloseBasket(symbol);
+         return;
+      }
+   }
+   
+   // Break-even protection and stop loss management
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   double stopLossPoints = (symbol == "XAUUSD" || symbol == "GOLD") ? StopLossPointsXAU : StopLossPointsOther;
+   double breakEvenTrigger = atr * BreakEvenTriggerATR;
+   
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      if(!pos.SelectByIndex(i)) continue;
+      if(pos.Symbol() != symbol) continue;
+      
+      // Include all trades if enabled
+      if(!IncludeAllTrades && pos.Magic() != MagicNumber)
+         continue;
+      
+      ulong ticket = pos.Ticket();
+      double currentSL = pos.StopLoss();
+      double currentTP = pos.TakeProfit();
+      double openPrice = pos.PriceOpen();
+      double positionProfit = pos.Profit() + pos.Swap() + pos.Commission();
+      ENUM_POSITION_TYPE ptype = (ENUM_POSITION_TYPE)pos.PositionType();
+      
+      // Add stop loss if missing
+      if(UseStopLoss && currentSL == 0)
+      {
+         double newSL = 0;
+         
+         if(ptype == POSITION_TYPE_BUY)
+            newSL = ask - (stopLossPoints * point);
+         else if(ptype == POSITION_TYPE_SELL)
+            newSL = bid + (stopLossPoints * point);
+         
+         if(newSL > 0)
+         {
+            newSL = NormalizeDouble(newSL, digits);
+            trade.PositionModify(ticket, newSL, currentTP);
+         }
+         continue;
+      }
+      
+      // Break-even protection - move SL to entry when profitable
+      if(UseBreakEven && currentSL > 0 && positionProfit > 0)
+      {
+         double priceDistance = 0;
+         bool shouldMoveToBE = false;
+         
+         if(ptype == POSITION_TYPE_BUY)
+         {
+            priceDistance = bid - openPrice;
+            // Move to BE if profit distance >= trigger and SL is below entry
+            if(priceDistance >= breakEvenTrigger && currentSL < openPrice)
+               shouldMoveToBE = true;
+         }
+         else if(ptype == POSITION_TYPE_SELL)
+         {
+            priceDistance = openPrice - ask;
+            // Move to BE if profit distance >= trigger and SL is above entry
+            if(priceDistance >= breakEvenTrigger && currentSL > openPrice)
+               shouldMoveToBE = true;
+         }
+         
+         if(shouldMoveToBE)
+         {
+            double newSL = NormalizeDouble(openPrice, digits);
+            // Add small buffer to avoid immediate stop
+            if(ptype == POSITION_TYPE_BUY)
+               newSL = NormalizeDouble(openPrice - (point * 5), digits); // 5 points below entry
+            else
+               newSL = NormalizeDouble(openPrice + (point * 5), digits); // 5 points above entry
+               
+            if(newSL != currentSL)
+            {
+               if(trade.PositionModify(ticket, newSL, currentTP))
+               {
+                  Print("Break-even set for position ", ticket, " at ", DoubleToString(newSL, digits));
+               }
+            }
+         }
+      }
+   }
+   
+   // Trailing stop - protect profits as they grow
+   if(UseTrailingStop)
+   {
+      double trailingDistance = atr * TrailingStopATR;
+      double trailingStep = atr * TrailingStepATR;
+      
+      for(int i = PositionsTotal() - 1; i >= 0; --i)
+      {
+         if(!pos.SelectByIndex(i)) continue;
+         if(pos.Symbol() != symbol) continue;
+         
+         // Include all trades if enabled
+         if(!IncludeAllTrades && pos.Magic() != MagicNumber)
+            continue;
+         
+         ulong ticket = pos.Ticket();
+         double currentSL = pos.StopLoss();
+         double currentTP = pos.TakeProfit();
+         double openPrice = pos.PriceOpen();
+         double positionProfit = pos.Profit() + pos.Swap() + pos.Commission();
+         ENUM_POSITION_TYPE ptype = (ENUM_POSITION_TYPE)pos.PositionType();
+         
+         // Only trail if position is profitable and has stop loss
+         if(currentSL > 0 && positionProfit > 0)
+         {
+            double newSL = currentSL;
+            bool modifyNeeded = false;
+            
+            if(ptype == POSITION_TYPE_BUY)
+            {
+               double idealSL = bid - trailingDistance;
+               // Only move SL up, never down
+               if(idealSL > currentSL + trailingStep && idealSL > openPrice)
+               {
+                  newSL = NormalizeDouble(idealSL, digits);
+                  modifyNeeded = true;
+               }
+            }
+            else if(ptype == POSITION_TYPE_SELL)
+            {
+               double idealSL = ask + trailingDistance;
+               // Only move SL down, never up
+               if((idealSL < currentSL - trailingStep || currentSL == 0) && idealSL < openPrice)
+               {
+                  newSL = NormalizeDouble(idealSL, digits);
+                  modifyNeeded = true;
+               }
+            }
+            
+            if(modifyNeeded && newSL != currentSL)
+            {
+               if(trade.PositionModify(ticket, newSL, currentTP))
+               {
+                  Print("Trailing stop updated for position ", ticket, 
+                        " | Old SL: ", DoubleToString(currentSL, digits),
+                        " | New SL: ", DoubleToString(newSL, digits));
+               }
+            }
+         }
+      }
+   }
+}
+
+// ---------------------------------------------------------------------------
+// Core logic
+// ---------------------------------------------------------------------------
+int OnInit()
+{
+   if(!EnsureSymbolReady(TradeSymbol))
+      return INIT_FAILED;
+   
+   // Close all existing trades when EA is activated
+   CloseAllExistingTrades(TradeSymbol);
+   
+   // Initialize ATR
+   atrHandle = iATR(TradeSymbol, ATRTimeframe, ATRPeriod);
+   if(atrHandle == INVALID_HANDLE)
+   {
+      Print("ATR handle failed");
+      return INIT_FAILED;
+   }
+   
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(DeviationPoints);
+   
+   cumulativeRealizedProfit = 0;
+   
+   double firstLot = GetScaledLot(TradeSymbol);
+   double minLot = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_MIN);
+   if(BaseLot < minLot)
+      Print("WARNING: BaseLot ", BaseLot, " < broker min ", minLot, ". Using ", minLot);
+   int maxTrades = MathMax(MinTotalTrades, MathMin(20, MaxTotalTrades));
+   
+   Print("========================================");
+   Print("Momentum Breakout EA initialized");
+   Print("========================================");
+   Print("Symbol: ", TradeSymbol);
+   Print("Lot: Base=", BaseLot, " Max=", MaxLot, " | Every $", ProfitPerLotStep, " profit + ", LotIncrement, " (first=", DoubleToString(firstLot, 2), ")");
+   Print("Trades per basket: ", MinTotalTrades, "-", maxTrades);
+   string tfStr = (MomentumTF == PERIOD_M1) ? "M1 (Scalping)" : 
+                  (MomentumTF == PERIOD_M5) ? "M5" :
+                  (MomentumTF == PERIOD_M15) ? "M15" : "Custom";
+   Print("Momentum Timeframe: ", tfStr);
+   Print("Momentum Threshold: ", MomentumThresholdATR, "x ATR");
+   Print("Momentum Lookback: ", MomentumLookback, " candles");
+   Print("Volume Confirmation: ", (RequireVolumeConfirmation ? "ENABLED" : "DISABLED"));
+   Print("Entry cooldown: ", MinSecondsBetweenEntries, " sec | One per bar: ", (OneEntryPerBar ? "YES" : "NO"));
+   if(InpTickVelocityThresholdPoints > 0)
+      Print("Tick Velocity Filter: ENABLED | Spike if price moves > ", InpTickVelocityThresholdPoints, " pts in 500ms (CloseBasket + ExpertRemove)");
+   else
+      Print("Tick Velocity Filter: DISABLED");
+   Print("Same-direction rule: ENABLED (no mixed BUY/SELL basket)");
+   if(UseLimitOrders)
+   {
+      long stopsLevel = SymbolInfoInteger(TradeSymbol, SYMBOL_TRADE_STOPS_LEVEL);
+      Print("Entry: ", MarketOrdersAtExecution, " market + ", LimitOrderCount, " limit | Min distance: ", stopsLevel, " pts");
+      Print("Cancel pendings: direction change after ", MinPendingHoldSeconds, " sec | timeout ", PendingOrderTimeoutSeconds, " sec");
+      double atrInit = GetATR();
+      if(atrInit > 0)
+      {
+         double point = SymbolInfoDouble(TradeSymbol, SYMBOL_POINT);
+         double minOffset = MathMax(atrInit * 0.2, (double)stopsLevel * point);
+         Print("First limit offset: ", DoubleToString(minOffset, 5), " (price)");
+      }
+   }
+   Print("Stop Loss: ", (UseStopLoss ? "ENABLED" : "DISABLED"));
+   if(UseStopLoss)
+   {
+      Print("  - XAUUSD Stop Loss: ", StopLossPointsXAU, " points");
+      Print("  - Other instruments: ", StopLossPointsOther, " points");
+   }
+   Print("Trailing Stop: ", (UseTrailingStop ? "ENABLED" : "DISABLED"));
+   if(UseTrailingStop)
+   {
+      Print("  - Trailing distance: ", TrailingStopATR, " ATR");
+      Print("  - Trailing step: ", TrailingStepATR, " ATR");
+   }
+   Print("Strategy: MOMENTUM BREAKOUT - NO INDIVIDUAL TAKE PROFIT - Basket Management Only");
+   Print("Basket Profit Management: ", (UseBasketProfit ? "ENABLED" : "DISABLED"));
+   if(UseBasketProfit)
+   {
+      if(UsePercentForBasket)
+         Print("  - Profit Target: ", BasketProfitPercent, "% of account balance");
+      else
+         Print("  - Profit Target: ", BasketProfitATRMultiplier, "x ATR");
+      Print("  - Include All Trades: ", (IncludeAllTrades ? "YES" : "NO (EA trades only)"));
+      if(CloseEarlyWhenProfitable)
+      {
+         if(UsePercentForEarlyClose)
+            Print("  - Early Close: ", EarlyCloseProfitPercent, "% profit");
+         else
+            Print("  - Early Close: ", EarlyCloseProfitATR, "x ATR profit");
+      }
+      if(CloseAtAnyProfit)
+         Print("  - Close At Any Profit: ", MinProfitToClose, " (min currency)");
+      if(UseTimeBasedClose)
+         Print("  - Dynamic hold: ", MinHoldSeconds, "-", MaxHoldSeconds, " sec by profit % (fast at ", ProfitPctForFastClose, "%)");
+      Print("  - CloseMode: ", CloseMode, " (0=basket 1=individual 2=both)");
+   }
+   Print("Break-Even Protection: ", (UseBreakEven ? "ENABLED" : "DISABLED"));
+   if(UseBreakEven)
+      Print("  - Break-Even Trigger: ", BreakEvenTriggerATR, "x ATR profit");
+   Print("Trailing Stop: ", (UseTrailingStop ? "ENABLED" : "DISABLED"));
+   if(UseTrailingStop)
+   {
+      Print("  - Trailing distance: ", TrailingStopATR, " ATR");
+      Print("  - Trailing step: ", TrailingStepATR, " ATR");
+   }
+   Print("========================================");
+   
+   eaInitialized = true;
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+   // Release indicator handles
+   if(atrHandle != INVALID_HANDLE)
+      IndicatorRelease(atrHandle);
+   Print("EA stopped. reason=", reason);
+}
+
+void OnTick()
+{
+   if(!EnsureSymbolReady(TradeSymbol))
+      return;
+   if(!SpreadOK(TradeSymbol))
+      return;
+
+   double atr = GetATR();
+   if(atr <= 0.0)
+      return;
+
+   // Tick Velocity Filter: spike if price moves > threshold in 500ms
+   if(InpTickVelocityThresholdPoints > 0)
+   {
+      double mid = (SymbolInfoDouble(TradeSymbol, SYMBOL_BID) + SymbolInfoDouble(TradeSymbol, SYMBOL_ASK)) / 2.0;
+      ulong now = GetTickCount64();
+      if(tickVelTime > 0 && (now - tickVelTime) >= 500)
+      {
+         double point = SymbolInfoDouble(TradeSymbol, SYMBOL_POINT);
+         double changePoints = MathAbs(mid - tickVelPrice) / (point > 0 ? point : 0.01);
+         if(changePoints >= InpTickVelocityThresholdPoints)
+         {
+            Print("Tick Velocity Spike! ", DoubleToString(changePoints, 1), " pts in 500ms - closing and removing EA");
+            CloseBasket(TradeSymbol);
+            ExpertRemove();
+            return;
+         }
+         tickVelPrice = mid;
+         tickVelTime = now;
+      }
+      else if(tickVelTime == 0)
+      {
+         tickVelPrice = mid;
+         tickVelTime = now;
+      }
+   }
+
+   int totalTrades = PositionsCount(TradeSymbol) + PendingOrdersCount(TradeSymbol);
+   
+   // Manage exits - check basket profit and close all trades if target reached
+   ManageExits(TradeSymbol, atr);
+   
+   // Recalculate after exits
+   totalTrades = PositionsCount(TradeSymbol) + PendingOrdersCount(TradeSymbol);
+   int maxTrades = MathMax(MinTotalTrades, MathMin(20, MaxTotalTrades));
+   
+   // Log basket profit status periodically
+   static datetime lastBasketLog = 0;
+   if(UseBasketProfit && TimeCurrent() - lastBasketLog > 60) // Log every minute
+   {
+      double basketProfit = BasketProfit(TradeSymbol);
+      double totalLots = BasketLots(TradeSymbol);
+      double profitTarget = CalculateBasketProfitTarget(TradeSymbol, atr, totalLots);
+      
+      if(totalTrades > 0)
+      {
+         Print("Basket Status: ", totalTrades, " trades | Profit: ", DoubleToString(basketProfit, 2), 
+               " | Target: ", DoubleToString(profitTarget, 2),
+               " | Progress: ", DoubleToString((basketProfit / profitTarget) * 100.0, 1), "%");
+      }
+      lastBasketLog = TimeCurrent();
+   }
+   
+   // Check trade limit
+   int maxForMode = UseLimitOrders ? (MarketOrdersAtExecution + LimitOrderCount) : maxTrades;
+   if(totalTrades >= maxForMode)
+      return;
+   
+   // Momentum Breakout Entry - Simple and effective for scalping
+   int entryDirection = DetectMomentumBreakout(TradeSymbol, atr);
+   
+   // Log momentum status periodically
+   static datetime lastMomentumLog = 0;
+   if(TimeCurrent() - lastMomentumLog > 30) // Log every 30 seconds
+   {
+      if(entryDirection != 0)
+      {
+         double close[];
+         ArraySetAsSeries(close, true);
+         if(CopyClose(TradeSymbol, MomentumTF, 0, MomentumLookback + 1, close) >= MomentumLookback + 1)
+         {
+            double momentum = close[0] - close[MomentumLookback];
+            double threshold = atr * MomentumThresholdATR;
+            Print("Momentum Breakout detected: ", (entryDirection > 0 ? "BUY" : "SELL"),
+                  " | Momentum: ", DoubleToString(momentum, 5),
+                  " | Threshold: ", DoubleToString(threshold, 5));
          }
       }
       else
       {
-         // Reset consecutive losses on profitable trade
-         consecutiveLosses = 0;
+         Print("Waiting for momentum breakout signal...");
       }
+      lastMomentumLog = TimeCurrent();
+   }
+   
+   // Open trade if momentum breakout detected
+   if(entryDirection != 0)
+   {
+      // Same-direction rule: no mixed BUY/SELL (positions or pendings)
+      int basketDir = GetBasketOrPendingDirection(TradeSymbol);
+      if(basketDir != 0 && entryDirection != basketDir)
+         return;
       
-      // Track pattern sequence progress
-      if(UsePatternStrategy)
+      int pendingCount = PendingOrdersCount(TradeSymbol);
+      
+      if(UseLimitOrders)
       {
-         tradesInSequence++;
-         
-         // Track trade direction in recent trades array
-         if(recentTradeCount < 20)
+         // Cancel pendings on direction change (after min hold) or timeout (not filled)
+         if(pendingCount > 0)
          {
-            recentTradeDirections[recentTradeCount] = currentTrade.direction;
-            recentTradeCount++;
+            int pendingDir = GetPendingOrdersDirection(TradeSymbol);
+            datetime oldestPending = GetOldestPendingOrderTime(TradeSymbol);
+            int pendingAgeSec = (int)(TimeCurrent() - oldestPending);
+            bool cancelOnDirection = (pendingDir != 0 && entryDirection != pendingDir && pendingAgeSec >= MinPendingHoldSeconds);
+            bool cancelOnTimeout = (pendingAgeSec >= PendingOrderTimeoutSeconds);
+            if(cancelOnDirection || cancelOnTimeout)
+            {
+               DeletePendingOrdersOnly(TradeSymbol);
+               return;
+            }
+            return;  // Place only when no pendings (avoid duplicates)
+         }
+         // Entry cooldown
+         if(TimeCurrent() - lastEntryTime < MinSecondsBetweenEntries)
+            return;
+         if(OneEntryPerBar)
+         {
+            datetime barTime = iTime(TradeSymbol, MomentumTF, 0);
+            if(lastEntryBar == barTime)
+               return;
+         }
+         
+         double currentPrice = (SymbolInfoDouble(TradeSymbol, SYMBOL_BID) + SymbolInfoDouble(TradeSymbol, SYMBOL_ASK)) / 2.0;
+         Print("Momentum Entry Signal: ", (entryDirection > 0 ? "BUY" : "SELL"),
+               " | Price: ", DoubleToString(currentPrice, 5),
+               " | Opening ", MarketOrdersAtExecution, " market + ", LimitOrderCount, " limit");
+         
+         // 1. Open 4 market orders immediately
+         int marketOpened = 0;
+         trade.SetAsyncMode(true); // HFT burst: send orders without waiting
+         for(int m = 0; m < MarketOrdersAtExecution; m++)
+         {
+            int currentTotal = PositionsCount(TradeSymbol) + PendingOrdersCount(TradeSymbol);
+            if(currentTotal >= maxForMode) break;
+            if(OpenMarket(TradeSymbol, entryDirection, atr))
+               marketOpened++;
+         }
+         trade.SetAsyncMode(false);
+         
+         // 2. Place 5 limit orders
+         bool limitsOk = PlaceLimitOrders(TradeSymbol, entryDirection, atr);
+         
+         if(marketOpened > 0 || limitsOk)
+         {
+            lastEntryTime = TimeCurrent();
+            if(OneEntryPerBar)
+               lastEntryBar = iTime(TradeSymbol, MomentumTF, 0);
+            Print("✓ Opened ", marketOpened, " market + ", (limitsOk ? LimitOrderCount : 0), " limits");
          }
          else
+            Print("✗ Failed to place orders.");
+      }
+      else
+      {
+         // Market order path
+         if(TimeCurrent() - lastEntryTime < MinSecondsBetweenEntries)
+            return;
+         if(OneEntryPerBar)
          {
-            // Shift array
-            for(int i = 0; i < 19; i++)
-               recentTradeDirections[i] = recentTradeDirections[i+1];
-            recentTradeDirections[19] = currentTrade.direction;
+            datetime barTime = iTime(TradeSymbol, MomentumTF, 0);
+            if(lastEntryBar == barTime)
+               return;
          }
-      }
-   }
-      else
-      {
-         Print("PositionClose failed: ", GetLastError());
-      }
-   
-   hasActiveTrade = false;
-   currentTrade.ticket = 0;
-}
-
-// =====================================================================================================
-// DISPLAY
-// =====================================================================================================
-
-void UpdateDisplay()
-{
-   // Update daily tracking for display
-   UpdateDailyTracking();
-   
-   string display = "\n=== ULTRA HIGH FREQUENCY MICRO-SCALPER V3 ===\n";
-   if(UsePatternStrategy)
-   {
-      display += "PATTERN-BASED ENTRY STRATEGY\n";
-      display += "Sequence: " + IntegerToString(tradesInSequence) + "/" + IntegerToString(PatternSequenceLength);
-      display += " | Pattern Position: " + IntegerToString(patternIndex) + "/" + IntegerToString(PatternSequenceLength) + "\n";
-      string momentumStr = (lastPatternMomentum == 1 ? "BULLISH" : (lastPatternMomentum == -1 ? "BEARISH" : "NEUTRAL"));
-      display += "Current Momentum: " + momentumStr + "\n";
-      display += "Risk per Trade: " + DoubleToString(RiskPercentPerTrade, 1) + "% | Max Hold: " + 
-                 IntegerToString(MaxHoldSeconds) + "s\n";
-   }
-   else
-   {
-      display += "AGGRESSIVE MODE: 5-IN-1 ENTRY SYSTEM\n";
-      display += "Tick Momentum | Direction Change | Micro Pullback | Spread Compression | Continuous Momentum\n";
-      display += "Risk per Trade: " + DoubleToString(RiskPercentPerTrade, 1) + "% | Max Hold: " + 
-                 IntegerToString(MaxHoldSeconds) + "s\n";
-   }
-   
-   // Risk Management Status
-   display += "\n--- RISK MANAGEMENT ---\n";
-   double dailyLossPercent = (dailyProfitLoss / dailyStartBalance) * 100.0;
-   double currentDrawdown = sessionHighEquity > 0 ? ((sessionHighEquity - AccountEquity()) / sessionHighEquity) * 100.0 : 0.0;
-   double currentSpread = (Ask - Bid) / pipToPoint;
-   
-   display += "Daily P&L: $" + DoubleToString(dailyProfitLoss, 2) + " (" + DoubleToString(dailyLossPercent, 2) + "%)";
-   if(dailyLossPercent <= -DailyLossLimitPercent)
-      display += " [LIMIT REACHED]";
-   display += "\n";
-   
-   display += "Drawdown: " + DoubleToString(currentDrawdown, 2) + "%";
-   if(currentDrawdown >= MaxDrawdownPercent)
-      display += " [LIMIT REACHED]";
-   display += "\n";
-   
-   display += "Spread: " + DoubleToString(currentSpread, 1) + " pips";
-   if(currentSpread > MaxSpreadPips)
-      display += " [TOO WIDE]";
-   display += "\n";
-   
-   display += "Consecutive Losses: " + IntegerToString(consecutiveLosses) + "/" + IntegerToString(ConsecutiveLossLimit) + "\n";
-   
-   if(cooldownUntil > 0 && TimeCurrent() < cooldownUntil)
-   {
-      int remainingSeconds = (int)(cooldownUntil - TimeCurrent());
-      display += "COOLDOWN: " + IntegerToString(remainingSeconds) + "s remaining\n";
-   }
-   
-   display += "\n--- TRADE MANAGEMENT ---\n";
-   display += "Trailing Stop: " + DoubleToString(TrailingStopPips, 1) + " pips\n";
-   display += "Breakeven Trigger: " + DoubleToString(BreakevenTriggerPips, 1) + " pips\n";
-   display += "Min Profit to Close: $" + DoubleToString(MinProfitToClose, 2) + "\n";
-   
-   if(hasActiveTrade)
-   {
-      if(PositionSelectByTicket(currentTrade.ticket))
-      {
-         double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP) + PositionGetDouble(POSITION_COMMISSION);
-         int holdSeconds = (int)(TimeCurrent() - currentTrade.openTime);
          
-         display += "\n--- ACTIVE TRADE ---\n";
-         display += "Direction: " + (currentTrade.direction == 1 ? "BUY" : "SELL") + "\n";
-         display += "P&L: $" + DoubleToString(profit, 2);
-         if(profit >= MinProfitToClose)
-            display += " [READY TO CLOSE]";
-         display += "\n";
-         display += "Hold: " + IntegerToString(holdSeconds) + "s / " + 
-                    IntegerToString(MaxHoldSeconds) + "s max\n";
-         if(currentTrade.breakevenSet)
-            display += "Breakeven: SET\n";
-         if(currentTrade.stopLoss > 0)
-            display += "Stop Loss: " + DoubleToString(currentTrade.stopLoss, digits) + "\n";
+         double currentPrice = (SymbolInfoDouble(TradeSymbol, SYMBOL_BID) + SymbolInfoDouble(TradeSymbol, SYMBOL_ASK)) / 2.0;
+         Print("Momentum Breakout Entry Signal: ", (entryDirection > 0 ? "BUY" : "SELL"),
+               " | Current Price: ", DoubleToString(currentPrice, 5),
+               " | Total trades: ", totalTrades, "/", maxTrades);
+         
+         if(OpenMarket(TradeSymbol, entryDirection, atr))
+         {
+            lastEntryTime = TimeCurrent();
+            if(OneEntryPerBar)
+               lastEntryBar = iTime(TradeSymbol, MomentumTF, 0);
+            Print("✓ Trade opened successfully");
+         }
+         else
+            Print("✗ Failed to open trade.");
       }
    }
-   else
-   {
-      display += "\n--- STATUS ---\n";
-      display += "No active trade\n";
-      if(CheckRiskManagement())
-         display += "Status: READY TO TRADE\n";
-      else
-         display += "Status: BLOCKED (check risk limits)\n";
-      if(tickIndex >= 2)
-         display += "Buffers: READY (Ultra-Fast Mode)\n";
-      else
-         display += "Buffers: Initializing (" + IntegerToString(tickIndex) + "/2 ticks)...\n";
-   }
-   
-   Comment(display);
 }
+
+// Safety: clean up dangling pendings on stop
+void OnTesterDeinit()
+{
+   CloseBasket(TradeSymbol);
+}
+
+
+
+
+
+
+
+
+
+
+
