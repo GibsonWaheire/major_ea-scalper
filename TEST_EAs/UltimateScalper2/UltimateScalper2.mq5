@@ -33,6 +33,9 @@ input int             MinSecondsBetweenEntries = 5;       // HFT entry rate limi
 input bool            UseLimitOrders           = true;
 input int             MarketOrdersAtExecution  = 2;       // Instant market fills per signal
 input int             LimitOrderCount          = 2;       // Limit orders stacked per signal
+input double          BodyStrengthATR          = 0.25;    // Min candle body as ATR fraction (lower = more trades)
+input double          CloseLocationPct         = 0.30;    // Close must be in top/bottom X% of range (higher = more trades)
+input bool            RequireAcceleration      = false;   // Require momentum to be accelerating (false = more trades)
 
 // ─── Stop Loss ───────────────────────────────────────────────────────────────
 input bool            UseStopLoss              = true;
@@ -55,9 +58,13 @@ input int             CooldownSeconds          = 300;     // Base cooldown: 5 mi
 input double          QualitySL_ATR            = 1.5;     // Quality mode SL (ATR mult)
 input double          QualityTP_ATR            = 3.0;     // Quality mode TP (ATR mult)
 input int             QualityTimeoutSeconds    = 1800;    // Max quality hold: 30 min
+input double          QualityRiskPercent       = 4.0;     // Quality mode risk % of equity
 
 // ─── Margin Protection ───────────────────────────────────────────────────────
 input double          MarginTriggerLevel       = 150.0;   // Close all if margin% drops below
+
+// ─── Overall Profit Target ───────────────────────────────────────────────────
+input double          ProfitTargetPercent      = 70.0;    // Stop all trading when profit reaches X% of starting balance
 
 // ─── Globals ─────────────────────────────────────────────────────────────────
 CTrade        trade;
@@ -72,6 +79,217 @@ datetime cooldownStart   = 0;
 int      cooldownDur     = 0;       // Actual cooldown duration (may be extended)
 ulong    qualityTicket   = 0;
 datetime qualityOpenTime = 0;
+
+// ─── Persistence (GlobalVariables) ───────────────────────────────────────────
+// Survives chart period changes and MT5 restarts without closing trades.
+#define GV_STATE      "US2_State"
+#define GV_HFTCOUNT   "US2_HFTCount"
+#define GV_COOLSTART  "US2_CoolStart"
+#define GV_COOLDUR    "US2_CoolDur"
+#define GV_QTICKET    "US2_QTicket"
+#define GV_QOPENTIME  "US2_QOpenTime"
+#define GV_STARTBAL   "US2_StartBal"
+#define GV_STOPPED    "US2_Stopped"
+
+double startingBalance  = 0;
+bool   profitTargetHit  = false;
+
+void SaveState()
+{
+   GlobalVariableSet(GV_STATE,     (double)eaState);
+   GlobalVariableSet(GV_HFTCOUNT,  (double)hftTradeCount);
+   GlobalVariableSet(GV_COOLSTART, (double)cooldownStart);
+   GlobalVariableSet(GV_COOLDUR,   (double)cooldownDur);
+   GlobalVariableSet(GV_QTICKET,   (double)qualityTicket);
+   GlobalVariableSet(GV_QOPENTIME, (double)qualityOpenTime);
+   GlobalVariableSet(GV_STARTBAL,  startingBalance);
+   GlobalVariableSet(GV_STOPPED,   (double)profitTargetHit);
+}
+
+bool LoadState()
+{
+   if(!GlobalVariableCheck(GV_STATE)) return false;
+
+   eaState         = (EA_STATE)(int)GlobalVariableGet(GV_STATE);
+   hftTradeCount   = (int)GlobalVariableGet(GV_HFTCOUNT);
+   cooldownStart   = (datetime)GlobalVariableGet(GV_COOLSTART);
+   cooldownDur     = (int)GlobalVariableGet(GV_COOLDUR);
+   qualityTicket   = (ulong)GlobalVariableGet(GV_QTICKET);
+   qualityOpenTime = (datetime)GlobalVariableGet(GV_QOPENTIME);
+   startingBalance = GlobalVariableGet(GV_STARTBAL);
+   profitTargetHit = (bool)(int)GlobalVariableGet(GV_STOPPED);
+
+   // Validate quality ticket still exists
+   if(qualityTicket > 0 && !PositionSelectByTicket(qualityTicket))
+   {
+      Print("Restored: Quality ticket #", qualityTicket, " no longer open. Resetting to HFT.");
+      hftTradeCount   = 0;
+      qualityTicket   = 0;
+      qualityOpenTime = 0;
+      eaState         = STATE_HFT;
+   }
+
+   // If cooldown already elapsed while EA was off, advance to quality
+   if(eaState == STATE_COOLDOWN && (TimeCurrent() - cooldownStart) >= cooldownDur)
+   {
+      Print("Restored: Cooldown already elapsed. Advancing to QUALITY mode.");
+      eaState = STATE_QUALITY;
+   }
+
+   Print("State restored | Mode: ", EnumToString(eaState),
+         " | HFT trades: ", hftTradeCount,
+         " | Quality ticket: ", qualityTicket);
+   return true;
+}
+
+// ─── Panel ───────────────────────────────────────────────────────────────────
+#define PANEL_PREFIX  "US2_"
+#define PANEL_X       10
+#define PANEL_Y       20
+#define PANEL_W       260
+#define LINE_H        22
+#define PANEL_LINES   8
+#define PANEL_PAD_X   14
+#define PANEL_PAD_Y   12
+
+void PanelLabel(const string name, const string text, int x, int y, color clr, int sz = 8)
+{
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_ANCHOR,    ANCHOR_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN,    true);
+      ObjectSetString (0, name, OBJPROP_FONT,      "Consolas");
+   }
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,     clr);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,  sz);
+   ObjectSetString (0, name, OBJPROP_TEXT,      text);
+}
+
+void DrawPanel(double atr)
+{
+   int panelH = PANEL_LINES * LINE_H + (PANEL_PAD_Y * 2);
+
+   // Background
+   string bg = PANEL_PREFIX + "BG";
+   if(ObjectFind(0, bg) < 0)
+   {
+      ObjectCreate(0, bg, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, bg, OBJPROP_CORNER,      CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, bg, OBJPROP_SELECTABLE,  false);
+      ObjectSetInteger(0, bg, OBJPROP_HIDDEN,      true);
+      ObjectSetInteger(0, bg, OBJPROP_BACK,        true);
+      ObjectSetInteger(0, bg, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   }
+   ObjectSetInteger(0, bg, OBJPROP_XDISTANCE, PANEL_X);
+   ObjectSetInteger(0, bg, OBJPROP_YDISTANCE, PANEL_Y);
+   ObjectSetInteger(0, bg, OBJPROP_XSIZE,     PANEL_W);
+   ObjectSetInteger(0, bg, OBJPROP_YSIZE,     panelH);
+   ObjectSetInteger(0, bg, OBJPROP_BGCOLOR,   C'22,22,22');
+   ObjectSetInteger(0, bg, OBJPROP_COLOR,     C'55,55,55');
+
+   int tx = PANEL_X + PANEL_PAD_X;
+   int ty = PANEL_Y + PANEL_PAD_Y;
+
+   // Row 0 — Header
+   PanelLabel(PANEL_PREFIX+"R0", "UltimateScalper2  v1.00", tx, ty, C'160,160,160', 8);
+   ty += LINE_H;
+
+   // Row 1 — Symbol + ATR
+   PanelLabel(PANEL_PREFIX+"R1",
+      StringFormat("%-8s  ATR: %.2f", TradeSymbol, atr),
+      tx, ty, C'110,110,110', 8);
+   ty += LINE_H;
+
+   // Row 2 — Mode (colour-coded)
+   string modeStr; color modeClr;
+   if(profitTargetHit)
+   {
+      modeStr = "MODE:  PROFIT TARGET HIT";
+      modeClr = C'255,215,0';  // Gold
+   }
+   else
+   {
+      switch(eaState)
+      {
+         case STATE_HFT:      modeStr = "MODE:  HFT ACTIVE";   modeClr = C'0,220,100';  break;
+         case STATE_COOLDOWN: modeStr = "MODE:  COOLDOWN";      modeClr = C'255,160,0';  break;
+         case STATE_QUALITY:  modeStr = "MODE:  QUALITY HOLD";  modeClr = C'80,185,255'; break;
+         default:             modeStr = "MODE:  ---";           modeClr = clrWhite;
+      }
+   }
+   PanelLabel(PANEL_PREFIX+"R2", modeStr, tx, ty, modeClr, 9);
+   ty += LINE_H;
+
+   // Row 3 — State detail
+   string detStr = ""; color detClr = C'160,160,160';
+   if(eaState == STATE_HFT)
+   {
+      detStr = StringFormat("Trades:  %d / %d", hftTradeCount, HFTTradeThreshold);
+   }
+   else if(eaState == STATE_COOLDOWN)
+   {
+      int rem = cooldownDur - (int)(TimeCurrent() - cooldownStart);
+      if(rem < 0) rem = 0;
+      detStr = StringFormat("Resume in:  %dm %02ds", rem / 60, rem % 60);
+      detClr = C'255,160,0';
+   }
+   else if(eaState == STATE_QUALITY)
+   {
+      if(qualityTicket > 0)
+      {
+         int left = QualityTimeoutSeconds - (int)(TimeCurrent() - qualityOpenTime);
+         if(left < 0) left = 0;
+         detStr = StringFormat("Timeout in: %dm %02ds", left / 60, left % 60);
+      }
+      else detStr = "Waiting for H1 signal...";
+      detClr = C'80,185,255';
+   }
+   PanelLabel(PANEL_PREFIX+"R3", detStr, tx, ty, detClr, 8);
+   ty += LINE_H;
+
+   // Row 4 — Basket P&L
+   double profit = BasketProfit(TradeSymbol);
+   color pnlClr  = (profit >= 0) ? C'0,210,90' : C'255,75,75';
+   PanelLabel(PANEL_PREFIX+"R4",
+      StringFormat("Basket P&L:  %+.2f", profit),
+      tx, ty, pnlClr, 8);
+   ty += LINE_H;
+
+   // Row 5 — Positions + Pending
+   PanelLabel(PANEL_PREFIX+"R5",
+      StringFormat("Positions: %d   Pending: %d",
+         PositionsCount(TradeSymbol), PendingOrdersCount(TradeSymbol)),
+      tx, ty, C'110,110,110', 8);
+   ty += LINE_H;
+
+   // Row 6 — Margin
+   double mgn    = AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+   color  mgnClr = (mgn > 200) ? C'0,210,90' : (mgn > MarginTriggerLevel ? C'255,160,0' : C'255,75,75');
+   string mgnStr = (mgn <= 0) ? "Margin: N/A" : StringFormat("Margin: %.0f%%", mgn);
+   PanelLabel(PANEL_PREFIX+"R6", mgnStr, tx, ty, mgnClr, 8);
+   ty += LINE_H;
+
+   // Row 7 — Overall profit progress toward target
+   double curBal    = AccountInfoDouble(ACCOUNT_BALANCE);
+   double profitPct = (startingBalance > 0) ? ((curBal - startingBalance) / startingBalance) * 100.0 : 0;
+   double targetPct = ProfitTargetPercent;
+   color  prgClr    = profitTargetHit ? C'255,215,0' : (profitPct >= targetPct * 0.75 ? C'0,210,90' : C'110,110,110');
+   PanelLabel(PANEL_PREFIX+"R7",
+      StringFormat("Profit: %+.1f%% / %.0f%%", profitPct, targetPct),
+      tx, ty, prgClr, 8);
+
+   ChartRedraw(0);
+}
+
+void DeletePanel()
+{
+   ObjectsDeleteAll(0, PANEL_PREFIX);
+}
 
 // ─── Symbol Helpers ──────────────────────────────────────────────────────────
 
@@ -119,13 +337,53 @@ double GetATR()
 int DetectMomentum(const string sym, double atr, ENUM_TIMEFRAMES tf)
 {
    if(atr <= 0) return 0;
+
+   // ── Option A: Momentum Acceleration ──────────────────────────────────────
+   // Requires momentum to be BUILDING across two consecutive candles,
+   // not just present. Rejects drifts and fading moves.
    double close[];
    ArraySetAsSeries(close, true);
-   int needed = MomentumLookback + 1;
-   if(CopyClose(sym, tf, 0, needed, close) < needed) return 0;
-   double momentum = close[0] - close[MomentumLookback];
-   if(MathAbs(momentum) < atr * MomentumThresholdATR) return 0;
-   return (momentum > 0) ? 1 : -1;
+   if(CopyClose(sym, tf, 0, 3, close) < 3) return 0;
+
+   double velocity     = close[0] - close[1];  // current candle move
+   double prevVelocity = close[1] - close[2];  // previous candle move
+
+   bool accelBull = (velocity > 0 && prevVelocity > 0 && MathAbs(velocity) > MathAbs(prevVelocity));
+   bool accelBear = (velocity < 0 && prevVelocity < 0 && MathAbs(velocity) > MathAbs(prevVelocity));
+   bool dirBull   = velocity > 0;
+   bool dirBear   = velocity < 0;
+
+   // RequireAcceleration=true: both candles must agree AND accelerate (strict)
+   // RequireAcceleration=false: just need directional velocity above threshold (relaxed)
+   if(RequireAcceleration && !accelBull && !accelBear) return 0;
+   if(!RequireAcceleration && !dirBull && !dirBear)    return 0;
+
+   int dir = (RequireAcceleration ? accelBull : dirBull) ? 1 : -1;
+
+   // ── ATR minimum threshold — filters micro-noise ───────────────────────────
+   if(MathAbs(velocity) < atr * MomentumThresholdATR) return 0;
+
+   // ── Option B: Candle Body Strength + Close Location ──────────────────────
+   // Requires a decisive candle — large body, closed at the extreme.
+   double open[], high[], low[];
+   ArraySetAsSeries(open, true);
+   ArraySetAsSeries(high, true);
+   ArraySetAsSeries(low, true);
+   if(CopyOpen(sym, tf, 0, 1, open) < 1) return 0;
+   if(CopyHigh(sym, tf, 0, 1, high) < 1) return 0;
+   if(CopyLow (sym, tf, 0, 1, low)  < 1) return 0;
+
+   double body  = MathAbs(close[0] - open[0]);
+   double range = high[0] - low[0];
+
+   if(body  < atr * BodyStrengthATR) return 0;  // Weak candle — body too small
+   if(range <= 0)                    return 0;
+
+   double closePct = (close[0] - low[0]) / range;  // 0.0 = bottom, 1.0 = top
+   if(dir > 0 && closePct < (1.0 - CloseLocationPct)) return 0;  // BUY: close in top X%
+   if(dir < 0 && closePct > CloseLocationPct)          return 0;  // SELL: close in bottom X%
+
+   return dir;
 }
 
 // H1 candle direction — uses completed candle [1] for signal stability
@@ -328,7 +586,7 @@ bool OpenMarket(const string sym, int dir, double atr)
    double sl = GetStopLoss(sym, dir, atr);
    trade.SetExpertMagicNumber(MagicNumber);
    bool ok = (dir > 0) ? trade.Buy(lot, sym, 0, sl, 0) : trade.Sell(lot, sym, 0, sl, 0);
-   if(ok) hftTradeCount++;
+   if(ok) { hftTradeCount++; SaveState(); }
    return ok;
 }
 
@@ -365,6 +623,7 @@ void EnterCooldown(const string sym)
    Print("HFT → COOLDOWN | trades=", hftTradeCount,
          " | cooldown=", cooldownDur, "s",
          (hftTradeCount >= HFTExtendedThreshold ? " [EXTENDED]" : ""));
+   SaveState();
 }
 
 void RunHFT(const string sym, double atr)
@@ -399,6 +658,23 @@ void RunHFT(const string sym, double atr)
       OpenMarket(sym, dir, atr);
    }
    lastEntryTime = TimeCurrent();
+}
+
+// ─── Risk-Based Lot (Quality Mode Only) ──────────────────────────────────────
+
+double CalcRiskLot(const string sym, double entryPrice, double slPrice)
+{
+   double slDist = MathAbs(entryPrice - slPrice);
+   if(slDist <= 0) return NormalizeVolume(sym, BaseLot); // fallback
+
+   double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskAmt   = equity * (QualityRiskPercent / 100.0);
+   double tickValue = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize <= 0 || tickValue <= 0) return NormalizeVolume(sym, BaseLot);
+
+   double lot = riskAmt / ((slDist / tickSize) * tickValue);
+   return NormalizeVolume(sym, lot);
 }
 
 // ─── Quality Mode ────────────────────────────────────────────────────────────
@@ -436,7 +712,7 @@ void OpenQualityTrade(const string sym, double atr)
    double tpDist = atr * QualityTP_ATR;
    double tp     = (dir > 0) ? NormalizeDouble(entry + tpDist, digits)
                               : NormalizeDouble(entry - tpDist, digits);
-   double lot    = NormalizeVolume(sym, BaseLot);
+   double lot    = CalcRiskLot(sym, entry, sl);
 
    trade.SetExpertMagicNumber(MagicNumber);
    bool ok = (dir > 0) ? trade.Buy(lot, sym, 0, sl, tp) : trade.Sell(lot, sym, 0, sl, tp);
@@ -446,6 +722,7 @@ void OpenQualityTrade(const string sym, double atr)
       qualityOpenTime = TimeCurrent();
       Print("QUALITY trade opened | ", (dir > 0 ? "BUY" : "SELL"),
             " | SL=", sl, " | TP=", tp, " | Lot=", lot);
+      SaveState();
    }
    else
    {
@@ -459,10 +736,11 @@ void ManageQualityTrade(const string sym)
    {
       // TP or SL was hit — clean return to HFT
       Print("QUALITY trade closed (TP/SL hit). Resetting to HFT.");
-      hftTradeCount  = 0;
-      qualityTicket  = 0;
+      hftTradeCount   = 0;
+      qualityTicket   = 0;
       qualityOpenTime = 0;
-      eaState        = STATE_HFT;
+      eaState         = STATE_HFT;
+      SaveState();
       return;
    }
 
@@ -470,10 +748,11 @@ void ManageQualityTrade(const string sym)
    {
       Print("QUALITY trade timed out (", QualityTimeoutSeconds, "s). Closing → HFT.");
       trade.PositionClose(qualityTicket, DeviationPoints);
-      hftTradeCount  = 0;
-      qualityTicket  = 0;
+      hftTradeCount   = 0;
+      qualityTicket   = 0;
       qualityOpenTime = 0;
-      eaState        = STATE_HFT;
+      eaState         = STATE_HFT;
+      SaveState();
    }
 }
 
@@ -482,21 +761,54 @@ void ManageQualityTrade(const string sym)
 int OnInit()
 {
    if(!EnsureSymbolReady(TradeSymbol)) return INIT_FAILED;
-   CloseAllExistingTrades(TradeSymbol);
+
    atrHandle = iATR(TradeSymbol, ATRTimeframe, ATRPeriod);
    if(atrHandle < 0) { Print("ATR indicator failed to initialize."); return INIT_FAILED; }
-   Print("UltimateScalper2 v1.00 ready | HFT threshold=", HFTTradeThreshold,
-         " | Extended=", HFTExtendedThreshold, " | Cooldown=", CooldownSeconds, "s");
+
+   // Restore state if available — skips trade cleanup to preserve open positions
+   if(!LoadState())
+   {
+      // Fresh start — no saved state, clean slate
+      CloseAllExistingTrades(TradeSymbol);
+      startingBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      profitTargetHit = false;
+      Print("UltimateScalper2 v1.00 fresh start | Starting balance: ", startingBalance,
+            " | Profit target: +", ProfitTargetPercent, "%");
+      SaveState();
+   }
+
    return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason)
 {
+   SaveState();
    IndicatorRelease(atrHandle);
+   DeletePanel();
 }
 
 void OnTick()
 {
+   // ── Profit Target — stops all trading when reached ────────────────────────
+   if(profitTargetHit)
+   {
+      DrawPanel(GetATR());
+      return;
+   }
+   if(startingBalance > 0)
+   {
+      double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      double profitPct      = ((currentBalance - startingBalance) / startingBalance) * 100.0;
+      if(profitPct >= ProfitTargetPercent)
+      {
+         CloseBasket(TradeSymbol);
+         profitTargetHit = true;
+         SaveState();
+         Print("PROFIT TARGET HIT: +", DoubleToString(profitPct, 1), "% | Trading stopped.");
+         return;
+      }
+   }
+
    // ── Margin Protection — always runs first ─────────────────────────────────
    double marginLevel = AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
    if(marginLevel > 0 && marginLevel < MarginTriggerLevel)
@@ -507,6 +819,7 @@ void OnTick()
       eaState       = STATE_COOLDOWN;
       cooldownStart = TimeCurrent();
       cooldownDur   = CooldownSeconds;
+      SaveState();
       return;
    }
 
@@ -526,6 +839,7 @@ void OnTick()
          {
             Print("Cooldown complete (", cooldownDur, "s) → QUALITY mode.");
             eaState = STATE_QUALITY;
+            SaveState();
          }
          break;
 
@@ -536,4 +850,7 @@ void OnTick()
             ManageQualityTrade(TradeSymbol);
          break;
    }
+
+   // ── Panel ─────────────────────────────────────────────────────────────────
+   DrawPanel(atr);
 }
