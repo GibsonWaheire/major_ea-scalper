@@ -202,11 +202,6 @@ int DetectMomentumBreakout(const string symbol, double atr)
       CopyOpen(symbol, MomentumTF, 0, lookback, open) < lookback || cl < lookback)
       return 0;
    
-   // Overextension Blocker: prevent buying exhaustion
-   double barRange = high[0] - low[0];
-   if(barRange > atr * 2.0)
-      return 0;
-   
    if(RequireVolumeConfirmation)
    {
       if(CopyTickVolume(symbol, MomentumTF, 0, lookback, volume) < lookback)
@@ -220,22 +215,6 @@ int DetectMomentumBreakout(const string symbol, double atr)
    // Check if momentum exceeds threshold
    if(MathAbs(momentum) < momentumThreshold)
       return 0;
-   
-   // Rejection Wick Blocker: only enter on full-body momentum, not spiky rejection candles
-   double bodySize = MathAbs(open[0] - close[0]);
-   if(bodySize < 0.00001) bodySize = 0.00001;
-   if(momentum > 0)  // BUY candidate
-   {
-      double upperWick = high[0] - MathMax(open[0], close[0]);
-      if(upperWick > bodySize * 2.0)
-         return 0;
-   }
-   else  // SELL candidate
-   {
-      double lowerWick = MathMin(open[0], close[0]) - low[0];
-      if(lowerWick > bodySize * 2.0)
-         return 0;
-   }
    
    // Volume confirmation (if enabled)
    if(RequireVolumeConfirmation && lookback > 1)
@@ -1098,7 +1077,6 @@ void OnTick()
             ChartStatus("TICK VELOCITY SPIKE! " + DoubleToString(changePrice, 5) + " in 500ms - closing");
             Print("Tick Velocity Spike! ", DoubleToString(changePrice, 5), " (", DoubleToString(TickVelocitySpikeATR, 1), " ATR) in 500ms - closing");
             CloseBasket(_Symbol);
-            ExpertRemove();
             return;
          }
          tickVelPrice = mid;
@@ -1162,14 +1140,6 @@ void OnTick()
    // Open trade if momentum breakout detected (1 trade per tick - staggered entry)
    if(entryDirection != 0)
    {
-      // Same-direction rule: no mixed BUY/SELL (positions or pendings)
-      int basketDir = GetBasketOrPendingDirection(_Symbol);
-      if(basketDir != 0 && entryDirection != basketDir)
-      {
-         ChartStatus("Signal " + (entryDirection > 0 ? "BUY" : "SELL") + " but basket is " + (basketDir > 0 ? "BUY" : "SELL") + "\nSpread: " + DoubleToString(spreadPts, 0) + " pts");
-         return;
-      }
-      
       int posCount = PositionsCount(_Symbol);
       int pendingCount = PendingOrdersCount(_Symbol);
       
@@ -1185,27 +1155,6 @@ void OnTick()
          {
             DeletePendingOrdersOnly(_Symbol);
             ChartStatus("Cancelled pendings (direction/timeout)\nSpread: " + DoubleToString(spreadPts, 0) + " pts");
-            return;
-         }
-      }
-      
-      // Staggered: min seconds between each new trade
-      if(TimeCurrent() - lastTradeOpenTime < MinSecondsBetweenTrades)
-      {
-         ChartStatus("Cooldown: " + IntegerToString(MinSecondsBetweenTrades - (int)(TimeCurrent() - lastTradeOpenTime)) + "s left\nSignal: " + (entryDirection > 0 ? "BUY" : "SELL") + " | Spread: " + DoubleToString(spreadPts, 0) + " pts");
-         return;
-      }
-      if(TimeCurrent() - lastEntryTime < MinSecondsBetweenEntries)
-      {
-         ChartStatus("Entry cooldown\nSpread: " + DoubleToString(spreadPts, 0) + " pts");
-         return;
-      }
-      if(OneEntryPerBar)
-      {
-         datetime barTime = iTime(_Symbol, MomentumTF, 0);
-         if(lastEntryBar == barTime)
-         {
-            ChartStatus("One entry per bar - wait for new bar\nSignal: " + (entryDirection > 0 ? "BUY" : "SELL") + " | Spread: " + DoubleToString(spreadPts, 0) + " pts");
             return;
          }
       }
@@ -1248,8 +1197,6 @@ void OnTick()
       {
          lastTradeOpenTime = TimeCurrent();
          lastEntryTime = TimeCurrent();
-         if(OneEntryPerBar)
-            lastEntryBar = iTime(_Symbol, MomentumTF, 0);
          Print("✓ Staggered entry: 1 trade opened | Total: ", (posCount + pendingCount + 1), "/", maxForMode);
          ChartStatus("Opened " + (entryDirection > 0 ? "BUY" : "SELL") + " | Total: " + IntegerToString(posCount + pendingCount + 1) + "/" + IntegerToString(maxForMode) + "\nSpread: " + DoubleToString(spreadPts, 0) + " pts");
       }
