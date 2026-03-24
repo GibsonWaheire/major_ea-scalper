@@ -83,7 +83,6 @@ input double          BETrailATRTrigger        = 1.0;    // Trail SL to breakeve
 input double          BEBufferATRMult          = 0.1;    // Buffer above entry for BE SL (ATR × this)
 input int             ScoreHoldThreshold       = 4;      // Min score to qualify for partial close
 input bool            EnableGraduation         = true;   // Promote best trade to Quality on threshold hit
-input double          PostPartialCutATRMult    = 1.0;    // After partial: cut remaining if loss >= N×ATR from entry (0=off)
 
 // ─── Volatility Regime ────────────────────────────────────────────────────────
 // Compares current ATRTimeframe ATR vs a longer VolATRTF baseline.
@@ -987,26 +986,14 @@ void ManageHFTExits(const string sym, double atr)
          }
       }
 
-      // Step 3: Partial close — strong-score trades only, at ATR trigger
+      // Step 3: Partial close — strong-score trades only, at ATR trigger, confirmed in profit
       double curPx      = (dir > 0) ? SymbolInfoDouble(sym, SYMBOL_BID)
                                      : SymbolInfoDouble(sym, SYMBOL_ASK);
       double profitDist = (curPx - pos.PriceOpen()) * dir;
       bool   partialTrigger = (atr > 0 && profitDist >= atr * PartialCloseATRTrigger);
 
-      if(ScorePosition(ticket, atr) >= ScoreHoldThreshold && partialTrigger && !PCIsDone(ticket))
+      if(posProfit > 0 && ScorePosition(ticket, atr) >= ScoreHoldThreshold && partialTrigger && !PCIsDone(ticket))
          TryPartialClose(ticket, PartialCloseRatio);
-
-      // Step 4: Post-partial loss cut — guards remaining half after partial fires
-      if(PostPartialCutATRMult > 0 && PCIsDone(ticket) && atr > 0)
-      {
-         double lossDist = (pos.PriceOpen() - curPx) * dir;   // > 0 when in loss from entry
-         if(lossDist >= atr * PostPartialCutATRMult)
-         {
-            Print("Post-partial cut: #", ticket,
-                  " | loss from entry=", DoubleToString(lossDist, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS)));
-            trade.PositionClose(ticket, DeviationPoints);
-         }
-      }
    }
 }
 
@@ -1082,8 +1069,18 @@ void GraduateBestPosition(const string sym, double atr)
 
    if(bestTicket == 0 || bestScore < ScoreHoldThreshold)
    {
-      // No worthy candidate — close basket and restart HFT immediately
-      CloseBasket(sym);
+      // No worthy candidate — close any winning positions, leave losers for SL
+      trade.SetAsyncMode(true);
+      for(int i = PositionsTotal()-1; i >= 0; i--)
+      {
+         if(!pos.SelectByIndex(i) || pos.Symbol()!=sym || pos.Magic()!=MagicNumber) continue;
+         if(pos.Profit() + pos.Swap() > 0)
+            trade.PositionClose(pos.Ticket(), DeviationPoints);
+      }
+      trade.SetAsyncMode(false);
+      DeletePendingOrders(sym);
+      gPCCount = 0; gVelCount = 0;
+      hftTradeCount = 0;
       eaState = STATE_HFT;
       Print("HFT cycle complete | trades=", hftTradeCount,
             (bestScore > -99 ? StringFormat(" | best score=%d (below threshold)", bestScore) : ""),
@@ -1092,11 +1089,13 @@ void GraduateBestPosition(const string sym, double atr)
       return;
    }
 
-   // Close all except the best trade
+   // Close all except the best trade — only those currently showing a gain
    for(int i = PositionsTotal()-1; i >= 0; i--)
    {
       if(!pos.SelectByIndex(i) || pos.Symbol()!=sym || pos.Magic()!=MagicNumber) continue;
-      if(pos.Ticket() != bestTicket)
+      if(pos.Ticket() == bestTicket) continue;
+      double pnl = pos.Profit() + pos.Swap();
+      if(pnl > 0)
          trade.PositionClose(pos.Ticket(), DeviationPoints);
    }
    DeletePendingOrders(sym);
