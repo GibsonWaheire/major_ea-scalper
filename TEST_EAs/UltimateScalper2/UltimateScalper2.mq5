@@ -60,6 +60,7 @@ input double          PaddingATRMult           = 0.0;     // Candle SL padding a
 input double          BasketProfitATRMult      = 2.5;     // Full target (ATR multiplier)
 input bool            CloseAtAnyProfit         = true;    // Close basket at MinProfitToClose
 input double          MinProfitToClose         = 0.01;    // Minimum profit to trigger close
+input double          MinCloseATRMult          = 0.5;     // Min basket profit (N×ATR×lots value) before CloseAtAnyProfit fires
 
 // ─── State Machine ───────────────────────────────────────────────────────────
 input int             HFTTradeThreshold        = 50;      // Market orders before cooldown
@@ -776,8 +777,25 @@ void ManageHFTExits(const string sym, double atr)
 {
    double profit = BasketProfit(sym);
    double target = CalculateBasketProfitTarget(sym, atr, BasketLots(sym));
-   if(profit >= target && profit > 0)            { CloseBasket(sym); return; }
-   if(CloseAtAnyProfit && profit >= MinProfitToClose) { CloseBasket(sym); return; }
+
+   // Full ATR target — always honoured regardless of MinCloseATRMult
+   if(profit >= target && profit > 0) { CloseBasket(sym); return; }
+
+   // CloseAtAnyProfit — only fires when basket profit has reached a meaningful ATR distance.
+   // Prevents tiny $0.01 closes that leave nothing to absorb the next loss.
+   if(CloseAtAnyProfit && profit >= MinProfitToClose)
+   {
+      bool profitWorthy = true;
+      if(MinCloseATRMult > 0 && atr > 0)
+      {
+         double lots = BasketLots(sym);
+         double tv   = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+         double ts   = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+         if(ts > 0 && tv > 0 && lots > 0)
+            profitWorthy = (profit >= MinCloseATRMult * atr * (tv / ts) * lots);
+      }
+      if(profitWorthy) { CloseBasket(sym); return; }
+   }
 }
 
 bool OpenMarket(const string sym, int dir, double atr)

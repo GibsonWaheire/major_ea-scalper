@@ -90,6 +90,7 @@ input int             ScoreHoldThreshold       = 4;      // Min score to hold; p
 input int             ScorePartialThreshold    = 2;      // Min score for partial (else full close)
 input bool            EnableGraduation         = true;   // Promote best trade to Quality on threshold hit
 input double          PostPartialCutATRMult    = 1.0;   // After partial close: cut remaining if loss >= N×ATR from entry (0=off)
+input double          MinCloseATRMult          = 0.5;   // Min profit distance (N×ATR from entry) before ANY close/partial is allowed
 
 // ─── Profit Protection (High-Water Mark) ─────────────────────────────────────
 // Prevents closing a winning trade on a brief pullback.
@@ -1100,26 +1101,29 @@ void ManageHFTExits(const string sym, double atr)
       double profitDist     = (curPx - pos.PriceOpen()) * dir;
       bool   partialTrigger = (atr > 0 && profitDist >= atr * PartialCloseATRTrigger);
 
+      // Gate: don't close/reduce unless trade has moved at least MinCloseATRMult×ATR in profit.
+      // Prevents exiting at near-zero profit which leaves nothing to offset the next loss.
+      bool profitWorthy = (MinCloseATRMult <= 0 || atr <= 0 || profitDist >= atr * MinCloseATRMult);
+
       int score = ScorePosition(ticket, atr);
 
       if(score >= ScoreHoldThreshold)
       {
          // Strong trade — hold it; lock in partial profit if far enough and not yet done
-         if(partialTrigger && !PCIsDone(ticket))
+         if(partialTrigger && profitWorthy && !PCIsDone(ticket))
             TryPartialClose(ticket, PartialCloseRatio);
       }
       else if(score >= ScorePartialThreshold)
       {
-         // Moderate — only partial close if profit has pulled back below the floor
-         // (prevents cutting a winning trade on a normal pullback)
-         if(posProfit > 0 && !PCIsDone(ticket) && PWCanClose(ticket, posProfit))
+         // Moderate — only partial close if profit is worthy AND has pulled back below the floor
+         if(posProfit > 0 && profitWorthy && !PCIsDone(ticket) && PWCanClose(ticket, posProfit))
             TryPartialClose(ticket, PartialCloseRatio);
       }
       else
       {
-         // Weak / opposing — only close if profit has pulled back from peak
+         // Weak / opposing — only close if profit is worthy, pulled back from peak,
          // AND momentum has confirmed the reversal for N consecutive ticks
-         if(CloseAtAnyProfit && posProfit >= MinProfitToClose && PWCanClose(ticket, posProfit))
+         if(CloseAtAnyProfit && posProfit >= MinProfitToClose && profitWorthy && PWCanClose(ticket, posProfit))
             trade.PositionClose(ticket, DeviationPoints);
       }
 
