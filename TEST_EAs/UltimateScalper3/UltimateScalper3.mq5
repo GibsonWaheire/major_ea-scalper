@@ -125,6 +125,21 @@ input double          MarginTriggerLevel       = 150.0;
 // ─── Overall Profit Target ───────────────────────────────────────────────────
 input double          ProfitTargetPercent      = 70.0;
 
+// ─── Basket Drawdown Protection ──────────────────────────────────────────────
+// 3-stage response when total basket loss exceeds equity thresholds.
+input bool            EnableBasketDDProtection = true;
+input double          BasketDD_Caution_Pct     = 1.0;   // equity % → stop new entries + move all SLs to breakeven
+input double          BasketDD_Danger_Pct      = 2.0;   // equity % → close weakest 50% of positions (by score)
+input double          BasketDD_Emergency_Pct   = 3.0;   // equity % → close all positions + extended cooldown
+
+// ─── Daily Loss Limit ─────────────────────────────────────────────────────────
+input bool            EnableDailyLossLimit     = true;
+input double          DailyLossLimitPct        = 5.0;   // % equity drop from session open → halt trading rest of day
+
+// ─── Consecutive Loss Dampener ────────────────────────────────────────────────
+input bool            EnableConsecLossDampen   = true;
+input int             MaxConsecLosses          = 3;     // After N losing HFT cycles: halve max trades + double cooldown
+
 // ─── Globals ─────────────────────────────────────────────────────────────────
 CTrade        trade;
 CPositionInfo pos;
@@ -133,6 +148,14 @@ int           volAtrHandle = -1;   // Longer-period ATR for regime detection
 datetime      lastEntryTime = 0;
 double        gATR         = 0.0;  // Updated each tick for ATR-relative helpers
 bool          gDefensive   = false;
+
+// ─── Protection state ─────────────────────────────────────────────────────────
+bool          gCautionActive   = false;  // Layer 1 DD: blocks new entries
+double        gDayOpenEquity   = 0.0;   // Equity at calendar-day open
+bool          gDailyHalted     = false;  // Session halted by daily loss limit
+int           gDayChecked      = -1;    // Last day number gDayOpenEquity was refreshed
+int           gConsecLosses    = 0;     // Consecutive HFT cycles that ended with net equity loss
+double        gHFTStartEquity  = 0.0;   // Equity snapshot when current HFT cycle began
 
 // ─── Partial close tracking ───────────────────────────────────────────────────
 // Prevents re-triggering partial close on the same position within one HFT cycle.
@@ -225,7 +248,7 @@ bool LoadState()
 #define PANEL_Y      20
 #define PANEL_W      370
 #define LINE_H       24
-#define PANEL_LINES  9
+#define PANEL_LINES  10
 #define PANEL_PAD_X  16
 #define PANEL_PAD_Y  14
 
@@ -365,6 +388,19 @@ void DrawPanel(double atr, double baselineATR)
       : StringFormat("Vol: Normal     (x%.1f baseline)", ratio);
    color regClr = gDefensive ? C'255,100,80' : C'80,180,80';
    PanelLabel(PANEL_PREFIX+"R8", regStr, tx, ty, regClr, 8);
+
+   // Row 9 — Protection status
+   ty += LINE_H;
+   string protStr; color protClr;
+   if(gDailyHalted)
+      { protStr = "HALTED: daily loss limit";                                           protClr = C'255,75,75'; }
+   else if(gCautionActive)
+      { protStr = StringFormat("DD CAUTION  | Streak: %d/%d", gConsecLosses, MaxConsecLosses); protClr = C'255,160,0'; }
+   else if(gConsecLosses > 0)
+      { protStr = StringFormat("Protection: OK  | Streak: %d/%d", gConsecLosses, MaxConsecLosses); protClr = C'255,200,0'; }
+   else
+      { protStr = "Protection: OK";                                                     protClr = C'80,180,80'; }
+   PanelLabel(PANEL_PREFIX+"R9", protStr, tx, ty, protClr, 8);
 
    ChartRedraw(0);
 }
@@ -735,6 +771,150 @@ bool TryPartialClose(ulong ticket, double ratio)
    return ok;
 }
 
+// ─── Basket Drawdown Protection Helpers ──────────────────────────────────────
+
+// Returns the effective max trades, accounting for defensive mode and loss streak.
+int GetEffectiveMaxTrades()
+{
+   int base = gDefensive ? DefensiveMaxTrades : MaxTotalTrades;
+   if(EnableConsecLossDampen && gConsecLosses >= MaxConsecLosses)
+      return MathMax(1, base / 2);
+   return base;
+}
+
+// Layer 1: move all basket SLs to entry price (breakeven protection).
+void MoveAllToBreakeven(const string sym)
+{
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+   {
+      if(!pos.SelectByIndex(i) || pos.Symbol()!=sym || pos.Magic()!=MagicNumber) continue;
+      int    dir    = (pos.PositionType() == POSITION_TYPE_BUY) ? 1 : -1;
+      double openPx = pos.PriceOpen();
+      double curSL  = pos.StopLoss();
+      double curTP  = pos.TakeProfit();
+      int    digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+      // Use BEBufferATRMult if available, else exactly at entry
+      double buf   = (gATR > 0 && BEBufferATRMult > 0) ? gATR * BEBufferATRMult : 0.0;
+      double beSL  = NormalizeDouble((dir > 0) ? openPx + buf : openPx - buf, digits);
+      bool   improve = (dir > 0) ? (curSL == 0.0 || beSL > curSL)
+                                 : (curSL == 0.0 || beSL < curSL);
+      if(improve) trade.PositionModify(pos.Ticket(), beSL, curTP);
+   }
+}
+
+// Layer 2: close the worst-scoring half of positions.
+void CloseWorstHalf(const string sym, double atr)
+{
+   ulong  tickets[32];
+   int    scores[32];
+   int    count = 0;
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+   {
+      if(!pos.SelectByIndex(i) || pos.Symbol()!=sym || pos.Magic()!=MagicNumber) continue;
+      if(count >= 32) break;
+      tickets[count] = pos.Ticket();
+      scores[count]  = ScorePosition(pos.Ticket(), atr);
+      count++;
+   }
+   if(count == 0) return;
+   // Bubble sort ascending by score (weakest first)
+   for(int i = 0; i < count-1; i++)
+      for(int j = i+1; j < count; j++)
+         if(scores[j] < scores[i])
+         {
+            int   ts = scores[i];  scores[i]  = scores[j];  scores[j]  = ts;
+            ulong tt = tickets[i]; tickets[i] = tickets[j]; tickets[j] = tt;
+         }
+   int closeN = MathMax(1, count / 2);
+   for(int i = 0; i < closeN; i++)
+   {
+      Print("DD DANGER: closing weakest position #", tickets[i], " score=", scores[i]);
+      trade.PositionClose(tickets[i], DeviationPoints);
+   }
+}
+
+// Main basket DD check — called each tick while in HFT mode.
+void CheckBasketDD(const string sym, double atr)
+{
+   if(!EnableBasketDDProtection) return;
+   if(PositionsCount(sym) == 0) { gCautionActive = false; return; }
+
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity <= 0) return;
+   double loss   = -BasketProfit(sym);   // positive when basket is losing
+
+   double cauAmt = equity * BasketDD_Caution_Pct   / 100.0;
+   double danAmt = equity * BasketDD_Danger_Pct    / 100.0;
+   double emgAmt = equity * BasketDD_Emergency_Pct / 100.0;
+
+   if(loss >= emgAmt)
+   {
+      Print("DD EMERGENCY: basket loss=", DoubleToString(loss,2),
+            " (", DoubleToString(BasketDD_Emergency_Pct,1), "% equity) → closing all + extended cooldown");
+      CloseBasket(sym);
+      eaState       = STATE_COOLDOWN;
+      cooldownStart = TimeCurrent();
+      cooldownDur   = CooldownSeconds * 3;
+      gCautionActive = false;
+      gConsecLosses++;
+      SaveState();
+   }
+   else if(loss >= danAmt)
+   {
+      if(!gCautionActive)
+      {
+         Print("DD DANGER: basket loss=", DoubleToString(loss,2),
+               " → closing weakest 50% of positions");
+         gCautionActive = true;
+      }
+      CloseWorstHalf(sym, atr);
+   }
+   else if(loss >= cauAmt)
+   {
+      if(!gCautionActive)
+      {
+         Print("DD CAUTION: basket loss=", DoubleToString(loss,2),
+               " → stopping entries + moving SLs to breakeven");
+         gCautionActive = true;
+         MoveAllToBreakeven(sym);
+      }
+   }
+   else
+   {
+      gCautionActive = false;   // Basket recovered above caution threshold
+   }
+}
+
+// Daily loss limit — resets at midnight, halts session if limit is breached.
+void CheckDailyLoss(const string sym)
+{
+   if(!EnableDailyLossLimit) return;
+
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   if(dt.day != gDayChecked)
+   {
+      gDayOpenEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      gDayChecked    = dt.day;
+      gDailyHalted   = false;
+      Print("Daily loss tracker reset | Day equity: ", DoubleToString(gDayOpenEquity,2));
+   }
+   if(gDailyHalted || gDayOpenEquity <= 0) return;
+
+   double curEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double lossPct   = (gDayOpenEquity - curEquity) / gDayOpenEquity * 100.0;
+   if(lossPct >= DailyLossLimitPct)
+   {
+      Print("DAILY LOSS LIMIT: -", DoubleToString(lossPct,1), "% → halting session for today");
+      CloseBasket(sym);
+      gDailyHalted  = true;
+      eaState       = STATE_COOLDOWN;
+      cooldownStart = TimeCurrent();
+      cooldownDur   = 28800;   // 8-hour cooldown
+      SaveState();
+   }
+}
+
 // ─── Stop Loss Calculation ───────────────────────────────────────────────────
 
 double GetCandleBasedSL(const string sym, int dir)
@@ -967,7 +1147,8 @@ void ManageHFTExits(const string sym, double atr)
 
 bool OpenMarket(const string sym, int dir, double atr)
 {
-   int maxT  = gDefensive ? DefensiveMaxTrades : MaxTotalTrades;
+   if(gCautionActive) return false;   // Layer 1 DD: entries blocked
+   int maxT  = GetEffectiveMaxTrades();
    int total = PositionsCount(sym) + PendingOrdersCount(sym);
    if(total >= maxT) return false;
    double sl    = GetStopLoss(sym, dir, atr);
@@ -985,6 +1166,7 @@ bool OpenMarket(const string sym, int dir, double atr)
 
 bool PlaceLimitOrders(const string sym, int dir, double atr)
 {
+   if(gCautionActive) return false;   // Layer 1 DD: entries blocked
    double ask    = SymbolInfoDouble(sym, SYMBOL_ASK);
    double bid    = SymbolInfoDouble(sym, SYMBOL_BID);
    int    digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
@@ -995,7 +1177,7 @@ bool PlaceLimitOrders(const string sym, int dir, double atr)
    for(int i = 0; i < LimitOrderCount; i++)
    {
       int cur  = PositionsCount(sym) + PendingOrdersCount(sym);
-      int maxT = gDefensive ? DefensiveMaxTrades : MaxTotalTrades;
+      int maxT = GetEffectiveMaxTrades();
       if(cur >= maxT) break;
       double offset = atr * offsets[MathMin(i, 4)];
       double price  = (dir > 0) ? NormalizeDouble(bid-offset, digits)
@@ -1035,15 +1217,31 @@ void GraduateBestPosition(const string sym, double atr)
 
    if(bestTicket == 0 || bestScore < ScoreHoldThreshold)
    {
+      // Track consecutive loss cycles
+      if(EnableConsecLossDampen && gHFTStartEquity > 0)
+      {
+         double curEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+         if(curEquity < gHFTStartEquity * 0.9995) gConsecLosses++;
+         else                                      gConsecLosses = 0;
+      }
+
       // No worthy candidate — full close + cooldown
       CloseBasket(sym);
       eaState       = STATE_COOLDOWN;
       cooldownStart = TimeCurrent();
       cooldownDur   = (hftTradeCount >= HFTExtendedThreshold)
                       ? CooldownSeconds * 2 : CooldownSeconds;
+
+      if(EnableConsecLossDampen && gConsecLosses >= MaxConsecLosses)
+      {
+         cooldownDur *= 2;
+         Print("Consec loss streak: ", gConsecLosses, " → cooldown doubled to ", cooldownDur, "s | next cycle max trades halved");
+      }
+
       Print("HFT → COOLDOWN | trades=", hftTradeCount,
             " | cooldown=", cooldownDur, "s",
-            (bestScore > -99 ? StringFormat(" | best score=%d (below threshold)", bestScore) : ""));
+            (bestScore > -99 ? StringFormat(" | best score=%d (below threshold)", bestScore) : ""),
+            " | streak=", gConsecLosses);
       SaveState();
       return;
    }
@@ -1075,8 +1273,9 @@ void GraduateBestPosition(const string sym, double atr)
    qualityTicket   = bestTicket;
    qualityOpenTime = TimeCurrent();
    eaState         = STATE_QUALITY;
-   gPCCount = 0;
-   gPWCount = 0;
+   gPCCount        = 0;
+   gPWCount        = 0;
+   gCautionActive  = false;
    SaveState();
 }
 
@@ -1176,7 +1375,12 @@ void ManageQualityTrade(const string sym, double atr)
    if(!IsQualityPositionOpen())
    {
       Print("QUALITY trade closed (TP/SL hit). Resetting to HFT.");
-      hftTradeCount=0; qualityTicket=0; qualityOpenTime=0; eaState=STATE_HFT;
+      hftTradeCount   = 0;
+      qualityTicket   = 0;
+      qualityOpenTime = 0;
+      eaState         = STATE_HFT;
+      gHFTStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      gCautionActive  = false;
       SaveState();
       return;
    }
@@ -1188,7 +1392,12 @@ void ManageQualityTrade(const string sym, double atr)
    {
       Print("QUALITY trade timed out (", QualityTimeoutSeconds, "s). Closing → HFT.");
       trade.PositionClose(qualityTicket, DeviationPoints);
-      hftTradeCount=0; qualityTicket=0; qualityOpenTime=0; eaState=STATE_HFT;
+      hftTradeCount   = 0;
+      qualityTicket   = 0;
+      qualityOpenTime = 0;
+      eaState         = STATE_HFT;
+      gHFTStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      gCautionActive  = false;
       SaveState();
    }
 }
@@ -1230,6 +1439,10 @@ int OnInit()
             " | Target: +", ProfitTargetPercent, "%");
       SaveState();
    }
+   gHFTStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   gCautionActive  = false;
+   gDailyHalted    = false;
+   gConsecLosses   = 0;
 
    return INIT_SUCCEEDED;
 }
@@ -1269,6 +1482,10 @@ void OnTick()
       }
    }
 
+   // ── Daily Loss Limit ──────────────────────────────────────────────────────
+   CheckDailyLoss(gSymbol);
+   if(gDailyHalted) { DrawPanel(atr > 0 ? atr : GetATR(), GetBaselineATR()); return; }
+
    // Margin protection
    double marginLevel = AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
    if(marginLevel > 0 && marginLevel < MarginTriggerLevel)
@@ -1287,7 +1504,8 @@ void OnTick()
    switch(eaState)
    {
       case STATE_HFT:
-         RunHFT(gSymbol, atr);
+         CheckBasketDD(gSymbol, atr);
+         if(eaState == STATE_HFT) RunHFT(gSymbol, atr);   // DD may have triggered cooldown
          break;
 
       case STATE_COOLDOWN:
