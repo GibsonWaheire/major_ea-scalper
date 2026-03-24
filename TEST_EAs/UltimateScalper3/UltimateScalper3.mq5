@@ -1329,8 +1329,7 @@ void ManageQualityTrade(const string sym, double atr)
    if(PositionSelectByTicket(qualityTicket))
    {
       double qProfit = PositionGetDouble(POSITION_PROFIT)
-                     + PositionGetDouble(POSITION_SWAP)
-                     + PositionGetDouble(POSITION_COMMISSION);
+                     + PositionGetDouble(POSITION_SWAP);
       double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
       if(equity > 0 && qProfit >= equity * QualityProfitTargetPct / 100.0)
       {
