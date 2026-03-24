@@ -96,8 +96,6 @@ input int             DefensiveMaxTrades       = 2;      // Max basket size in D
 
 // ─── State Machine ───────────────────────────────────────────────────────────
 input int             HFTTradeThreshold        = 50;
-input int             HFTExtendedThreshold     = 70;
-input int             CooldownSeconds          = 300;
 input double          QualitySL_ATR            = 1.5;
 input double          QualityTP_ATR            = 3.0;
 input int             QualityTimeoutSeconds    = 1800;
@@ -114,16 +112,7 @@ input double          ProfitTargetPercent      = 70.0;
 input bool            EnableBasketDDProtection = true;
 input double          BasketDD_Caution_Pct     = 1.0;   // equity % → stop new entries + move all SLs to breakeven
 input double          BasketDD_Danger_Pct      = 2.0;   // equity % → close weakest 50% of positions (by score)
-input double          BasketDD_Emergency_Pct   = 3.0;   // equity % → close all positions + extended cooldown
-
-// ─── Daily Loss Limit ─────────────────────────────────────────────────────────
-input bool            EnableDailyLossLimit     = true;
-input double          DailyLossLimitPct        = 5.0;   // % equity drop from session open → halt trading rest of day
-input bool            ForceResumeTrading       = false; // Set true → clears any halt/cooldown instantly on (re)attach
-
-// ─── Consecutive Loss Dampener ────────────────────────────────────────────────
-input bool            EnableConsecLossDampen   = true;
-input int             MaxConsecLosses          = 3;     // After N losing HFT cycles: halve max trades + double cooldown
+input double          BasketDD_Emergency_Pct   = 3.0;   // equity % → close all positions immediately
 
 // ─── Velocity-Based HFT Exit ─────────────────────────────────────────────────
 // Each tick, measures how fast price is moving in a position's favor.
@@ -146,10 +135,6 @@ bool          gDefensive   = false;
 
 // ─── Protection state ─────────────────────────────────────────────────────────
 bool          gCautionActive   = false;  // Layer 1 DD: blocks new entries
-double        gDayOpenEquity   = 0.0;   // Equity at calendar-day open
-bool          gDailyHalted     = false;  // Session halted by daily loss limit
-int           gDayChecked      = -1;    // Last day number gDayOpenEquity was refreshed
-int           gConsecLosses    = 0;     // Consecutive HFT cycles that ended with net equity loss
 double        gHFTStartEquity  = 0.0;   // Equity snapshot when current HFT cycle began
 
 // ─── Velocity tracking (per-position, HFT mode) ──────────────────────────────
@@ -174,26 +159,20 @@ int   gPCCount = 0;
 string gSymbol = "";
 
 // ─── State machine ───────────────────────────────────────────────────────────
-enum EA_STATE { STATE_HFT = 0, STATE_COOLDOWN = 1, STATE_QUALITY = 2 };
+enum EA_STATE { STATE_HFT = 0, STATE_QUALITY = 1 };
 EA_STATE eaState         = STATE_HFT;
 int      hftTradeCount   = 0;
-datetime cooldownStart   = 0;
-int      cooldownDur     = 0;
 ulong    qualityTicket   = 0;
 datetime qualityOpenTime = 0;
 
 // ─── Persistence (GlobalVariables) ───────────────────────────────────────────
 // Keys are per-symbol (set in OnInit), so multiple chart instances never collide.
-string GV_STATE      = "";
-string GV_HFTCOUNT   = "";
-string GV_COOLSTART  = "";
-string GV_COOLDUR    = "";
-string GV_QTICKET    = "";
-string GV_QOPENTIME  = "";
-string GV_STARTBAL   = "";
-string GV_STOPPED    = "";
-string GV_DAILYHALT  = "";   // persists gDailyHalted across restarts
-string GV_HALTDAY    = "";   // persists gDayChecked so midnight reset works after restart
+string GV_STATE     = "";
+string GV_HFTCOUNT  = "";
+string GV_QTICKET   = "";
+string GV_QOPENTIME = "";
+string GV_STARTBAL  = "";
+string GV_STOPPED   = "";
 
 double startingBalance = 0;
 bool   profitTargetHit = false;
@@ -204,14 +183,10 @@ void SaveState()
 {
    GlobalVariableSet(GV_STATE,     (double)eaState);
    GlobalVariableSet(GV_HFTCOUNT,  (double)hftTradeCount);
-   GlobalVariableSet(GV_COOLSTART, (double)cooldownStart);
-   GlobalVariableSet(GV_COOLDUR,   (double)cooldownDur);
    GlobalVariableSet(GV_QTICKET,   (double)qualityTicket);
    GlobalVariableSet(GV_QOPENTIME, (double)qualityOpenTime);
    GlobalVariableSet(GV_STARTBAL,  startingBalance);
    GlobalVariableSet(GV_STOPPED,   (double)profitTargetHit);
-   GlobalVariableSet(GV_DAILYHALT, (double)gDailyHalted);
-   GlobalVariableSet(GV_HALTDAY,   (double)gDayChecked);
 }
 
 bool LoadState()
@@ -220,35 +195,18 @@ bool LoadState()
 
    eaState         = (EA_STATE)(int)GlobalVariableGet(GV_STATE);
    hftTradeCount   = (int)GlobalVariableGet(GV_HFTCOUNT);
-   cooldownStart   = (datetime)GlobalVariableGet(GV_COOLSTART);
-   cooldownDur     = (int)GlobalVariableGet(GV_COOLDUR);
    qualityTicket   = (ulong)GlobalVariableGet(GV_QTICKET);
    qualityOpenTime = (datetime)GlobalVariableGet(GV_QOPENTIME);
    startingBalance = GlobalVariableGet(GV_STARTBAL);
    profitTargetHit = (bool)(int)GlobalVariableGet(GV_STOPPED);
 
-   // Restore daily-halt flags
-   gDailyHalted = (bool)(int)GlobalVariableGet(GV_DAILYHALT);
-   gDayChecked  = (int)GlobalVariableGet(GV_HALTDAY);
-
-   // Auto-clear daily halt if it was set on a previous calendar day
-   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
-   if(gDailyHalted && dt.day != gDayChecked)
-   {
-      Print("Daily halt from previous day — auto-clearing.");
-      gDailyHalted = false;
-      if(eaState == STATE_COOLDOWN) { eaState = STATE_HFT; cooldownStart = 0; cooldownDur = 0; }
-   }
+   // If saved state was COOLDOWN (old data) or invalid, reset to HFT
+   if((int)eaState > (int)STATE_QUALITY) eaState = STATE_HFT;
 
    if(qualityTicket > 0 && !PositionSelectByTicket(qualityTicket))
    {
       Print("Restored: Quality ticket #", qualityTicket, " not found. Resetting to HFT.");
       hftTradeCount=0; qualityTicket=0; qualityOpenTime=0; eaState=STATE_HFT;
-   }
-   if(eaState == STATE_COOLDOWN && (TimeCurrent()-cooldownStart) >= cooldownDur)
-   {
-      Print("Restored: Cooldown already elapsed. Advancing to QUALITY.");
-      eaState = STATE_QUALITY;
    }
    Print("State restored | Mode: ", EnumToString(eaState),
          " | HFT trades: ", hftTradeCount, " | Quality ticket: ", qualityTicket);
@@ -328,10 +286,9 @@ void DrawPanel(double atr, double baselineATR)
    {
       switch(eaState)
       {
-         case STATE_HFT:      modeStr = "MODE:  HFT ACTIVE";   modeClr = C'0,220,100';  break;
-         case STATE_COOLDOWN: modeStr = "MODE:  COOLDOWN";      modeClr = C'255,160,0';  break;
-         case STATE_QUALITY:  modeStr = "MODE:  QUALITY HOLD";  modeClr = C'80,185,255'; break;
-         default:             modeStr = "MODE:  ---";           modeClr = clrWhite;
+         case STATE_HFT:     modeStr = "MODE:  HFT ACTIVE";   modeClr = C'0,220,100';  break;
+         case STATE_QUALITY: modeStr = "MODE:  QUALITY HOLD";  modeClr = C'80,185,255'; break;
+         default:            modeStr = "MODE:  ---";           modeClr = clrWhite;
       }
       if(gDefensive) { modeStr += "  [DEF]"; modeClr = C'255,100,80'; }
    }
@@ -342,13 +299,6 @@ void DrawPanel(double atr, double baselineATR)
    string detStr = ""; color detClr = C'160,160,160';
    if(eaState == STATE_HFT)
       detStr = StringFormat("Trades: %d / %d", hftTradeCount, HFTTradeThreshold);
-   else if(eaState == STATE_COOLDOWN)
-   {
-      int rem = cooldownDur - (int)(TimeCurrent()-cooldownStart);
-      if(rem < 0) rem = 0;
-      detStr = StringFormat("Resume in: %dm %02ds", rem/60, rem%60);
-      detClr = C'255,160,0';
-   }
    else if(eaState == STATE_QUALITY)
    {
       if(qualityTicket > 0)
@@ -405,14 +355,10 @@ void DrawPanel(double atr, double baselineATR)
    // Row 9 — Protection status
    ty += LINE_H;
    string protStr; color protClr;
-   if(gDailyHalted)
-      { protStr = "HALTED: daily loss limit";                                           protClr = C'255,75,75'; }
-   else if(gCautionActive)
-      { protStr = StringFormat("DD CAUTION  | Streak: %d/%d", gConsecLosses, MaxConsecLosses); protClr = C'255,160,0'; }
-   else if(gConsecLosses > 0)
-      { protStr = StringFormat("Protection: OK  | Streak: %d/%d", gConsecLosses, MaxConsecLosses); protClr = C'255,200,0'; }
+   if(gCautionActive)
+      { protStr = "DD CAUTION — entries paused";   protClr = C'255,160,0'; }
    else
-      { protStr = "Protection: OK";                                                     protClr = C'80,180,80'; }
+      { protStr = "Protection: OK";                protClr = C'80,180,80'; }
    PanelLabel(PANEL_PREFIX+"R9", protStr, tx, ty, protClr, 8);
 
    ChartRedraw(0);
@@ -719,13 +665,10 @@ bool TryPartialClose(ulong ticket, double ratio)
 
 // ─── Basket Drawdown Protection Helpers ──────────────────────────────────────
 
-// Returns the effective max trades, accounting for defensive mode and loss streak.
+// Returns the effective max trades, accounting for defensive mode.
 int GetEffectiveMaxTrades()
 {
-   int base = gDefensive ? DefensiveMaxTrades : MaxTotalTrades;
-   if(EnableConsecLossDampen && gConsecLosses >= MaxConsecLosses)
-      return MathMax(1, base / 2);
-   return base;
+   return gDefensive ? DefensiveMaxTrades : MaxTotalTrades;
 }
 
 // Layer 1: move all basket SLs to entry price (breakeven protection).
@@ -796,13 +739,10 @@ void CheckBasketDD(const string sym, double atr)
    if(loss >= emgAmt)
    {
       Print("DD EMERGENCY: basket loss=", DoubleToString(loss,2),
-            " (", DoubleToString(BasketDD_Emergency_Pct,1), "% equity) → closing all + extended cooldown");
+            " (", DoubleToString(BasketDD_Emergency_Pct,1), "% equity) → closing all");
       CloseBasket(sym);
-      eaState       = STATE_COOLDOWN;
-      cooldownStart = TimeCurrent();
-      cooldownDur   = CooldownSeconds * 3;
+      eaState        = STATE_HFT;
       gCautionActive = false;
-      gConsecLosses++;
       SaveState();
    }
    else if(loss >= danAmt)
@@ -828,36 +768,6 @@ void CheckBasketDD(const string sym, double atr)
    else
    {
       gCautionActive = false;   // Basket recovered above caution threshold
-   }
-}
-
-// Daily loss limit — resets at midnight, halts session if limit is breached.
-void CheckDailyLoss(const string sym)
-{
-   if(!EnableDailyLossLimit) return;
-
-   MqlDateTime dt;
-   TimeToStruct(TimeCurrent(), dt);
-   if(dt.day != gDayChecked)
-   {
-      gDayOpenEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-      gDayChecked    = dt.day;
-      gDailyHalted   = false;
-      Print("Daily loss tracker reset | Day equity: ", DoubleToString(gDayOpenEquity,2));
-   }
-   if(gDailyHalted || gDayOpenEquity <= 0) return;
-
-   double curEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double lossPct   = (gDayOpenEquity - curEquity) / gDayOpenEquity * 100.0;
-   if(lossPct >= DailyLossLimitPct)
-   {
-      Print("DAILY LOSS LIMIT: -", DoubleToString(lossPct,1), "% → halting session for today");
-      CloseBasket(sym);
-      gDailyHalted  = true;
-      eaState       = STATE_COOLDOWN;
-      cooldownStart = TimeCurrent();
-      cooldownDur   = 28800;   // 8-hour cooldown
-      SaveState();
    }
 }
 
@@ -1172,31 +1082,12 @@ void GraduateBestPosition(const string sym, double atr)
 
    if(bestTicket == 0 || bestScore < ScoreHoldThreshold)
    {
-      // Track consecutive loss cycles
-      if(EnableConsecLossDampen && gHFTStartEquity > 0)
-      {
-         double curEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-         if(curEquity < gHFTStartEquity * 0.9995) gConsecLosses++;
-         else                                      gConsecLosses = 0;
-      }
-
-      // No worthy candidate — full close + cooldown
+      // No worthy candidate — close basket and restart HFT immediately
       CloseBasket(sym);
-      eaState       = STATE_COOLDOWN;
-      cooldownStart = TimeCurrent();
-      cooldownDur   = (hftTradeCount >= HFTExtendedThreshold)
-                      ? CooldownSeconds * 2 : CooldownSeconds;
-
-      if(EnableConsecLossDampen && gConsecLosses >= MaxConsecLosses)
-      {
-         cooldownDur *= 2;
-         Print("Consec loss streak: ", gConsecLosses, " → cooldown doubled to ", cooldownDur, "s | next cycle max trades halved");
-      }
-
-      Print("HFT → COOLDOWN | trades=", hftTradeCount,
-            " | cooldown=", cooldownDur, "s",
+      eaState = STATE_HFT;
+      Print("HFT cycle complete | trades=", hftTradeCount,
             (bestScore > -99 ? StringFormat(" | best score=%d (below threshold)", bestScore) : ""),
-            " | streak=", gConsecLosses);
+            " → restarting HFT");
       SaveState();
       return;
    }
@@ -1387,14 +1278,10 @@ int OnInit()
    string pfx  = "US3_" + gSymbol + "_";
    GV_STATE     = pfx + "State";
    GV_HFTCOUNT  = pfx + "HFTCount";
-   GV_COOLSTART = pfx + "CoolStart";
-   GV_COOLDUR   = pfx + "CoolDur";
    GV_QTICKET   = pfx + "QTicket";
    GV_QOPENTIME = pfx + "QOpenTime";
    GV_STARTBAL  = pfx + "StartBal";
    GV_STOPPED   = pfx + "Stopped";
-   GV_DAILYHALT = pfx + "DailyHalt";
-   GV_HALTDAY   = pfx + "HaltDay";
 
    if(!EnsureSymbolReady(gSymbol)) return INIT_FAILED;
 
@@ -1416,18 +1303,8 @@ int OnInit()
       SaveState();
    }
 
-   // ForceResumeTrading: clear any halt or cooldown immediately (e.g. after account switch or manual reset)
-   if(ForceResumeTrading)
-   {
-      Print("ForceResumeTrading: clearing halt/cooldown → resuming HFT.");
-      eaState = STATE_HFT; cooldownStart = 0; cooldownDur = 0;
-      gDailyHalted = false; profitTargetHit = false;
-      SaveState();
-   }
-
    gHFTStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
    gCautionActive  = false;
-   gConsecLosses   = 0;
 
    return INIT_SUCCEEDED;
 }
@@ -1472,18 +1349,13 @@ void OnTick()
       }
    }
 
-   // ── Daily Loss Limit ──────────────────────────────────────────────────────
-   CheckDailyLoss(gSymbol);
-   if(gDailyHalted) { DrawPanel(atr > 0 ? atr : GetATR(), GetBaselineATR()); return; }
-
    // Margin protection
    double marginLevel = AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
    if(marginLevel > 0 && marginLevel < MarginTriggerLevel)
    {
       Print("Margin protection: ", marginLevel, "% → closing all.");
       CloseBasket(gSymbol);
-      qualityTicket=0; eaState=STATE_COOLDOWN;
-      cooldownStart=TimeCurrent(); cooldownDur=CooldownSeconds;
+      qualityTicket=0; eaState=STATE_HFT;
       SaveState();
       return;
    }
@@ -1495,16 +1367,7 @@ void OnTick()
    {
       case STATE_HFT:
          CheckBasketDD(gSymbol, atr);
-         if(eaState == STATE_HFT) RunHFT(gSymbol, atr);   // DD may have triggered cooldown
-         break;
-
-      case STATE_COOLDOWN:
-         if(TimeCurrent()-cooldownStart >= cooldownDur)
-         {
-            Print("Cooldown complete (", cooldownDur, "s) → QUALITY mode.");
-            eaState = STATE_QUALITY;
-            SaveState();
-         }
+         if(eaState == STATE_HFT) RunHFT(gSymbol, atr);
          break;
 
       case STATE_QUALITY:
