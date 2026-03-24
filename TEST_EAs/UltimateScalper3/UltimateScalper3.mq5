@@ -119,6 +119,7 @@ input double          BasketDD_Emergency_Pct   = 3.0;   // equity % → close al
 // ─── Daily Loss Limit ─────────────────────────────────────────────────────────
 input bool            EnableDailyLossLimit     = true;
 input double          DailyLossLimitPct        = 5.0;   // % equity drop from session open → halt trading rest of day
+input bool            ForceResumeTrading       = false; // Set true → clears any halt/cooldown instantly on (re)attach
 
 // ─── Consecutive Loss Dampener ────────────────────────────────────────────────
 input bool            EnableConsecLossDampen   = true;
@@ -183,14 +184,16 @@ datetime qualityOpenTime = 0;
 
 // ─── Persistence (GlobalVariables) ───────────────────────────────────────────
 // Keys are per-symbol (set in OnInit), so multiple chart instances never collide.
-string GV_STATE     = "";
-string GV_HFTCOUNT  = "";
-string GV_COOLSTART = "";
-string GV_COOLDUR   = "";
-string GV_QTICKET   = "";
-string GV_QOPENTIME = "";
-string GV_STARTBAL  = "";
-string GV_STOPPED   = "";
+string GV_STATE      = "";
+string GV_HFTCOUNT   = "";
+string GV_COOLSTART  = "";
+string GV_COOLDUR    = "";
+string GV_QTICKET    = "";
+string GV_QOPENTIME  = "";
+string GV_STARTBAL   = "";
+string GV_STOPPED    = "";
+string GV_DAILYHALT  = "";   // persists gDailyHalted across restarts
+string GV_HALTDAY    = "";   // persists gDayChecked so midnight reset works after restart
 
 double startingBalance = 0;
 bool   profitTargetHit = false;
@@ -207,6 +210,8 @@ void SaveState()
    GlobalVariableSet(GV_QOPENTIME, (double)qualityOpenTime);
    GlobalVariableSet(GV_STARTBAL,  startingBalance);
    GlobalVariableSet(GV_STOPPED,   (double)profitTargetHit);
+   GlobalVariableSet(GV_DAILYHALT, (double)gDailyHalted);
+   GlobalVariableSet(GV_HALTDAY,   (double)gDayChecked);
 }
 
 bool LoadState()
@@ -221,6 +226,19 @@ bool LoadState()
    qualityOpenTime = (datetime)GlobalVariableGet(GV_QOPENTIME);
    startingBalance = GlobalVariableGet(GV_STARTBAL);
    profitTargetHit = (bool)(int)GlobalVariableGet(GV_STOPPED);
+
+   // Restore daily-halt flags
+   gDailyHalted = (bool)(int)GlobalVariableGet(GV_DAILYHALT);
+   gDayChecked  = (int)GlobalVariableGet(GV_HALTDAY);
+
+   // Auto-clear daily halt if it was set on a previous calendar day
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   if(gDailyHalted && dt.day != gDayChecked)
+   {
+      Print("Daily halt from previous day — auto-clearing.");
+      gDailyHalted = false;
+      if(eaState == STATE_COOLDOWN) { eaState = STATE_HFT; cooldownStart = 0; cooldownDur = 0; }
+   }
 
    if(qualityTicket > 0 && !PositionSelectByTicket(qualityTicket))
    {
@@ -1375,6 +1393,8 @@ int OnInit()
    GV_QOPENTIME = pfx + "QOpenTime";
    GV_STARTBAL  = pfx + "StartBal";
    GV_STOPPED   = pfx + "Stopped";
+   GV_DAILYHALT = pfx + "DailyHalt";
+   GV_HALTDAY   = pfx + "HaltDay";
 
    if(!EnsureSymbolReady(gSymbol)) return INIT_FAILED;
 
@@ -1395,9 +1415,18 @@ int OnInit()
             " | Target: +", ProfitTargetPercent, "%");
       SaveState();
    }
+
+   // ForceResumeTrading: clear any halt or cooldown immediately (e.g. after account switch or manual reset)
+   if(ForceResumeTrading)
+   {
+      Print("ForceResumeTrading: clearing halt/cooldown → resuming HFT.");
+      eaState = STATE_HFT; cooldownStart = 0; cooldownDur = 0;
+      gDailyHalted = false; profitTargetHit = false;
+      SaveState();
+   }
+
    gHFTStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
    gCautionActive  = false;
-   gDailyHalted    = false;
    gConsecLosses   = 0;
 
    return INIT_SUCCEEDED;
