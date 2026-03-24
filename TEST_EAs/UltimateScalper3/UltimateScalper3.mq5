@@ -74,32 +74,16 @@ input double          SLCeilingATRMult         = 0.0;
 input double          SpreadATRMult            = 0.0;
 input double          PaddingATRMult           = 0.0;
 
-// ─── HFT Basket Profit ───────────────────────────────────────────────────────
-input double          BasketProfitATRMult      = 2.5;
-input bool            CloseAtAnyProfit         = true;
-input double          MinProfitToClose         = 0.01;
-
 // ─── Dynamic Trade Management ────────────────────────────────────────────────
-// Per-position fate scoring drives individual hold / partial / full close actions.
-input bool            EnableDynamicMgmt        = true;
-input double          PartialCloseATRTrigger   = 1.0;    // Partial close when profit dist >= N×ATR
+// Velocity-based exit is the primary HFT close mechanism.
+// Scoring gates partial closes only (strong trades get partial at ATR trigger).
+input double          PartialCloseATRTrigger   = 1.0;    // Partial close when profit dist >= N×ATR from entry
 input double          PartialCloseRatio        = 0.5;    // Fraction to close on partial (0.5 = 50%)
 input double          BETrailATRTrigger        = 1.0;    // Trail SL to breakeven when profit >= N×ATR
 input double          BEBufferATRMult          = 0.1;    // Buffer above entry for BE SL (ATR × this)
-input int             ScoreHoldThreshold       = 4;      // Min score to hold; partial-close if far enough
-input int             ScorePartialThreshold    = 2;      // Min score for partial (else full close)
+input int             ScoreHoldThreshold       = 4;      // Min score to qualify for partial close
 input bool            EnableGraduation         = true;   // Promote best trade to Quality on threshold hit
-input double          PostPartialCutATRMult    = 1.0;   // After partial close: cut remaining if loss >= N×ATR from entry (0=off)
-
-// ─── Profit Protection (High-Water Mark) ─────────────────────────────────────
-// Prevents closing a winning trade on a brief pullback.
-// Close is only allowed when BOTH conditions are true:
-//   1. Profit has fallen below ProfitFloorPct × peak (e.g. peak=$50, floor=50% → close below $25)
-//   2. Momentum has opposed the trade for ReversalTicksRequired consecutive ticks
-// Example: peak=$50, ProfitFloorPct=0.5 → trade is protected until profit < $25
-//          even if score drops, it won't close unless momentum confirms for N ticks too.
-input double          ProfitFloorPct           = 0.50;   // Close only when profit < peak × this
-input int             ReversalTicksRequired    = 3;      // Consecutive opposing momentum ticks to confirm
+input double          PostPartialCutATRMult    = 1.0;    // After partial: cut remaining if loss >= N×ATR from entry (0=off)
 
 // ─── Volatility Regime ────────────────────────────────────────────────────────
 // Compares current ATRTimeframe ATR vs a longer VolATRTF baseline.
@@ -140,6 +124,16 @@ input double          DailyLossLimitPct        = 5.0;   // % equity drop from se
 input bool            EnableConsecLossDampen   = true;
 input int             MaxConsecLosses          = 3;     // After N losing HFT cycles: halve max trades + double cooldown
 
+// ─── Velocity-Based HFT Exit ─────────────────────────────────────────────────
+// Each tick, measures how fast price is moving in a position's favor.
+// When that velocity peaks then decays below VelocityDecayPct × peak → close immediately.
+// This exits at the fastest point of the move before momentum dies.
+input bool            UseVelocityExit         = true;
+input double          VelocityDecayPct        = 0.40;  // Close when velocity drops to X% of peak (0.40 = 40%)
+
+// ─── Quality Profit Target ───────────────────────────────────────────────────
+input double          QualityProfitTargetPct  = 5.0;   // Close quality trade when profit >= X% of account equity
+
 // ─── Globals ─────────────────────────────────────────────────────────────────
 CTrade        trade;
 CPositionInfo pos;
@@ -157,6 +151,16 @@ int           gDayChecked      = -1;    // Last day number gDayOpenEquity was re
 int           gConsecLosses    = 0;     // Consecutive HFT cycles that ended with net equity loss
 double        gHFTStartEquity  = 0.0;   // Equity snapshot when current HFT cycle began
 
+// ─── Velocity tracking (per-position, HFT mode) ──────────────────────────────
+// Tracks the fastest favorable tick movement seen per position.
+// When velocity decays below VelocityDecayPct × peak the move has peaked — exit.
+#define MAX_VEL_TRACK 32
+ulong  gVelTicket[MAX_VEL_TRACK];
+double gVelPeak[MAX_VEL_TRACK];
+int    gVelCount     = 0;
+double gPrevBid      = 0.0;    // Previous tick bid price
+double gTickVelocity = 0.0;    // Current tick price change (updated in OnTick)
+
 // ─── Partial close tracking ───────────────────────────────────────────────────
 // Prevents re-triggering partial close on the same position within one HFT cycle.
 // Cleared when the basket is closed or the state resets.
@@ -164,15 +168,6 @@ double        gHFTStartEquity  = 0.0;   // Equity snapshot when current HFT cycl
 ulong gPCDone[MAX_PC_TRACK];
 int   gPCCount = 0;
 
-// ─── Peak profit / reversal confirmation tracking ─────────────────────────────
-// Per-position high-water mark and consecutive opposing momentum tick counter.
-// Prevents closing a trade on a brief pullback — requires profit to have fallen
-// below ProfitFloorPct × peak AND momentum to be opposing for N consecutive ticks.
-#define MAX_PW_TRACK 32
-ulong  gPWTicket[MAX_PW_TRACK];
-double gPWPeak[MAX_PW_TRACK];      // Highest profit seen for this ticket
-int    gPWOppCount[MAX_PW_TRACK];  // Consecutive ticks where momentum opposes the trade
-int    gPWCount = 0;
 
 // ─── Resolved symbol ─────────────────────────────────────────────────────────
 string gSymbol = "";
@@ -651,8 +646,8 @@ bool CloseBasket(const string sym)
    }
    DeletePendingOrders(sym);
    trade.SetAsyncMode(false);
-   gPCCount = 0;   // Clear partial-close tracking on full basket close
-   gPWCount = 0;   // Clear peak-profit tracking on full basket close
+   gPCCount  = 0;   // Clear partial-close tracking on full basket close
+   gVelCount = 0;   // Clear velocity tracking on full basket close
    return true;
 }
 
@@ -683,77 +678,6 @@ void PCCleanStale()
    }
 }
 
-// ─── Peak profit helpers ──────────────────────────────────────────────────────
-
-int PWFind(ulong ticket)
-{
-   for(int i = 0; i < gPWCount; i++)
-      if(gPWTicket[i] == ticket) return i;
-   return -1;
-}
-
-// Called each tick per position. Updates peak profit and opposing momentum count.
-// momentumDir = current M1 momentum direction; posDir = position direction (+1/-1).
-void PWUpdate(ulong ticket, double profit, int momentumDir, int posDir)
-{
-   int idx = PWFind(ticket);
-   if(idx < 0)
-   {
-      if(gPWCount >= MAX_PW_TRACK) return;
-      idx = gPWCount++;
-      gPWTicket[idx]   = ticket;
-      gPWPeak[idx]     = 0.0;
-      gPWOppCount[idx] = 0;
-   }
-   // Update high-water mark (only track positive profit peaks)
-   if(profit > gPWPeak[idx]) gPWPeak[idx] = profit;
-   // Opposing momentum counter: increment if opposing, reset if neutral or aligned
-   if(momentumDir != 0 && momentumDir != posDir) gPWOppCount[idx]++;
-   else                                           gPWOppCount[idx] = 0;
-}
-
-double PWGetPeak(ulong ticket)
-{
-   int idx = PWFind(ticket);
-   return (idx >= 0) ? gPWPeak[idx] : 0.0;
-}
-
-int PWGetOppCount(ulong ticket)
-{
-   int idx = PWFind(ticket);
-   return (idx >= 0) ? gPWOppCount[idx] : 0;
-}
-
-void PWCleanStale()
-{
-   for(int i = gPWCount-1; i >= 0; i--)
-   {
-      if(!PositionSelectByTicket(gPWTicket[i]))
-      {
-         gPWTicket[i]   = gPWTicket[gPWCount-1];
-         gPWPeak[i]     = gPWPeak[gPWCount-1];
-         gPWOppCount[i] = gPWOppCount[gPWCount-1];
-         gPWCount--;
-      }
-   }
-}
-
-// Returns true when it is safe to close/reduce a profitable position:
-//   - a meaningful profit peak has been recorded, AND
-//   - profit has fallen below ProfitFloorPct × peak, AND
-//   - momentum has been opposing for ReversalTicksRequired ticks
-//
-// If no meaningful peak exists yet → return FALSE (hold the trade, let it build).
-// The SL handles the case where it never becomes profitable.
-bool PWCanClose(ulong ticket, double posProfit)
-{
-   double peak = PWGetPeak(ticket);
-   // No meaningful peak yet — hold, don't close at near-zero profit
-   if(peak <= MinProfitToClose) return false;
-   bool belowFloor   = (posProfit <= peak * ProfitFloorPct);
-   bool reversalConf = (PWGetOppCount(ticket) >= ReversalTicksRequired);
-   return (belowFloor && reversalConf);
-}
 
 // Closes a fraction of a position's volume. Returns false if not viable.
 bool TryPartialClose(ulong ticket, double ratio)
@@ -1056,93 +980,102 @@ int ScorePosition(ulong ticket, double atr)
    return score;
 }
 
-// ─── HFT Mode ────────────────────────────────────────────────────────────────
+// ─── Velocity Helpers ────────────────────────────────────────────────────────
 
-double CalculateBasketProfitTarget(const string sym, double atr, double totalLots)
+int VelFind(ulong ticket)
 {
-   if(atr <= 0 || totalLots <= 0) return 1.0;
-   double tv = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
-   double ts = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
-   if(ts <= 0) return 1.0;
-   return MathMax((atr * BasketProfitATRMult) * (tv/ts) * totalLots, 1.0);
+   for(int i = 0; i < gVelCount; i++)
+      if(gVelTicket[i] == ticket) return i;
+   return -1;
 }
+
+void VelUpdate(ulong ticket, double favVelocity)
+{
+   int idx = VelFind(ticket);
+   if(idx < 0)
+   {
+      if(gVelCount >= MAX_VEL_TRACK) return;
+      idx = gVelCount++;
+      gVelTicket[idx] = ticket;
+      gVelPeak[idx]   = 0.0;
+   }
+   if(favVelocity > gVelPeak[idx]) gVelPeak[idx] = favVelocity;
+}
+
+// Returns true when velocity has peaked and decayed: time to exit.
+// Returns false if no meaningful peak yet — hold the position.
+bool VelShouldClose(ulong ticket, double favVelocity)
+{
+   int idx = VelFind(ticket);
+   if(idx < 0 || gVelPeak[idx] <= 0) return false;
+   return (favVelocity < gVelPeak[idx] * VelocityDecayPct);
+}
+
+void VelCleanStale()
+{
+   for(int i = gVelCount-1; i >= 0; i--)
+   {
+      if(!PositionSelectByTicket(gVelTicket[i]))
+      {
+         gVelTicket[i] = gVelTicket[gVelCount-1];
+         gVelPeak[i]   = gVelPeak[gVelCount-1];
+         gVelCount--;
+      }
+   }
+}
+
+// ─── HFT Mode ────────────────────────────────────────────────────────────────
 
 void ManageHFTExits(const string sym, double atr)
 {
-   if(!EnableDynamicMgmt)
-   {
-      // Legacy mode: close entire basket at profit target
-      double profit = BasketProfit(sym);
-      double target = CalculateBasketProfitTarget(sym, atr, BasketLots(sym));
-      if(profit >= target && profit > 0)                 { CloseBasket(sym); return; }
-      if(CloseAtAnyProfit && profit >= MinProfitToClose) { CloseBasket(sym); return; }
-      return;
-   }
-
    PCCleanStale();
-   PWCleanStale();
+   VelCleanStale();
 
-   // Evaluate each position individually
    for(int i = PositionsTotal()-1; i >= 0; i--)
    {
       if(!pos.SelectByIndex(i) || pos.Symbol()!=sym || pos.Magic()!=MagicNumber) continue;
       ulong  ticket    = pos.Ticket();
       double posProfit = pos.Profit() + pos.Swap() + pos.Commission();
+      int    dir       = (pos.PositionType() == POSITION_TYPE_BUY) ? 1 : -1;
 
-      // Breakeven trail always runs regardless of score
+      // Step 1: Breakeven trail — always runs
       TryMoveToBreakeven(ticket, atr);
 
-      // Determine position direction and current momentum for peak tracking
-      int    dir        = (pos.PositionType() == POSITION_TYPE_BUY) ? 1 : -1;
-      int    momentumDir = DetectMomentum(sym, atr, MomentumTF);
-      PWUpdate(ticket, posProfit, momentumDir, dir);
+      // Step 2: Velocity-based full close (primary exit)
+      // Closes when tick velocity has peaked and decays — locks in profit at the
+      // fastest point of the move before momentum fades. SL handles no-peak case.
+      if(UseVelocityExit && gTickVelocity != 0.0)
+      {
+         double favVel = gTickVelocity * dir;
+         VelUpdate(ticket, favVel);
+         if(posProfit > 0 && VelShouldClose(ticket, favVel))
+         {
+            int vi = VelFind(ticket);
+            Print("Velocity exit: #", ticket,
+                  " | vel=", DoubleToString(favVel, 6),
+                  " | peak=", DoubleToString(vi >= 0 ? gVelPeak[vi] : 0, 6));
+            trade.PositionClose(ticket, DeviationPoints);
+            continue;
+         }
+      }
 
-      // ATR-based partial close trigger (price distance from entry)
-      double bid   = SymbolInfoDouble(sym, SYMBOL_BID);
-      double ask   = SymbolInfoDouble(sym, SYMBOL_ASK);
-      double curPx = (dir > 0) ? bid : ask;
-      double profitDist     = (curPx - pos.PriceOpen()) * dir;
+      // Step 3: Partial close — strong-score trades only, at ATR trigger
+      double curPx      = (dir > 0) ? SymbolInfoDouble(sym, SYMBOL_BID)
+                                     : SymbolInfoDouble(sym, SYMBOL_ASK);
+      double profitDist = (curPx - pos.PriceOpen()) * dir;
       bool   partialTrigger = (atr > 0 && profitDist >= atr * PartialCloseATRTrigger);
 
-      int score = ScorePosition(ticket, atr);
+      if(ScorePosition(ticket, atr) >= ScoreHoldThreshold && partialTrigger && !PCIsDone(ticket))
+         TryPartialClose(ticket, PartialCloseRatio);
 
-      if(score >= ScoreHoldThreshold)
-      {
-         // Strong trade — hold it; lock in partial profit if far enough and not yet done
-         if(partialTrigger && !PCIsDone(ticket))
-            TryPartialClose(ticket, PartialCloseRatio);
-      }
-      else if(score >= ScorePartialThreshold)
-      {
-         // Moderate — partial close only when profit has peaked and is genuinely pulling back.
-         // PWCanClose holds until a real peak was seen AND floor breached AND reversal confirmed.
-         if(posProfit > 0 && !PCIsDone(ticket) && PWCanClose(ticket, posProfit))
-            TryPartialClose(ticket, PartialCloseRatio);
-      }
-      else
-      {
-         // Weak / opposing — close only after a real profit peak, confirmed pullback, and reversal.
-         // PWCanClose returns false if no meaningful peak exists → hold, don't dump at $0.01.
-         if(CloseAtAnyProfit && posProfit >= MinProfitToClose && PWCanClose(ticket, posProfit))
-            trade.PositionClose(ticket, DeviationPoints);
-      }
-
-      // ── Post-partial-close loss cut ──────────────────────────────────────────
-      // After a partial close has been locked in, guard the remaining half.
-      // If price reverses PostPartialCutATRMult × ATR past entry (into loss),
-      // force-close the remainder — regardless of score or profit floor.
+      // Step 4: Post-partial loss cut — guards remaining half after partial fires
       if(PostPartialCutATRMult > 0 && PCIsDone(ticket) && atr > 0)
       {
-         double openPx   = pos.PriceOpen();
-         double bid      = SymbolInfoDouble(sym, SYMBOL_BID);
-         double ask      = SymbolInfoDouble(sym, SYMBOL_ASK);
-         double curPx    = (dir > 0) ? bid : ask;
-         double lossDist = (openPx - curPx) * dir;   // > 0 when position is in loss from entry
+         double lossDist = (pos.PriceOpen() - curPx) * dir;   // > 0 when in loss from entry
          if(lossDist >= atr * PostPartialCutATRMult)
          {
             Print("Post-partial cut: #", ticket,
-                  " | loss from entry=", DoubleToString(lossDist, (int)SymbolInfoInteger(sym,SYMBOL_DIGITS)),
-                  " | threshold=", DoubleToString(atr*PostPartialCutATRMult, (int)SymbolInfoInteger(sym,SYMBOL_DIGITS)));
+                  " | loss from entry=", DoubleToString(lossDist, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS)));
             trade.PositionClose(ticket, DeviationPoints);
          }
       }
@@ -1278,7 +1211,7 @@ void GraduateBestPosition(const string sym, double atr)
    qualityOpenTime = TimeCurrent();
    eaState         = STATE_QUALITY;
    gPCCount        = 0;
-   gPWCount        = 0;
+   gVelCount       = 0;
    gCautionActive  = false;
    SaveState();
 }
@@ -1392,6 +1325,26 @@ void ManageQualityTrade(const string sym, double atr)
    // Apply breakeven trail to the quality position as profit grows
    TryMoveToBreakeven(qualityTicket, atr);
 
+   // Quality profit target: close when position profit reaches X% of equity
+   if(PositionSelectByTicket(qualityTicket))
+   {
+      double qProfit = PositionGetDouble(POSITION_PROFIT)
+                     + PositionGetDouble(POSITION_SWAP)
+                     + PositionGetDouble(POSITION_COMMISSION);
+      double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
+      if(equity > 0 && qProfit >= equity * QualityProfitTargetPct / 100.0)
+      {
+         Print("QUALITY target hit: +", QualityProfitTargetPct, "% equity | P&L=", DoubleToString(qProfit,2));
+         trade.PositionClose(qualityTicket, DeviationPoints);
+         hftTradeCount   = 0; qualityTicket   = 0; qualityOpenTime = 0;
+         eaState         = STATE_HFT;
+         gHFTStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+         gCautionActive  = false;
+         SaveState();
+         return;
+      }
+   }
+
    if(TimeCurrent()-qualityOpenTime >= QualityTimeoutSeconds)
    {
       Print("QUALITY trade timed out (", QualityTimeoutSeconds, "s). Closing → HFT.");
@@ -1466,6 +1419,11 @@ void OnTick()
    double atr = GetATR();
    if(atr <= 0) return;
    gATR = atr;
+
+   // Tick velocity: price change since last tick (used by velocity-based HFT exit)
+   double curBid    = SymbolInfoDouble(gSymbol, SYMBOL_BID);
+   gTickVelocity    = (gPrevBid > 0.0) ? curBid - gPrevBid : 0.0;
+   gPrevBid         = curBid;
 
    // Volatility regime check — updates gDefensive flag
    UpdateVolatilityRegime(atr);

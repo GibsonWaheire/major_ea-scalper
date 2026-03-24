@@ -92,6 +92,13 @@ input double          DailyLossLimitPct        = 5.0;   // % equity drop from se
 input bool            EnableConsecLossDampen   = true;
 input int             MaxConsecLosses          = 3;     // After N losing HFT cycles: halve max trades + double cooldown
 
+// ─── Velocity-Based HFT Exit ─────────────────────────────────────────────────
+input bool            UseVelocityExit         = true;
+input double          VelocityDecayPct        = 0.40;  // Close basket when velocity drops to X% of peak (0.40 = 40%)
+
+// ─── Quality Profit Target ───────────────────────────────────────────────────
+input double          QualityProfitTargetPct  = 5.0;   // Close quality trade when profit >= X% of account equity
+
 // ─── Globals ─────────────────────────────────────────────────────────────────
 CTrade        trade;
 CPositionInfo pos;
@@ -99,6 +106,9 @@ int           atrHandle     = -1;
 datetime      lastEntryTime = 0;
 double        gATR          = 0.0;   // Updated each tick; used by helpers for ATR-relative scaling
 double        gBasketPeak   = 0.0;   // High-water mark for basket profit (reset on basket close)
+double        gBasketVelPeak = 0.0;  // Peak favorable basket velocity (bid change × basket dir)
+double        gPrevBid      = 0.0;   // Previous tick bid price
+double        gTickVelocity = 0.0;   // Current tick price change (set in OnTick)
 
 // ─── Protection state ─────────────────────────────────────────────────────────
 bool          gCautionActive   = false;  // Layer 1 DD: blocks new entries
@@ -558,7 +568,8 @@ bool CloseBasket(const string sym)
    }
    DeletePendingOrders(sym);
    trade.SetAsyncMode(false);
-   gBasketPeak = 0;   // Reset high-water mark for next cycle
+   gBasketPeak    = 0;   // Reset high-water mark for next cycle
+   gBasketVelPeak = 0;   // Reset velocity peak for next cycle
    return true;
 }
 
@@ -777,26 +788,40 @@ double CalculateBasketProfitTarget(const string sym, double atr, double totalLot
 
 void ManageHFTExits(const string sym, double atr)
 {
-   double profit = BasketProfit(sym);
+   double profit    = BasketProfit(sym);
+   int    basketDir = GetBasketDirection(sym);
 
-   // Update basket high-water mark
+   // Update basket profit high-water mark
    if(profit > gBasketPeak) gBasketPeak = profit;
+
+   // ── Velocity-based exit ───────────────────────────────────────────────────
+   // Track how fast price moves in the basket's favor each tick.
+   // Close the moment velocity peaks and begins to decay — locks in profit
+   // at the fastest point of the move before momentum fades.
+   if(UseVelocityExit && gTickVelocity != 0.0 && basketDir != 0 && profit > 0)
+   {
+      double favVel = gTickVelocity * basketDir;
+      if(favVel > gBasketVelPeak) gBasketVelPeak = favVel;
+      if(gBasketVelPeak > 0 && favVel < gBasketVelPeak * VelocityDecayPct)
+      {
+         Print("Velocity exit: basket vel=", DoubleToString(favVel,6),
+               " | peak=", DoubleToString(gBasketVelPeak,6));
+         gBasketPeak = 0; gBasketVelPeak = 0;
+         CloseBasket(sym); return;
+      }
+   }
 
    double target = CalculateBasketProfitTarget(sym, atr, BasketLots(sym));
 
-   // Full ATR target — always honoured, close immediately
-   if(profit >= target && profit > 0) { gBasketPeak = 0; CloseBasket(sym); return; }
+   // Full ATR target — always honoured
+   if(profit >= target && profit > 0) { gBasketPeak = 0; gBasketVelPeak = 0; CloseBasket(sym); return; }
 
-   // CloseAtAnyProfit — hold until basket has built a real peak then pulled back.
-   // This prevents dumping at $0.01 before profit has had a chance to develop.
-   // Logic: basket must have reached a meaningful peak (> MinProfitToClose),
-   //        then pulled back to BasketProfitFloorPct × peak (e.g. 60%).
-   //        If no real peak exists yet → hold, let profit build.
+   // CloseAtAnyProfit — only after a real peak has formed and profit pulls back
    if(CloseAtAnyProfit && profit >= MinProfitToClose)
    {
-      bool hasPeak     = (gBasketPeak > MinProfitToClose);
-      bool pulledBack  = (profit <= gBasketPeak * BasketProfitFloorPct);
-      if(hasPeak && pulledBack) { gBasketPeak = 0; CloseBasket(sym); return; }
+      bool hasPeak    = (gBasketPeak > MinProfitToClose);
+      bool pulledBack = (profit <= gBasketPeak * BasketProfitFloorPct);
+      if(hasPeak && pulledBack) { gBasketPeak = 0; gBasketVelPeak = 0; CloseBasket(sym); return; }
    }
 }
 
@@ -995,6 +1020,26 @@ void ManageQualityTrade(const string sym)
       return;
    }
 
+   // Quality profit target: close when position profit reaches X% of equity
+   if(PositionSelectByTicket(qualityTicket))
+   {
+      double qProfit = PositionGetDouble(POSITION_PROFIT)
+                     + PositionGetDouble(POSITION_SWAP)
+                     + PositionGetDouble(POSITION_COMMISSION);
+      double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
+      if(equity > 0 && qProfit >= equity * QualityProfitTargetPct / 100.0)
+      {
+         Print("QUALITY target hit: +", QualityProfitTargetPct, "% equity | P&L=", DoubleToString(qProfit,2));
+         trade.PositionClose(qualityTicket, DeviationPoints);
+         hftTradeCount   = 0; qualityTicket   = 0; qualityOpenTime = 0;
+         eaState         = STATE_HFT;
+         gHFTStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+         gCautionActive  = false;
+         SaveState();
+         return;
+      }
+   }
+
    if(TimeCurrent() - qualityOpenTime >= QualityTimeoutSeconds)
    {
       Print("QUALITY trade timed out (", QualityTimeoutSeconds, "s). Closing → HFT.");
@@ -1101,6 +1146,11 @@ void OnTick()
    double atr = GetATR();
    if(atr <= 0) return;
    gATR = atr;  // Update global so all helpers can use ATR-relative scaling
+
+   // Tick velocity: bid price change since last tick
+   double curBid    = SymbolInfoDouble(gSymbol, SYMBOL_BID);
+   gTickVelocity    = (gPrevBid > 0.0) ? curBid - gPrevBid : 0.0;
+   gPrevBid         = curBid;
 
    if(!EnsureSymbolReady(gSymbol) || !SpreadOK(gSymbol)) return;
 
