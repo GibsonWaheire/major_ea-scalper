@@ -12,11 +12,12 @@
 #include <Trade/PositionInfo.mqh>
 
 // ─── Core ────────────────────────────────────────────────────────────────────
-input string          TradeSymbol              = "XAUUSD";
+input string          TradeSymbol              = "";       // Blank = use chart symbol automatically
 input int             MagicNumber              = 905534;
-input double          BaseLot                  = 0.02;
-input double          LotStep                  = 0.00;    // 0 = flat lot for all trades
-input double          MaxLot                   = 0.02;
+input bool            UseRiskPercent           = true;    // true = risk-% sizing (recommended); false = fixed BaseLot
+input double          HFTRiskPercent           = 2.5;     // HFT mode: risk % of equity per trade
+input double          BaseLot                  = 0.02;    // Fallback lot when UseRiskPercent=false or SL=0
+input double          MaxLot                   = 0.10;    // Hard cap per trade (both modes)
 input int             MaxTotalTrades           = 6;       // Max positions per HFT basket
 input int             DeviationPoints          = 30;
 input double          SpreadLimitPoints        = 300;
@@ -41,10 +42,19 @@ input bool            RequireAcceleration      = false;   // Require momentum to
 input bool            UseStopLoss              = true;
 input bool            UseCandleSL              = true;    // Use High/Low candle for SL anchor
 input int             CandleLookback           = 5;       // Candles to scan for H/L
-input int             CandlePaddingPoints      = 100;     // Buffer beyond H/L in points
-input double          StopLossATRMultiplier    = 3.0;     // ATR mult for floor SL distance
-input double          StopLossMinPoints        = 1000;    // Min SL distance (breathing room)
-input double          StopLossMaxPoints        = 1500;    // Max SL distance (account cap)
+input int             CandlePaddingPoints      = 100;     // Buffer beyond H/L in points (used when PaddingATRMult=0)
+input double          StopLossATRMultiplier    = 3.0;     // ATR mult for SL distance
+input double          StopLossMinPoints        = 1000;    // Min SL distance in points (used when SLFloorATRMult=0)
+input double          StopLossMaxPoints        = 1500;    // Max SL distance in points (used when SLCeilingATRMult=0)
+
+// ─── Instrument Scaling (ATR-relative — set > 0 for non-XAUUSD instruments) ──
+// These replace the fixed-point limits above and scale automatically with volatility.
+// Recommended for forex: SLFloor=1.5, SLCeiling=6.0, Spread=0.3, Padding=0.1
+// Leave all at 0 to preserve the original XAUUSD point-based behaviour.
+input double          SLFloorATRMult           = 0.0;     // Min SL as ATR multiple  (0 = use StopLossMinPoints)
+input double          SLCeilingATRMult         = 0.0;     // Max SL as ATR multiple  (0 = use StopLossMaxPoints)
+input double          SpreadATRMult            = 0.0;     // Max spread as ATR multiple (0 = use SpreadLimitPoints)
+input double          PaddingATRMult           = 0.0;     // Candle SL padding as ATR multiple (0 = use CandlePaddingPoints)
 
 // ─── HFT Basket Profit ───────────────────────────────────────────────────────
 input double          BasketProfitATRMult      = 2.5;     // Full target (ATR multiplier)
@@ -71,6 +81,7 @@ CTrade        trade;
 CPositionInfo pos;
 int           atrHandle     = -1;
 datetime      lastEntryTime = 0;
+double        gATR          = 0.0;   // Updated each tick; used by helpers for ATR-relative scaling
 
 enum EA_STATE { STATE_HFT = 0, STATE_COOLDOWN = 1, STATE_QUALITY = 2 };
 EA_STATE eaState         = STATE_HFT;
@@ -80,16 +91,22 @@ int      cooldownDur     = 0;       // Actual cooldown duration (may be extended
 ulong    qualityTicket   = 0;
 datetime qualityOpenTime = 0;
 
+// ─── Resolved symbol (set in OnInit) ─────────────────────────────────────────
+// Allows the EA to run on any instrument. Multiple instances on different
+// symbols are fully independent — each gets its own GlobalVariable namespace.
+string gSymbol = "";
+
 // ─── Persistence (GlobalVariables) ───────────────────────────────────────────
 // Survives chart period changes and MT5 restarts without closing trades.
-#define GV_STATE      "US2_State"
-#define GV_HFTCOUNT   "US2_HFTCount"
-#define GV_COOLSTART  "US2_CoolStart"
-#define GV_COOLDUR    "US2_CoolDur"
-#define GV_QTICKET    "US2_QTicket"
-#define GV_QOPENTIME  "US2_QOpenTime"
-#define GV_STARTBAL   "US2_StartBal"
-#define GV_STOPPED    "US2_Stopped"
+// Keys are initialised in OnInit() so they are unique per symbol.
+string GV_STATE     = "";
+string GV_HFTCOUNT  = "";
+string GV_COOLSTART = "";
+string GV_COOLDUR   = "";
+string GV_QTICKET   = "";
+string GV_QOPENTIME = "";
+string GV_STARTBAL  = "";
+string GV_STOPPED   = "";
 
 double startingBalance  = 0;
 bool   profitTargetHit  = false;
@@ -146,11 +163,11 @@ bool LoadState()
 #define PANEL_PREFIX  "US2_"
 #define PANEL_X       10
 #define PANEL_Y       20
-#define PANEL_W       260
-#define LINE_H        22
+#define PANEL_W       350
+#define LINE_H        24
 #define PANEL_LINES   8
-#define PANEL_PAD_X   14
-#define PANEL_PAD_Y   12
+#define PANEL_PAD_X   16
+#define PANEL_PAD_Y   14
 
 void PanelLabel(const string name, const string text, int x, int y, color clr, int sz = 8)
 {
@@ -189,8 +206,8 @@ void DrawPanel(double atr)
    ObjectSetInteger(0, bg, OBJPROP_YDISTANCE, PANEL_Y);
    ObjectSetInteger(0, bg, OBJPROP_XSIZE,     PANEL_W);
    ObjectSetInteger(0, bg, OBJPROP_YSIZE,     panelH);
-   ObjectSetInteger(0, bg, OBJPROP_BGCOLOR,   C'22,22,22');
-   ObjectSetInteger(0, bg, OBJPROP_COLOR,     C'55,55,55');
+   ObjectSetInteger(0, bg, OBJPROP_BGCOLOR,   C'38,42,52');
+   ObjectSetInteger(0, bg, OBJPROP_COLOR,     C'80,88,108');
 
    int tx = PANEL_X + PANEL_PAD_X;
    int ty = PANEL_Y + PANEL_PAD_Y;
@@ -201,7 +218,7 @@ void DrawPanel(double atr)
 
    // Row 1 — Symbol + ATR
    PanelLabel(PANEL_PREFIX+"R1",
-      StringFormat("%-8s  ATR: %.2f", TradeSymbol, atr),
+      StringFormat("%-8s  ATR: %.2f", gSymbol, atr),
       tx, ty, C'110,110,110', 8);
    ty += LINE_H;
 
@@ -253,7 +270,7 @@ void DrawPanel(double atr)
    ty += LINE_H;
 
    // Row 4 — Basket P&L
-   double profit = BasketProfit(TradeSymbol);
+   double profit = BasketProfit(gSymbol);
    color pnlClr  = (profit >= 0) ? C'0,210,90' : C'255,75,75';
    PanelLabel(PANEL_PREFIX+"R4",
       StringFormat("Basket P&L:  %+.2f", profit),
@@ -263,7 +280,7 @@ void DrawPanel(double atr)
    // Row 5 — Positions + Pending
    PanelLabel(PANEL_PREFIX+"R5",
       StringFormat("Positions: %d   Pending: %d",
-         PositionsCount(TradeSymbol), PendingOrdersCount(TradeSymbol)),
+         PositionsCount(gSymbol), PendingOrdersCount(gSymbol)),
       tx, ty, C'110,110,110', 8);
    ty += LINE_H;
 
@@ -320,9 +337,12 @@ void CloseAllExistingTrades(const string sym)
 
 bool SpreadOK(const string sym)
 {
-   double spread = (SymbolInfoDouble(sym, SYMBOL_ASK) - SymbolInfoDouble(sym, SYMBOL_BID))
-                   / SymbolInfoDouble(sym, SYMBOL_POINT);
-   return spread <= SpreadLimitPoints;
+   double point  = SymbolInfoDouble(sym, SYMBOL_POINT);
+   double spread = (SymbolInfoDouble(sym, SYMBOL_ASK) - SymbolInfoDouble(sym, SYMBOL_BID)) / point;
+   double limit  = (SpreadATRMult > 0 && gATR > 0)
+                   ? (gATR * SpreadATRMult) / point   // ATR-relative limit
+                   : SpreadLimitPoints;               // fixed-point fallback
+   return spread <= limit;
 }
 
 // ─── ATR & Momentum ──────────────────────────────────────────────────────────
@@ -413,8 +433,7 @@ double NormalizeVolume(const string sym, double lots)
 
 double GetDynamicLot(const string sym, int tradeNum)
 {
-   double lot = (LotStep == 0.0) ? BaseLot : BaseLot + tradeNum * LotStep;
-   return NormalizeVolume(sym, MathMin(MaxLot, MathMax(SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN), lot)));
+   return NormalizeVolume(sym, MathMin(MaxLot, MathMax(SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN), BaseLot)));
 }
 
 // ─── Position/Order Counts ───────────────────────────────────────────────────
@@ -510,7 +529,9 @@ double GetCandleBasedSL(const string sym, int dir)
 {
    double point   = SymbolInfoDouble(sym, SYMBOL_POINT);
    int    digits  = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
-   double padding = CandlePaddingPoints * point;
+   double padding = (PaddingATRMult > 0 && gATR > 0)
+                    ? gATR * PaddingATRMult         // ATR-relative padding
+                    : CandlePaddingPoints * point;  // fixed-point fallback
 
    if(dir > 0)
    {
@@ -539,8 +560,13 @@ double GetStopLoss(const string sym, int dir, double atr, double atrMult = -1)
    int    digits   = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
    double mult     = (atrMult > 0) ? atrMult : StopLossATRMultiplier;
    double atrDist  = (atr > 0) ? atr * mult : 0;
-   double minDist  = StopLossMinPoints * point;
-   double maxDist  = StopLossMaxPoints * point;
+   // Use ATR-relative floor/ceiling when enabled, otherwise fall back to fixed points.
+   double minDist  = (SLFloorATRMult > 0 && atr > 0)
+                     ? atr * SLFloorATRMult
+                     : StopLossMinPoints * point;
+   double maxDist  = (SLCeilingATRMult > 0 && atr > 0)
+                     ? atr * SLCeilingATRMult
+                     : StopLossMaxPoints * point;
    double floorDist = MathMax(minDist, MathMin((atrDist > 0 ? atrDist : minDist), maxDist));
 
    if(UseCandleSL)
@@ -581,9 +607,13 @@ bool OpenMarket(const string sym, int dir, double atr)
 {
    int total = PositionsCount(sym) + PendingOrdersCount(sym);
    if(total >= MaxTotalTrades) return false;
-   double lot = GetDynamicLot(sym, total);
+   double sl    = GetStopLoss(sym, dir, atr);
+   double entry = (dir > 0) ? SymbolInfoDouble(sym, SYMBOL_ASK)
+                             : SymbolInfoDouble(sym, SYMBOL_BID);
+   double lot   = (UseRiskPercent && sl > 0)
+                  ? CalcRiskLot(sym, entry, sl, HFTRiskPercent)
+                  : GetDynamicLot(sym, total);
    if(lot <= 0) return false;
-   double sl = GetStopLoss(sym, dir, atr);
    trade.SetExpertMagicNumber(MagicNumber);
    bool ok = (dir > 0) ? trade.Buy(lot, sym, 0, sl, 0) : trade.Sell(lot, sym, 0, sl, 0);
    if(ok) { hftTradeCount++; SaveState(); }
@@ -603,10 +633,12 @@ bool PlaceLimitOrders(const string sym, int dir, double atr)
    {
       int cur = PositionsCount(sym) + PendingOrdersCount(sym);
       if(cur >= MaxTotalTrades) break;
-      double lot    = GetDynamicLot(sym, cur);
       double offset = atr * offsets[MathMin(i, 4)];
       double price  = (dir > 0) ? NormalizeDouble(bid - offset, digits) : NormalizeDouble(ask + offset, digits);
       double sl     = GetStopLoss(sym, dir, atr);
+      double lot    = (UseRiskPercent && sl > 0)
+                      ? CalcRiskLot(sym, price, sl, HFTRiskPercent)
+                      : GetDynamicLot(sym, cur);
       bool ok = (dir > 0) ? trade.BuyLimit(lot, price, sym, sl) : trade.SellLimit(lot, price, sym, sl);
       if(ok) placed++;
    }
@@ -662,19 +694,19 @@ void RunHFT(const string sym, double atr)
 
 // ─── Risk-Based Lot (Quality Mode Only) ──────────────────────────────────────
 
-double CalcRiskLot(const string sym, double entryPrice, double slPrice)
+double CalcRiskLot(const string sym, double entryPrice, double slPrice, double riskPercent)
 {
    double slDist = MathAbs(entryPrice - slPrice);
-   if(slDist <= 0) return NormalizeVolume(sym, BaseLot); // fallback
+   if(slDist <= 0) return NormalizeVolume(sym, BaseLot);
 
    double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
-   double riskAmt   = equity * (QualityRiskPercent / 100.0);
+   double riskAmt   = equity * (riskPercent / 100.0);
    double tickValue = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
    double tickSize  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
    if(tickSize <= 0 || tickValue <= 0) return NormalizeVolume(sym, BaseLot);
 
    double lot = riskAmt / ((slDist / tickSize) * tickValue);
-   return NormalizeVolume(sym, lot);
+   return NormalizeVolume(sym, MathMin(MaxLot, lot));
 }
 
 // ─── Quality Mode ────────────────────────────────────────────────────────────
@@ -712,7 +744,7 @@ void OpenQualityTrade(const string sym, double atr)
    double tpDist = atr * QualityTP_ATR;
    double tp     = (dir > 0) ? NormalizeDouble(entry + tpDist, digits)
                               : NormalizeDouble(entry - tpDist, digits);
-   double lot    = CalcRiskLot(sym, entry, sl);
+   double lot    = CalcRiskLot(sym, entry, sl, QualityRiskPercent);
 
    trade.SetExpertMagicNumber(MagicNumber);
    bool ok = (dir > 0) ? trade.Buy(lot, sym, 0, sl, tp) : trade.Sell(lot, sym, 0, sl, tp);
@@ -760,19 +792,35 @@ void ManageQualityTrade(const string sym)
 
 int OnInit()
 {
-   if(!EnsureSymbolReady(TradeSymbol)) return INIT_FAILED;
+   // ── Resolve active symbol ─────────────────────────────────────────────────
+   gSymbol = (TradeSymbol == "") ? Symbol() : TradeSymbol;
 
-   atrHandle = iATR(TradeSymbol, ATRTimeframe, ATRPeriod);
+   // ── Build per-symbol GlobalVariable keys ─────────────────────────────────
+   // Prefix includes the symbol so multiple instances never share state.
+   string pfx  = "US2_" + gSymbol + "_";
+   GV_STATE     = pfx + "State";
+   GV_HFTCOUNT  = pfx + "HFTCount";
+   GV_COOLSTART = pfx + "CoolStart";
+   GV_COOLDUR   = pfx + "CoolDur";
+   GV_QTICKET   = pfx + "QTicket";
+   GV_QOPENTIME = pfx + "QOpenTime";
+   GV_STARTBAL  = pfx + "StartBal";
+   GV_STOPPED   = pfx + "Stopped";
+
+   if(!EnsureSymbolReady(gSymbol)) return INIT_FAILED;
+
+   atrHandle = iATR(gSymbol, ATRTimeframe, ATRPeriod);
    if(atrHandle < 0) { Print("ATR indicator failed to initialize."); return INIT_FAILED; }
 
    // Restore state if available — skips trade cleanup to preserve open positions
    if(!LoadState())
    {
       // Fresh start — no saved state, clean slate
-      CloseAllExistingTrades(TradeSymbol);
+      CloseAllExistingTrades(gSymbol);
       startingBalance = AccountInfoDouble(ACCOUNT_BALANCE);
       profitTargetHit = false;
-      Print("UltimateScalper2 v1.00 fresh start | Starting balance: ", startingBalance,
+      Print("UltimateScalper2 v1.00 fresh start | Symbol: ", gSymbol,
+            " | Starting balance: ", startingBalance,
             " | Profit target: +", ProfitTargetPercent, "%");
       SaveState();
    }
@@ -801,7 +849,7 @@ void OnTick()
       double profitPct      = ((currentBalance - startingBalance) / startingBalance) * 100.0;
       if(profitPct >= ProfitTargetPercent)
       {
-         CloseBasket(TradeSymbol);
+         CloseBasket(gSymbol);
          profitTargetHit = true;
          SaveState();
          Print("PROFIT TARGET HIT: +", DoubleToString(profitPct, 1), "% | Trading stopped.");
@@ -814,7 +862,7 @@ void OnTick()
    if(marginLevel > 0 && marginLevel < MarginTriggerLevel)
    {
       Print("Margin protection: ", marginLevel, "% below ", MarginTriggerLevel, "% — closing all.");
-      CloseBasket(TradeSymbol);
+      CloseBasket(gSymbol);
       qualityTicket = 0;
       eaState       = STATE_COOLDOWN;
       cooldownStart = TimeCurrent();
@@ -823,15 +871,17 @@ void OnTick()
       return;
    }
 
-   if(!EnsureSymbolReady(TradeSymbol) || !SpreadOK(TradeSymbol)) return;
    double atr = GetATR();
    if(atr <= 0) return;
+   gATR = atr;  // Update global so all helpers can use ATR-relative scaling
+
+   if(!EnsureSymbolReady(gSymbol) || !SpreadOK(gSymbol)) return;
 
    // ── State Machine ─────────────────────────────────────────────────────────
    switch(eaState)
    {
       case STATE_HFT:
-         RunHFT(TradeSymbol, atr);
+         RunHFT(gSymbol, atr);
          break;
 
       case STATE_COOLDOWN:
@@ -845,9 +895,9 @@ void OnTick()
 
       case STATE_QUALITY:
          if(qualityTicket == 0)
-            OpenQualityTrade(TradeSymbol, atr);
+            OpenQualityTrade(gSymbol, atr);
          else
-            ManageQualityTrade(TradeSymbol);
+            ManageQualityTrade(gSymbol);
          break;
    }
 

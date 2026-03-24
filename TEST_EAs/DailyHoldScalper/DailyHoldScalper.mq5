@@ -1,487 +1,449 @@
-// // DynamicXauBasketMT5.mq5
-// Momentum Breakout EA - Dynamic lot (min to max), 1-20 trades per basket, bulk close
-#property copyright "Dynamic XAU Momentum Breakout EA"
+// DailyHoldScalper.mq5
+// Momentum Basket EA — No Stop Loss, Risk-Based Lots, Aggressive Basket Building
+//
+// v4.00 overhaul:
+//   - Risk-based lot sizing: equity × RiskPercent% ÷ (ATR reference distance)
+//     Lots scale automatically with account size and market volatility
+//   - Stronger momentum filter: velocity + candle body strength + close location
+//   - H1 bias filter: optional — only enter in H1 candle direction
+//   - Martingale averaging: optional lot multiplier for deeper basket trades
+//   - Rate limiter actually wired up (was declared but ignored in v3)
+//   - No stop loss on any trade — margin protection is the safety net
+//   - Symbol auto-detected from chart when TradeSymbol left blank
+//   - Removed dead inputs (UseBreakEven, UseTrailingStop, RequireVolumeConfirmation,
+//     OneEntryPerBar, LotStep, CloseMode — none of these did anything)
+
+#property copyright "DailyHoldScalper"
 #property link      "local"
-#property version   "3.10"
+#property version   "4.00"
 #property strict
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
 
-// --- Inputs ---
-input string    TradeSymbol           = "XAUUSD";
-input int       MagicNumber           = 905533;
-input double    BaseLot               = 0.03;   // Lot for first trade (min)
-input double    LotStep               = 0.01;      // Add per trade (0 = flat BaseLot for all)
-input double    MaxLot                = 0.10;   // Cap (not too much)
-input int       MinTotalTrades        = 1;      // Min trades per basket
-input int       MaxTotalTrades        = 10;     // Max trades per basket (1-20 dynamic)
-input int       ATRPeriod             = 14;
-input ENUM_TIMEFRAMES MomentumTF     = PERIOD_M1; // Momentum timeframe (M1 for scalping)
-input ENUM_TIMEFRAMES ATRTimeframe   = PERIOD_M1;
-input double    MomentumThresholdATR  = 0.15;   // Minimum momentum to trigger breakout entry (ATR fraction)
-input int       MomentumLookback      = 2;      // Number of candles to look back for momentum
-input bool      RequireVolumeConfirmation = false; // Require volume confirmation for breakout
-input int       DeviationPoints        = 30;     // Slippage guard
-input double    SpreadLimitPoints     = 300;    // Skip trading if spread too wide
-input int       MinSecondsBetweenEntries = 5;   // Min seconds between opening new trades
-input bool      OneEntryPerBar       = true;   // Max one entry per M1 bar
-input bool      UseLimitOrders       = true;   // Use limit orders instead of market
-input int       MarketOrdersAtExecution = 2;    // Market orders to open immediately on signal
-input int       LimitOrderCount      = 5;      // Number of limit orders per basket
-input int       MinPendingHoldSeconds = 3;     // Min seconds before cancelling pendings on direction change
-input int       PendingOrderTimeoutSeconds = 60; // Cancel pendings if not filled after this many seconds
+// ─── Core ────────────────────────────────────────────────────────────────────
+input string          TradeSymbol              = "";       // Blank = use chart symbol
+input int             MagicNumber              = 905533;
+input int             MaxTotalTrades           = 15;      // Max positions in basket
+input int             DeviationPoints          = 30;
+input double          SpreadLimitPoints        = 300;
 
-// --- Margin Protection Settings ---
-input double    MarginTriggerLevel    = 120.0;  // Margin % to Trigger Close & Reverse
+// ─── Lot Sizing (Risk-Based) ──────────────────────────────────────────────────
+// Lot is sized so that a 1×ATR move against you costs RiskPercent% of equity.
+// This makes lots dynamic: small account or volatile market = smaller lot.
+input double          RiskPercent              = 3.0;     // % of equity risked per trade (1 ATR reference)
+input double          MaxLotCap                = 1.0;     // Hard cap per single trade
 
-// --- Basket Profit Settings ---
-input bool      UseBasketProfit       = true;   // Close all trades when basket profit target reached
-input double    BasketProfitATRMultiplier = 2.5; // Basket profit target as multiple of ATR
-input double    BasketProfitPercent   = 2.0;    // Alternative: Basket profit as % of account balance
-input bool      UsePercentForBasket   = false;  // If true use %, if false use ATR multiplier
-input bool      IncludeAllTrades      = true;   // Include all trades (even pre-existing) in basket profit
-input bool      CloseEarlyWhenProfitable = true; // Close basket early when profitable (even below target)
-input double    EarlyCloseProfitATR   = 1.5;    // Close basket early at this ATR multiplier (if profitable)
-input double    EarlyCloseProfitPercent = 1.0;  // Alternative: Close early at this % profit
-input bool      UsePercentForEarlyClose = false; // If true use % for early close, if false use ATR
-input bool      CloseAtAnyProfit        = true;  // Close basket as soon as profit > 0
-input double    MinProfitToClose       = 0.01;   // Minimum profit (currency) to trigger close
-input bool      UseTimeBasedClose      = true;  // Require min hold time before closing profit
-input int       MinHoldSeconds         = 1;     // Min seconds to hold before close (1-5 sec window)
-input int       MaxHoldSeconds         = 5;     // Max seconds for close window
-input int       CloseMode              = 2;     // 0=basket only, 1=individual only, 2=both
+// ─── Martingale Averaging ────────────────────────────────────────────────────
+// When the basket is already open, each new averaging trade multiplies the lot
+// by MartingaleMult to accelerate recovery. Disable for flat sizing.
+input bool            UseMartingale            = false;
+input double          MartingaleMult           = 1.5;     // Lot multiplier per extra trade
 
-// --- Exit Settings ---
-input bool      UseBreakEven          = false;  // Move stop loss to break-even (disables wide SL)
-input double    BreakEvenTriggerATR   = 0.5;    // Move to BE when profit reaches this ATR
-input bool      UseTrailingStop       = false;  // Use trailing stop (disables wide SL)
-input double    TrailingStopATR        = 1.0;    // Trailing stop distance in ATR
-input double    TrailingStepATR       = 0.3;    // Trailing step in ATR
+// ─── ATR & Momentum ──────────────────────────────────────────────────────────
+input int             ATRPeriod                = 14;
+input ENUM_TIMEFRAMES ATRTimeframe             = PERIOD_M1;
+input ENUM_TIMEFRAMES MomentumTF               = PERIOD_M1;
+input double          MomentumThresholdATR     = 0.15;    // Min velocity as ATR fraction
+input double          BodyStrengthATR          = 0.20;    // Min candle body as ATR fraction
+input double          CloseLocationPct         = 0.30;    // Close must be in top/bottom X% of range
+input int             MinSecondsBetweenEntries = 5;       // Entry rate limiter
 
-// --- Globals ---
-CTrade          trade;
-CPositionInfo  pos;
-int             atrHandle     = -1;
-bool            eaInitialized = false;
-double          lastPrice     = 0.0;  // Track last price for momentum calculation
-datetime        lastEntryTime = 0;    // Entry cooldown
-datetime        lastEntryBar  = 0;    // One entry per bar
+// ─── H1 Bias Filter ──────────────────────────────────────────────────────────
+// When enabled, only opens trades in the direction of the completed H1 candle.
+// Reduces counter-trend basket exposure.
+input bool            UseH1Filter              = true;
 
+// ─── Entry ───────────────────────────────────────────────────────────────────
+input bool            UseLimitOrders           = true;
+input int             MarketOrdersAtExecution  = 2;
+input int             LimitOrderCount          = 5;
 
-// ---------------------------------------------------------------------------
-// Utility helpers
-// ---------------------------------------------------------------------------
-bool EnsureSymbolReady(const string symbol)
+// ─── Basket Profit Exit ───────────────────────────────────────────────────────
+input bool            UseBasketProfit          = true;
+input double          BasketProfitATRMult      = 2.5;     // Close basket at N×ATR profit
+input bool            CloseAtAnyProfit         = true;    // Close as soon as basket is profitable
+input double          MinProfitToClose         = 0.01;    // Minimum $ profit to trigger close
+
+// ─── Margin Protection ───────────────────────────────────────────────────────
+// No SL on trades — margin level is the only hard risk gate.
+// When margin drops below MarginTriggerLevel%, all positions are closed and
+// a reversal is attempted if H1 confirms the new direction.
+input double          MarginTriggerLevel       = 100.0;   // Close all if margin% falls below this
+
+// ─── Globals ─────────────────────────────────────────────────────────────────
+CTrade        trade;
+CPositionInfo pos;
+int           atrHandle    = -1;
+datetime      lastEntryTime = 0;
+string        gSymbol      = "";
+double        gATR         = 0.0;
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+bool EnsureSymbolReady(const string sym)
 {
-   if(!SymbolSelect(symbol, true))
-   {
-      Print("Failed to select symbol ", symbol);
-      return false;
-   }
-   if(SymbolInfoInteger(symbol, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_DISABLED)
-   {
-      Print("Symbol trading disabled: ", symbol);
-      return false;
-   }
+   if(!SymbolSelect(sym, true))                                                { Print("Symbol select failed: ", sym); return false; }
+   if(SymbolInfoInteger(sym, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_DISABLED) { Print("Trading disabled: ",    sym); return false; }
    return true;
 }
 
-void CloseAllExistingTrades(const string symbol)
+void CloseAllExistingTrades(const string sym)
 {
-   int closed = 0;
-   int deleted = 0;
-   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   int closed = 0, deleted = 0;
+   for(int i = PositionsTotal()-1; i >= 0; i--)
    {
-      if(!pos.SelectByIndex(i)) continue;
-      if(pos.Symbol() != symbol) continue;
-      ulong ticket = pos.Ticket();
-      if(trade.PositionClose(ticket, DeviationPoints)) closed++;
+      if(!pos.SelectByIndex(i) || pos.Symbol() != sym) continue;
+      if(trade.PositionClose(pos.Ticket(), DeviationPoints)) closed++;
    }
-   for(int i = OrdersTotal() - 1; i >= 0; --i)
+   for(int i = OrdersTotal()-1; i >= 0; i--)
    {
-      ulong oticket = OrderGetTicket(i);
-      if(oticket == 0 || !OrderSelect(oticket)) continue;
-      if(OrderGetString(ORDER_SYMBOL) != symbol) continue;
-      if(trade.OrderDelete(oticket)) deleted++;
+      ulong t = OrderGetTicket(i);
+      if(t == 0 || !OrderSelect(t) || OrderGetString(ORDER_SYMBOL) != sym) continue;
+      if(trade.OrderDelete(t)) deleted++;
    }
    if(closed > 0 || deleted > 0)
-      Print("Cleaned up ", closed, " positions and ", deleted, " orders on start.");
+      Print("Startup cleanup: ", closed, " positions, ", deleted, " orders.");
+}
+
+bool SpreadOK(const string sym)
+{
+   double spread = (SymbolInfoDouble(sym, SYMBOL_ASK) - SymbolInfoDouble(sym, SYMBOL_BID))
+                   / SymbolInfoDouble(sym, SYMBOL_POINT);
+   return spread <= SpreadLimitPoints;
 }
 
 double GetATR()
 {
-   if(atrHandle < 0) return 0.0;
-   double buffer[2];
-   if(CopyBuffer(atrHandle, 0, 0, 2, buffer) < 1) return 0.0;
-   return buffer[0];
+   double buf[2];
+   if(atrHandle < 0 || CopyBuffer(atrHandle, 0, 0, 2, buf) < 1) return 0.0;
+   return buf[0];
 }
 
-int DetectMomentumBreakout(const string symbol, double atr)
+// ─── Momentum Detection ──────────────────────────────────────────────────────
+// Three-layer check:
+//   1. Velocity: close[0] - close[1] must exceed ATR threshold
+//   2. Body strength: candle body must be meaningfully large vs ATR
+//   3. Close location: close must be in the top/bottom portion of the candle range
+
+int DetectMomentum(const string sym, double atr)
 {
    if(atr <= 0) return 0;
+
    double close[];
    ArraySetAsSeries(close, true);
-   int lookback = MomentumLookback + 1;
-   if(CopyClose(symbol, MomentumTF, 0, lookback, close) < lookback) return 0;
-   double momentum = close[0] - close[MomentumLookback];
-   double momentumThreshold = atr * MomentumThresholdATR;
-   if(MathAbs(momentum) < momentumThreshold) return 0;
-   return (momentum > 0) ? 1 : -1;
+   if(CopyClose(sym, MomentumTF, 0, 3, close) < 3) return 0;
+
+   double velocity = close[0] - close[1];
+   if(MathAbs(velocity) < atr * MomentumThresholdATR) return 0;
+   int dir = (velocity > 0) ? 1 : -1;
+
+   double open[], high[], low[];
+   ArraySetAsSeries(open, true);
+   ArraySetAsSeries(high, true);
+   ArraySetAsSeries(low,  true);
+   if(CopyOpen(sym, MomentumTF, 0, 1, open) < 1) return 0;
+   if(CopyHigh(sym, MomentumTF, 0, 1, high) < 1) return 0;
+   if(CopyLow (sym, MomentumTF, 0, 1, low)  < 1) return 0;
+
+   double body  = MathAbs(close[0] - open[0]);
+   double range = high[0] - low[0];
+   if(body  < atr * BodyStrengthATR) return 0;
+   if(range <= 0) return 0;
+
+   double closePct = (close[0] - low[0]) / range;
+   if(dir > 0 && closePct < (1.0 - CloseLocationPct)) return 0;
+   if(dir < 0 && closePct > CloseLocationPct)          return 0;
+
+   return dir;
 }
 
-double NormalizeVolume(const string symbol, double lots)
+// Returns direction of the last completed H1 candle (index [1]).
+int GetH1Direction(const string sym)
 {
-   double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
-   double maxLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
-   double step   = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
-   lots = MathMax(minLot, MathMin(maxLot, lots));
-   if(step > 0) lots = MathFloor(lots / step) * step;
+   double h1c[], h1o[];
+   ArraySetAsSeries(h1c, true);
+   ArraySetAsSeries(h1o, true);
+   if(CopyClose(sym, PERIOD_H1, 0, 2, h1c) < 2) return 0;
+   if(CopyOpen( sym, PERIOD_H1, 0, 2, h1o) < 2) return 0;
+   if(h1c[1] > h1o[1]) return  1;
+   if(h1c[1] < h1o[1]) return -1;
+   return 0;
+}
+
+// ─── Volume Helpers ──────────────────────────────────────────────────────────
+
+double NormalizeVolume(const string sym, double lots)
+{
+   double minL = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   double maxL = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
+   double step = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+   lots = MathMax(minL, MathMin(maxL, lots));
+   if(step > 0) lots = MathFloor(lots/step) * step;
    return NormalizeDouble(lots, 2);
 }
 
-double GetDynamicLot(const string symbol, int currentTrades)
+// Base lot from risk %: sizes so 1 ATR move costs RiskPercent% of equity.
+double CalcBaseLot(const string sym, double atr)
 {
-   double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
-   double lot = (LotStep == 0) ? BaseLot : (BaseLot + (currentTrades * LotStep));
-   lot = MathMin(MaxLot, MathMax(minLot, lot));
-   return NormalizeVolume(symbol, lot);
+   if(atr <= 0) return SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskAmt   = equity * (RiskPercent / 100.0);
+   double tickValue = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize <= 0 || tickValue <= 0) return SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   double lot = riskAmt / ((atr / tickSize) * tickValue);
+   return NormalizeVolume(sym, MathMin(MaxLotCap, lot));
 }
 
-int PositionsCount(const string symbol)
+// Lot for a specific trade in the basket.
+// If martingale is on, multiply base lot by MartingaleMult^tradeIndex.
+double GetBasketLot(const string sym, double atr, int tradeIndex)
 {
-   int count = 0;
-   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   double base = CalcBaseLot(sym, atr);
+   if(!UseMartingale || tradeIndex <= 0) return base;
+   double mult = MathPow(MartingaleMult, tradeIndex);
+   return NormalizeVolume(sym, MathMin(MaxLotCap, base * mult));
+}
+
+// ─── Position / Order Counts ─────────────────────────────────────────────────
+
+int PositionsCount(const string sym)
+{
+   int n = 0;
+   for(int i = PositionsTotal()-1; i >= 0; i--)
    {
       if(!pos.SelectByIndex(i)) continue;
-      if(pos.Symbol() != symbol) continue;
-      if(!IncludeAllTrades && pos.Magic() != MagicNumber) continue;
-      count++;
+      if(pos.Symbol() == sym && pos.Magic() == MagicNumber) n++;
    }
-   return count;
+   return n;
 }
 
-int PendingOrdersCount(const string symbol)
+int PendingOrdersCount(const string sym)
 {
-   int count = 0;
-   for(int i = OrdersTotal() - 1; i >= 0; --i)
+   int n = 0;
+   for(int i = OrdersTotal()-1; i >= 0; i--)
    {
-      ulong oticket = OrderGetTicket(i);
-      if(oticket == 0 || !OrderSelect(oticket)) continue;
-      if(OrderGetString(ORDER_SYMBOL) != symbol) continue;
-      if(!IncludeAllTrades && OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
-      count++;
+      ulong t = OrderGetTicket(i);
+      if(t == 0 || !OrderSelect(t)) continue;
+      if(OrderGetString(ORDER_SYMBOL) == sym && OrderGetInteger(ORDER_MAGIC) == MagicNumber) n++;
    }
-   return count;
+   return n;
 }
 
-int GetPendingOrdersDirection(const string symbol)
+int GetBasketDirection(const string sym)
 {
    int buys = 0, sells = 0;
-   for(int i = OrdersTotal() - 1; i >= 0; --i)
+   for(int i = PositionsTotal()-1; i >= 0; i--)
    {
-      ulong oticket = OrderGetTicket(i);
-      if(oticket == 0 || !OrderSelect(oticket)) continue;
-      if(OrderGetString(ORDER_SYMBOL) != symbol) continue;
-      ENUM_ORDER_TYPE otype = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-      if(otype == ORDER_TYPE_BUY_LIMIT) buys++;
-      else if(otype == ORDER_TYPE_SELL_LIMIT) sells++;
-   }
-   if(buys == 0 && sells == 0) return 0;
-   return (buys >= sells) ? 1 : -1;
-}
-
-datetime GetOldestPendingOrderTime(const string symbol)
-{
-   datetime oldest = 0;
-   for(int i = OrdersTotal() - 1; i >= 0; --i)
-   {
-      ulong oticket = OrderGetTicket(i);
-      if(oticket == 0 || !OrderSelect(oticket)) continue;
-      if(OrderGetString(ORDER_SYMBOL) != symbol) continue;
-      datetime t = (datetime)OrderGetInteger(ORDER_TIME_SETUP);
-      if(oldest == 0 || t < oldest) oldest = t;
-   }
-   return oldest;
-}
-
-void DeletePendingOrdersOnly(const string symbol)
-{
-   for(int i = OrdersTotal() - 1; i >= 0; --i)
-   {
-      ulong oticket = OrderGetTicket(i);
-      if(oticket == 0 || !OrderSelect(oticket)) continue;
-      if(OrderGetString(ORDER_SYMBOL) != symbol) continue;
-      trade.OrderDelete(oticket);
-   }
-}
-
-int GetBasketDirection(const string symbol)
-{
-   int buys = 0, sells = 0;
-   for(int i = PositionsTotal() - 1; i >= 0; --i)
-   {
-      if(!pos.SelectByIndex(i)) continue;
-      if(pos.Symbol() != symbol) continue;
+      if(!pos.SelectByIndex(i) || pos.Symbol()!=sym || pos.Magic()!=MagicNumber) continue;
       if(pos.PositionType() == POSITION_TYPE_BUY) buys++; else sells++;
    }
    if(buys == 0 && sells == 0) return 0;
    return (buys >= sells) ? 1 : -1;
 }
 
-double BasketProfit(const string symbol)
+double BasketProfit(const string sym)
 {
-   double profit = 0.0;
-   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   double p = 0;
+   for(int i = PositionsTotal()-1; i >= 0; i--)
    {
-      if(!pos.SelectByIndex(i)) continue;
-      if(pos.Symbol() != symbol) continue;
-      if(!IncludeAllTrades && pos.Magic() != MagicNumber) continue;
-      profit += pos.Profit() + pos.Swap() + pos.Commission();
+      if(!pos.SelectByIndex(i) || pos.Symbol()!=sym || pos.Magic()!=MagicNumber) continue;
+      p += pos.Profit() + pos.Swap() + pos.Commission();
    }
-   return profit;
+   return p;
 }
 
-double BasketLots(const string symbol)
+double BasketLots(const string sym)
 {
-   double lots = 0.0;
-   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   double lots = 0;
+   for(int i = PositionsTotal()-1; i >= 0; i--)
    {
-      if(!pos.SelectByIndex(i)) continue;
-      if(pos.Symbol() != symbol) continue;
-      if(!IncludeAllTrades && pos.Magic() != MagicNumber) continue;
+      if(!pos.SelectByIndex(i) || pos.Symbol()!=sym || pos.Magic()!=MagicNumber) continue;
       lots += pos.Volume();
    }
    return lots;
 }
 
-double CalculateBasketProfitTarget(const string symbol, double atr, double totalLots)
+void DeletePendingOrders(const string sym)
 {
-   if(!UseBasketProfit) return 0.0;
-   double target = 0.0;
-   if(UsePercentForBasket)
-      target = AccountInfoDouble(ACCOUNT_BALANCE) * (BasketProfitPercent / 100.0);
-   else if(atr > 0 && totalLots > 0)
+   for(int i = OrdersTotal()-1; i >= 0; i--)
    {
-      double tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
-      double tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
-      if(tickSize > 0) target = (atr * BasketProfitATRMultiplier) * (tickValue / tickSize) * totalLots;
+      ulong t = OrderGetTicket(i);
+      if(t == 0 || !OrderSelect(t)) continue;
+      if(OrderGetString(ORDER_SYMBOL)==sym && OrderGetInteger(ORDER_MAGIC)==MagicNumber)
+         trade.OrderDelete(t);
    }
-   return MathMax(target, 1.0);
 }
 
-datetime BasketOldestOpen(const string symbol)
-{
-   datetime oldest = 0;
-   for(int i = PositionsTotal() - 1; i >= 0; --i)
-   {
-      if(!pos.SelectByIndex(i)) continue;
-      if(pos.Symbol() != symbol) continue;
-      datetime opentime = pos.Time();
-      if(oldest == 0 || opentime < oldest) oldest = opentime;
-   }
-   return oldest;
-}
-
-bool CloseBasket(const string symbol)
+bool CloseBasket(const string sym)
 {
    trade.SetAsyncMode(true);
-   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   for(int i = PositionsTotal()-1; i >= 0; i--)
    {
-      if(!pos.SelectByIndex(i)) continue;
-      if(pos.Symbol() != symbol) continue;
+      if(!pos.SelectByIndex(i) || pos.Symbol()!=sym || pos.Magic()!=MagicNumber) continue;
       trade.PositionClose(pos.Ticket(), DeviationPoints);
    }
-   DeletePendingOrdersOnly(symbol);
+   DeletePendingOrders(sym);
    trade.SetAsyncMode(false);
    return true;
 }
 
+// ─── Profit Target ───────────────────────────────────────────────────────────
 
-bool OpenMarket(const string symbol, int direction, double atr)
+double CalcProfitTarget(const string sym, double atr, double totalLots)
 {
-   int totalTrades = PositionsCount(symbol) + PendingOrdersCount(symbol);
-   if(totalTrades >= MathMax(MinTotalTrades, MathMin(10, MaxTotalTrades))) return false;
-   
-   double lot = GetDynamicLot(symbol, totalTrades);
-   if(lot <= 0) return false;
-   
-   trade.SetExpertMagicNumber(MagicNumber);
-   
-   bool result = (direction > 0) ? trade.Buy(lot, symbol, 0, 0, 0) : trade.Sell(lot, symbol, 0, 0, 0);
-   return result;
+   if(!UseBasketProfit || atr <= 0 || totalLots <= 0) return 0.0;
+   double tv = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+   double ts = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+   if(ts <= 0) return 0.0;
+   return MathMax((atr * BasketProfitATRMult) * (tv/ts) * totalLots, 1.0);
 }
 
-bool PlaceLimitOrders(const string symbol, int direction, double atr)
+void ManageExits(const string sym, double atr)
 {
-   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
-   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-   
+   double profit = BasketProfit(sym);
+   double target = CalcProfitTarget(sym, atr, BasketLots(sym));
+   if(target > 0 && profit >= target)                 { CloseBasket(sym); return; }
+   if(CloseAtAnyProfit && profit >= MinProfitToClose) { CloseBasket(sym); return; }
+}
+
+// ─── Entry ───────────────────────────────────────────────────────────────────
+
+bool OpenMarket(const string sym, int dir, double atr)
+{
+   int total = PositionsCount(sym) + PendingOrdersCount(sym);
+   if(total >= MaxTotalTrades) return false;
+   double lot = GetBasketLot(sym, atr, total);
+   if(lot <= 0) return false;
+   trade.SetExpertMagicNumber(MagicNumber);
+   // No SL, no TP — basket is closed as a unit on profit target
+   bool ok = (dir > 0) ? trade.Buy(lot, sym, 0, 0, 0) : trade.Sell(lot, sym, 0, 0, 0);
+   return ok;
+}
+
+bool PlaceLimitOrders(const string sym, int dir, double atr)
+{
+   double ask    = SymbolInfoDouble(sym, SYMBOL_ASK);
+   double bid    = SymbolInfoDouble(sym, SYMBOL_BID);
+   int    digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
    double offsets[] = {0.2, 0.4, 0.6, 0.8, 1.0};
    int placed = 0;
-   
+   trade.SetExpertMagicNumber(MagicNumber);
+
    for(int i = 0; i < LimitOrderCount; i++)
    {
-      double lot = GetDynamicLot(symbol, PositionsCount(symbol) + PendingOrdersCount(symbol) + i);
-      double offset = atr * offsets[i];
-      double limitPrice = (direction > 0) ? NormalizeDouble(bid - offset, digits) : NormalizeDouble(ask + offset, digits);
-      
-      if(direction > 0) { if(trade.BuyLimit(lot, limitPrice, symbol, 0)) placed++; }
-      else { if(trade.SellLimit(lot, limitPrice, symbol, 0)) placed++; }
+      int cur = PositionsCount(sym) + PendingOrdersCount(sym);
+      if(cur >= MaxTotalTrades) break;
+      double lot    = GetBasketLot(sym, atr, cur);
+      double offset = atr * offsets[MathMin(i, 4)];
+      double price  = (dir > 0) ? NormalizeDouble(bid-offset, digits)
+                                 : NormalizeDouble(ask+offset, digits);
+      bool ok = (dir > 0) ? trade.BuyLimit(lot, price, sym, 0)
+                           : trade.SellLimit(lot, price, sym, 0);
+      if(ok) placed++;
    }
    return (placed > 0);
 }
 
-bool SpreadOK(const string symbol)
-{
-   double spread = (SymbolInfoDouble(symbol, SYMBOL_ASK) - SymbolInfoDouble(symbol, SYMBOL_BID)) / SymbolInfoDouble(symbol, SYMBOL_POINT);
-   return spread <= SpreadLimitPoints;
-}
-
-void ManageExits(const string symbol, double atr)
-{
-   if(atr <= 0) return;
-   double basketProfit = BasketProfit(symbol);
-   double totalLots = BasketLots(symbol);
-   double profitTarget = CalculateBasketProfitTarget(symbol, atr, totalLots);
-   
-   if(basketProfit >= profitTarget && basketProfit > 0) { CloseBasket(symbol); return; }
-   if(CloseAtAnyProfit && basketProfit >= MinProfitToClose) { CloseBasket(symbol); return; }
-}
+// ─── Lifecycle ───────────────────────────────────────────────────────────────
 
 int OnInit()
 {
-   if(!EnsureSymbolReady(TradeSymbol)) return INIT_FAILED;
-   CloseAllExistingTrades(TradeSymbol);
-   atrHandle = iATR(TradeSymbol, ATRTimeframe, ATRPeriod);
-   eaInitialized = true;
-   Print("EA Initialized with Margin-Based SAR System.");
+   gSymbol = (TradeSymbol == "") ? Symbol() : TradeSymbol;
+   if(!EnsureSymbolReady(gSymbol)) return INIT_FAILED;
+   CloseAllExistingTrades(gSymbol);
+   atrHandle = iATR(gSymbol, ATRTimeframe, ATRPeriod);
+   if(atrHandle < 0) { Print("ATR handle failed."); return INIT_FAILED; }
+   Print("DailyHoldScalper v4.00 | Symbol: ", gSymbol, " | Risk: ", RiskPercent, "% per trade");
    return INIT_SUCCEEDED;
 }
 
-void OnDeinit(const int reason) { IndicatorRelease(atrHandle); }
+void OnDeinit(const int reason)
+{
+   IndicatorRelease(atrHandle);
+}
 
 void OnTick()
 {
-   // Global Margin Protection - Execute FIRST before any other logic
+   // ── Margin protection — always first ──────────────────────────────────────
    double marginLevel = AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
    if(marginLevel > 0 && marginLevel < MarginTriggerLevel)
    {
-      // Determine basket direction BEFORE closing
-      int closedBasketDirection = GetBasketDirection(TradeSymbol);
-      
-      // Close all positions and pending orders
-      CloseBasket(TradeSymbol);
-      DeletePendingOrdersOnly(TradeSymbol);
-      
-      Print("Margin SAR Triggered: Margin Level = ", marginLevel, "%");
-      
-      // SAR Logic with H1 Filter
-      if(closedBasketDirection != 0)
+      int closedDir = GetBasketDirection(gSymbol);
+      CloseBasket(gSymbol);
+      Print("Margin protection triggered: ", marginLevel, "% → closing all.");
+
+      // Attempt H1-confirmed reversal
+      if(closedDir != 0)
       {
-         // Get H1 candle data
-         double h1Close[], h1Open[];
-         ArraySetAsSeries(h1Close, true);
-         ArraySetAsSeries(h1Open, true);
-         
-         if(CopyClose(TradeSymbol, PERIOD_H1, 0, 1, h1Close) >= 1 && 
-            CopyOpen(TradeSymbol, PERIOD_H1, 0, 1, h1Open) >= 1)
+         int h1dir = GetH1Direction(gSymbol);
+         int revDir = -closedDir;
+         if(h1dir != 0 && h1dir != revDir)
          {
-            bool h1Bearish = h1Close[0] < h1Open[0];
-            bool h1Bullish = h1Close[0] > h1Open[0];
-            
-            int reverseDirection = 0;
-            bool filterPassed = false;
-            
-            // If closed basket was BUY, only reverse to SELL if H1 is Bearish
-            if(closedBasketDirection > 0 && h1Bearish)
-            {
-               reverseDirection = -1;
-               filterPassed = true;
-            }
-            // If closed basket was SELL, only reverse to BUY if H1 is Bullish
-            else if(closedBasketDirection < 0 && h1Bullish)
-            {
-               reverseDirection = 1;
-               filterPassed = true;
-            }
-            
-            if(filterPassed && reverseDirection != 0)
-            {
-               // Check margin availability before opening reverse trade
-               double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
-               double ask = SymbolInfoDouble(TradeSymbol, SYMBOL_ASK);
-               double bid = SymbolInfoDouble(TradeSymbol, SYMBOL_BID);
-               
-               // Calculate required margin for BaseLot using OrderCalcMargin
-               double marginRequired = 0;
-               ENUM_ORDER_TYPE orderType = (reverseDirection > 0) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-               if(!OrderCalcMargin(orderType, TradeSymbol, BaseLot, 
-                                  (reverseDirection > 0) ? ask : bid, marginRequired))
-               {
-                  marginRequired = SymbolInfoDouble(TradeSymbol, SYMBOL_MARGIN_INITIAL) * BaseLot;
-               }
-               
-               // Add spread buffer (spread cost)
-               double point = SymbolInfoDouble(TradeSymbol, SYMBOL_POINT);
-               double spread = (ask - bid) / point;
-               double tickValue = SymbolInfoDouble(TradeSymbol, SYMBOL_TRADE_TICK_VALUE);
-               double tickSize = SymbolInfoDouble(TradeSymbol, SYMBOL_TRADE_TICK_SIZE);
-               if(tickSize > 0 && tickValue > 0)
-                  marginRequired += (spread * point) * (tickValue / tickSize) * BaseLot;
-               
-               if(freeMargin >= marginRequired)
-               {
-                  trade.SetExpertMagicNumber(MagicNumber);
-                  bool opened = (reverseDirection > 0) ? 
-                     trade.Buy(BaseLot, TradeSymbol, 0, 0, 0) : 
-                     trade.Sell(BaseLot, TradeSymbol, 0, 0, 0);
-                  
-                  if(opened)
-                     Print("SAR Reverse Trade Opened: Direction = ", (reverseDirection > 0 ? "BUY" : "SELL"), 
-                           ", H1 Filter = ", (h1Bullish ? "Bullish" : "Bearish"));
-               }
-               else
-               {
-                  Print("SAR Failed: Insufficient Free Margin. Required: ", marginRequired, ", Available: ", freeMargin);
-               }
-            }
-            else
-            {
-               Print("SAR Filter Blocked: Closed Basket Direction = ", (closedBasketDirection > 0 ? "BUY" : "SELL"),
-                     ", H1 Candle = ", (h1Bullish ? "Bullish" : h1Bearish ? "Bearish" : "Neutral"));
-            }
+            Print("SAR blocked — H1 does not confirm reversal direction.");
+            return;
          }
+         double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+         double atr        = GetATR();
+         double lot        = (atr > 0) ? CalcBaseLot(gSymbol, atr)
+                                       : SymbolInfoDouble(gSymbol, SYMBOL_VOLUME_MIN);
+         double price      = (revDir > 0) ? SymbolInfoDouble(gSymbol, SYMBOL_ASK)
+                                          : SymbolInfoDouble(gSymbol, SYMBOL_BID);
+         double marginReq  = 0;
+         if(!OrderCalcMargin((revDir > 0) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
+                              gSymbol, lot, price, marginReq))
+            marginReq = SymbolInfoDouble(gSymbol, SYMBOL_MARGIN_INITIAL) * lot;
+         if(freeMargin >= marginReq)
+         {
+            trade.SetExpertMagicNumber(MagicNumber);
+            bool ok = (revDir > 0) ? trade.Buy(lot, gSymbol, 0, 0, 0)
+                                   : trade.Sell(lot, gSymbol, 0, 0, 0);
+            if(ok) Print("SAR reversal opened: ", (revDir > 0 ? "BUY" : "SELL"));
+         }
+         else
+            Print("SAR failed — insufficient free margin.");
       }
-      
-      // Return early after margin SAR - don't proceed with normal entry logic
       return;
    }
-   
-   if(!EnsureSymbolReady(TradeSymbol) || !SpreadOK(TradeSymbol)) return;
+
+   if(!EnsureSymbolReady(gSymbol) || !SpreadOK(gSymbol)) return;
+
    double atr = GetATR();
    if(atr <= 0) return;
+   gATR = atr;
 
-   ManageExits(TradeSymbol, atr);
-   
-   int entryDirection = DetectMomentumBreakout(TradeSymbol, atr);
-   if(entryDirection != 0)
+   // ── Manage exits ──────────────────────────────────────────────────────────
+   ManageExits(gSymbol, atr);
+
+   // ── Rate limiter ──────────────────────────────────────────────────────────
+   if(TimeCurrent() - lastEntryTime < MinSecondsBetweenEntries) return;
+
+   // ── Entry signal ──────────────────────────────────────────────────────────
+   int dir = DetectMomentum(gSymbol, atr);
+   if(dir == 0) return;
+
+   // H1 bias filter — skip entries that fight the H1 trend
+   if(UseH1Filter)
    {
-      int basketDir = GetBasketDirection(TradeSymbol);
-      if(basketDir != 0 && entryDirection != basketDir) return;
-
-      if(UseLimitOrders)
-      {
-         if(PendingOrdersCount(TradeSymbol) > 0) return;
-         for(int m=0; m<MarketOrdersAtExecution; m++) OpenMarket(TradeSymbol, entryDirection, atr);
-         PlaceLimitOrders(TradeSymbol, entryDirection, atr);
-      }
-      else
-      {
-         OpenMarket(TradeSymbol, entryDirection, atr);
-      }
-      lastEntryTime = TimeCurrent();
+      int h1 = GetH1Direction(gSymbol);
+      if(h1 != 0 && h1 != dir) return;
    }
+
+   // Don't fight existing basket direction
+   int basketDir = GetBasketDirection(gSymbol);
+   if(basketDir != 0 && dir != basketDir) return;
+
+   // ── Open trades ───────────────────────────────────────────────────────────
+   if(UseLimitOrders)
+   {
+      if(PendingOrdersCount(gSymbol) > 0) return;
+      for(int m = 0; m < MarketOrdersAtExecution; m++) OpenMarket(gSymbol, dir, atr);
+      PlaceLimitOrders(gSymbol, dir, atr);
+   }
+   else
+   {
+      OpenMarket(gSymbol, dir, atr);
+   }
+   lastEntryTime = TimeCurrent();
 }
