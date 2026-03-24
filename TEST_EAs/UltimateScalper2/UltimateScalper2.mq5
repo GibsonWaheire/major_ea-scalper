@@ -59,8 +59,8 @@ input double          PaddingATRMult           = 0.0;     // Candle SL padding a
 // ─── HFT Basket Profit ───────────────────────────────────────────────────────
 input double          BasketProfitATRMult      = 2.5;     // Full target (ATR multiplier)
 input bool            CloseAtAnyProfit         = true;    // Close basket at MinProfitToClose
-input double          MinProfitToClose         = 0.01;    // Minimum profit to trigger close
-input double          MinCloseATRMult          = 0.5;     // Min basket profit (N×ATR×lots value) before CloseAtAnyProfit fires
+input double          MinProfitToClose         = 0.01;    // Minimum profit $ to arm the close trigger
+input double          BasketProfitFloorPct     = 0.60;    // CloseAtAnyProfit only fires after basket pulls back to X% of its peak profit
 
 // ─── State Machine ───────────────────────────────────────────────────────────
 input int             HFTTradeThreshold        = 50;      // Market orders before cooldown
@@ -98,6 +98,7 @@ CPositionInfo pos;
 int           atrHandle     = -1;
 datetime      lastEntryTime = 0;
 double        gATR          = 0.0;   // Updated each tick; used by helpers for ATR-relative scaling
+double        gBasketPeak   = 0.0;   // High-water mark for basket profit (reset on basket close)
 
 // ─── Protection state ─────────────────────────────────────────────────────────
 bool          gCautionActive   = false;  // Layer 1 DD: blocks new entries
@@ -557,6 +558,7 @@ bool CloseBasket(const string sym)
    }
    DeletePendingOrders(sym);
    trade.SetAsyncMode(false);
+   gBasketPeak = 0;   // Reset high-water mark for next cycle
    return true;
 }
 
@@ -776,25 +778,25 @@ double CalculateBasketProfitTarget(const string sym, double atr, double totalLot
 void ManageHFTExits(const string sym, double atr)
 {
    double profit = BasketProfit(sym);
+
+   // Update basket high-water mark
+   if(profit > gBasketPeak) gBasketPeak = profit;
+
    double target = CalculateBasketProfitTarget(sym, atr, BasketLots(sym));
 
-   // Full ATR target — always honoured regardless of MinCloseATRMult
-   if(profit >= target && profit > 0) { CloseBasket(sym); return; }
+   // Full ATR target — always honoured, close immediately
+   if(profit >= target && profit > 0) { gBasketPeak = 0; CloseBasket(sym); return; }
 
-   // CloseAtAnyProfit — only fires when basket profit has reached a meaningful ATR distance.
-   // Prevents tiny $0.01 closes that leave nothing to absorb the next loss.
+   // CloseAtAnyProfit — hold until basket has built a real peak then pulled back.
+   // This prevents dumping at $0.01 before profit has had a chance to develop.
+   // Logic: basket must have reached a meaningful peak (> MinProfitToClose),
+   //        then pulled back to BasketProfitFloorPct × peak (e.g. 60%).
+   //        If no real peak exists yet → hold, let profit build.
    if(CloseAtAnyProfit && profit >= MinProfitToClose)
    {
-      bool profitWorthy = true;
-      if(MinCloseATRMult > 0 && atr > 0)
-      {
-         double lots = BasketLots(sym);
-         double tv   = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
-         double ts   = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
-         if(ts > 0 && tv > 0 && lots > 0)
-            profitWorthy = (profit >= MinCloseATRMult * atr * (tv / ts) * lots);
-      }
-      if(profitWorthy) { CloseBasket(sym); return; }
+      bool hasPeak     = (gBasketPeak > MinProfitToClose);
+      bool pulledBack  = (profit <= gBasketPeak * BasketProfitFloorPct);
+      if(hasPeak && pulledBack) { gBasketPeak = 0; CloseBasket(sym); return; }
    }
 }
 

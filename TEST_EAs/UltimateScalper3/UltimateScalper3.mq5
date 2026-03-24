@@ -90,7 +90,6 @@ input int             ScoreHoldThreshold       = 4;      // Min score to hold; p
 input int             ScorePartialThreshold    = 2;      // Min score for partial (else full close)
 input bool            EnableGraduation         = true;   // Promote best trade to Quality on threshold hit
 input double          PostPartialCutATRMult    = 1.0;   // After partial close: cut remaining if loss >= N×ATR from entry (0=off)
-input double          MinCloseATRMult          = 0.5;   // Min profit distance (N×ATR from entry) before ANY close/partial is allowed
 
 // ─── Profit Protection (High-Water Mark) ─────────────────────────────────────
 // Prevents closing a winning trade on a brief pullback.
@@ -740,13 +739,17 @@ void PWCleanStale()
 }
 
 // Returns true when it is safe to close/reduce a profitable position:
+//   - a meaningful profit peak has been recorded, AND
 //   - profit has fallen below ProfitFloorPct × peak, AND
 //   - momentum has been opposing for ReversalTicksRequired ticks
+//
+// If no meaningful peak exists yet → return FALSE (hold the trade, let it build).
+// The SL handles the case where it never becomes profitable.
 bool PWCanClose(ulong ticket, double posProfit)
 {
    double peak = PWGetPeak(ticket);
-   // If no meaningful peak recorded yet, allow close normally
-   if(peak <= MinProfitToClose) return true;
+   // No meaningful peak yet — hold, don't close at near-zero profit
+   if(peak <= MinProfitToClose) return false;
    bool belowFloor   = (posProfit <= peak * ProfitFloorPct);
    bool reversalConf = (PWGetOppCount(ticket) >= ReversalTicksRequired);
    return (belowFloor && reversalConf);
@@ -1101,29 +1104,26 @@ void ManageHFTExits(const string sym, double atr)
       double profitDist     = (curPx - pos.PriceOpen()) * dir;
       bool   partialTrigger = (atr > 0 && profitDist >= atr * PartialCloseATRTrigger);
 
-      // Gate: don't close/reduce unless trade has moved at least MinCloseATRMult×ATR in profit.
-      // Prevents exiting at near-zero profit which leaves nothing to offset the next loss.
-      bool profitWorthy = (MinCloseATRMult <= 0 || atr <= 0 || profitDist >= atr * MinCloseATRMult);
-
       int score = ScorePosition(ticket, atr);
 
       if(score >= ScoreHoldThreshold)
       {
          // Strong trade — hold it; lock in partial profit if far enough and not yet done
-         if(partialTrigger && profitWorthy && !PCIsDone(ticket))
+         if(partialTrigger && !PCIsDone(ticket))
             TryPartialClose(ticket, PartialCloseRatio);
       }
       else if(score >= ScorePartialThreshold)
       {
-         // Moderate — only partial close if profit is worthy AND has pulled back below the floor
-         if(posProfit > 0 && profitWorthy && !PCIsDone(ticket) && PWCanClose(ticket, posProfit))
+         // Moderate — partial close only when profit has peaked and is genuinely pulling back.
+         // PWCanClose holds until a real peak was seen AND floor breached AND reversal confirmed.
+         if(posProfit > 0 && !PCIsDone(ticket) && PWCanClose(ticket, posProfit))
             TryPartialClose(ticket, PartialCloseRatio);
       }
       else
       {
-         // Weak / opposing — only close if profit is worthy, pulled back from peak,
-         // AND momentum has confirmed the reversal for N consecutive ticks
-         if(CloseAtAnyProfit && posProfit >= MinProfitToClose && profitWorthy && PWCanClose(ticket, posProfit))
+         // Weak / opposing — close only after a real profit peak, confirmed pullback, and reversal.
+         // PWCanClose returns false if no meaningful peak exists → hold, don't dump at $0.01.
+         if(CloseAtAnyProfit && posProfit >= MinProfitToClose && PWCanClose(ticket, posProfit))
             trade.PositionClose(ticket, DeviationPoints);
       }
 
