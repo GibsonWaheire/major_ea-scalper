@@ -79,6 +79,15 @@ input double          BasketProfitATRMult      = 2.5;    // Close basket when to
 input double          MinProfitToClose         = 0.50;   // Floor: basket must show at least this $ before peak-pullback fires
 input double          BasketProfitFloorPct     = 0.60;   // Fire close when profit pulls back to X% of its peak (0.60 = 60%)
 
+// ─── Momentum Hold Timer ─────────────────────────────────────────────────────
+// Once basket hits profit target, hold for 10–30 s instead of closing immediately.
+// Hold duration scales with tick velocity — fast market = longer hold.
+// Closes early if profit pulls back during the hold.
+input int             HoldMinSeconds           = 10;     // Minimum hold after target hit (seconds)
+input int             HoldMaxSeconds           = 30;     // Hard cap on hold duration (seconds)
+input double          HoldVelocityScale        = 500.0;  // avgTickVelocity × this = extra hold seconds added to HoldMin
+input double          HoldPullbackPct          = 0.40;   // Close early if profit drops to X% of in-hold peak (0.40 = 40%)
+
 // ─── Breakeven Trail ─────────────────────────────────────────────────────────
 input double          BETrailATRTrigger        = 1.0;    // Move SL to breakeven when profit >= N×ATR
 input double          BEBufferATRMult          = 0.1;    // Buffer above entry for BE SL (ATR × this)
@@ -132,6 +141,19 @@ double        gHFTStartEquity  = 0.0;   // Equity snapshot when current HFT cycl
 
 // ─── Basket profit tracking ──────────────────────────────────────────────────
 double gBasketPeak = 0.0;   // High-water mark of basket profit within the current HFT cycle
+
+// ─── Momentum Hold Timer state ───────────────────────────────────────────────
+bool     gHoldActive   = false;   // Currently in hold phase
+datetime gHoldStart    = 0;       // When hold phase began
+double   gHoldPeak     = 0.0;     // Profit high-water mark during the hold
+int      gHoldDuration = 0;       // Calculated hold seconds (10–30)
+
+// Tick velocity — rolling average of last 5 absolute bid changes
+#define VEL_WINDOW 5
+double gVelBuf[VEL_WINDOW];
+int    gVelIdx  = 0;
+double gVelSum  = 0.0;
+double gPrevBid = 0.0;
 
 
 // ─── Resolved symbol ─────────────────────────────────────────────────────────
@@ -590,6 +612,7 @@ bool CloseBasket(const string sym)
    DeletePendingOrders(sym);
    trade.SetAsyncMode(false);
    gBasketPeak = 0;
+   ResetHoldState();
    return true;
 }
 
@@ -849,6 +872,37 @@ double CalculateBasketProfitTarget(const string sym, double atr, double totalLot
    return MathMax((atr * BasketProfitATRMult) * (tv / ts) * totalLots, 1.0);
 }
 
+// Updates the 5-tick rolling average velocity and returns the current avg.
+double UpdateTickVelocity()
+{
+   double bid = SymbolInfoDouble(gSymbol, SYMBOL_BID);
+   if(gPrevBid > 0.0)
+   {
+      double delta = MathAbs(bid - gPrevBid);
+      gVelSum -= gVelBuf[gVelIdx];
+      gVelBuf[gVelIdx] = delta;
+      gVelSum += delta;
+      gVelIdx = (gVelIdx + 1) % VEL_WINDOW;
+   }
+   gPrevBid = bid;
+   return gVelSum / VEL_WINDOW;
+}
+
+// Returns hold duration in seconds based on current avg velocity.
+int CalcHoldDuration(double avgVel)
+{
+   int extra = (int)(avgVel * HoldVelocityScale);
+   return (int)MathMin(HoldMinSeconds + extra, HoldMaxSeconds);
+}
+
+void ResetHoldState()
+{
+   gHoldActive   = false;
+   gHoldStart    = 0;
+   gHoldPeak     = 0.0;
+   gHoldDuration = 0;
+}
+
 void ManageHFTExits(const string sym, double atr)
 {
    // Breakeven trail — run on every position each tick
@@ -858,22 +912,67 @@ void ManageHFTExits(const string sym, double atr)
       TryMoveToBreakeven(pos.Ticket(), atr);
    }
 
-   double profit = BasketProfit(sym);
+   double profit  = BasketProfit(sym);
+   double avgVel  = UpdateTickVelocity();
 
-   // Update basket high-water mark
-   if(profit > gBasketPeak) gBasketPeak = profit;
-
-   // Full ATR target — close basket immediately when hit
-   double target = CalculateBasketProfitTarget(sym, atr, BasketLots(sym));
-   if(profit >= target && profit > 0)
+   // ── HOLD PHASE ────────────────────────────────────────────────────────────
+   if(gHoldActive)
    {
-      Print("Basket target hit: profit=", DoubleToString(profit,2), " target=", DoubleToString(target,2));
+      // Track profit peak during hold
+      if(profit > gHoldPeak) gHoldPeak = profit;
+
+      int elapsed = (int)(TimeCurrent() - gHoldStart);
+
+      // Early exit: profit pulled back too far from in-hold peak
+      if(gHoldPeak > 0 && profit <= gHoldPeak * HoldPullbackPct)
+      {
+         Print("Hold pullback exit: profit=", DoubleToString(profit,2),
+               " holdPeak=", DoubleToString(gHoldPeak,2),
+               " elapsed=", elapsed, "s");
+         gBasketPeak = 0;
+         ResetHoldState();
+         CloseBasket(sym);
+         return;
+      }
+
+      // While still within hold window, extend duration if velocity is strong
+      if(elapsed < gHoldDuration)
+      {
+         int newDur = CalcHoldDuration(avgVel);
+         if(newDur > gHoldDuration) gHoldDuration = newDur;   // only extend, never shorten
+         return;   // still holding
+      }
+
+      // Hold duration elapsed — close now
+      Print("Hold timer expired: profit=", DoubleToString(profit,2),
+            " holdPeak=", DoubleToString(gHoldPeak,2),
+            " duration=", gHoldDuration, "s");
       gBasketPeak = 0;
+      ResetHoldState();
       CloseBasket(sym);
       return;
    }
 
-   // Peak-pullback close — only after a real peak has formed above MinProfitToClose
+   // ── NORMAL PHASE ─────────────────────────────────────────────────────────
+   // Update basket high-water mark
+   if(profit > gBasketPeak) gBasketPeak = profit;
+
+   // Target hit — enter hold phase instead of closing immediately
+   double target = CalculateBasketProfitTarget(sym, atr, BasketLots(sym));
+   if(profit >= target && profit > 0)
+   {
+      gHoldActive   = true;
+      gHoldStart    = TimeCurrent();
+      gHoldPeak     = profit;
+      gHoldDuration = CalcHoldDuration(avgVel);
+      Print("Basket target hit — entering hold: profit=", DoubleToString(profit,2),
+            " target=", DoubleToString(target,2),
+            " holdDur=", gHoldDuration, "s",
+            " avgVel=", DoubleToString(avgVel,6));
+      return;
+   }
+
+   // Peak-pullback close — only after a real peak above MinProfitToClose
    if(profit >= MinProfitToClose && gBasketPeak > MinProfitToClose)
    {
       if(profit <= gBasketPeak * BasketProfitFloorPct)
@@ -888,7 +987,7 @@ void ManageHFTExits(const string sym, double atr)
 
 bool OpenMarket(const string sym, int dir, double atr)
 {
-   if(gCautionActive) return false;   // Layer 1 DD: entries blocked
+   if(gCautionActive || gHoldActive) return false;   // Layer 1 DD or hold phase: entries blocked
    int maxT  = GetEffectiveMaxTrades();
    int total = PositionsCount(sym) + PendingOrdersCount(sym);
    if(total >= maxT) return false;
@@ -907,7 +1006,7 @@ bool OpenMarket(const string sym, int dir, double atr)
 
 bool PlaceLimitOrders(const string sym, int dir, double atr)
 {
-   if(gCautionActive) return false;   // Layer 1 DD: entries blocked
+   if(gCautionActive || gHoldActive) return false;   // Layer 1 DD or hold phase: entries blocked
    double ask    = SymbolInfoDouble(sym, SYMBOL_ASK);
    double bid    = SymbolInfoDouble(sym, SYMBOL_BID);
    int    digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
@@ -969,6 +1068,7 @@ void GraduateBestPosition(const string sym, double atr)
       trade.SetAsyncMode(false);
       DeletePendingOrders(sym);
       gBasketPeak = 0;
+      ResetHoldState();
       hftTradeCount = 0;
       eaState = STATE_HFT;
       Print("HFT cycle complete | trades=", hftTradeCount,
@@ -1008,6 +1108,7 @@ void GraduateBestPosition(const string sym, double atr)
    qualityOpenTime = TimeCurrent();
    eaState         = STATE_QUALITY;
    gBasketPeak     = 0;
+   ResetHoldState();
    gCautionActive  = false;
    SaveState();
 }
