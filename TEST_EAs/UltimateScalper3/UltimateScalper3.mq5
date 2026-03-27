@@ -86,7 +86,7 @@ input double          BasketProfitFloorPct     = 0.60;   // Fire close when prof
 input int             HoldMinSeconds           = 10;     // Minimum hold after target hit (seconds)
 input int             HoldMaxSeconds           = 30;     // Hard cap on hold duration (seconds)
 input double          HoldVelocityScale        = 500.0;  // avgTickVelocity × this = extra hold seconds added to HoldMin
-input double          HoldPullbackPct          = 0.40;   // Close early if profit drops to X% of in-hold peak (0.40 = 40%)
+input double          HoldPullbackPct          = 0.50;   // Close early if profit drops to X% of in-hold peak (0.50 = 50%)
 
 // ─── Breakeven Trail ─────────────────────────────────────────────────────────
 input double          BETrailATRTrigger        = 1.0;    // Move SL to breakeven when profit >= N×ATR
@@ -923,8 +923,17 @@ void ManageHFTExits(const string sym, double atr)
 
       int elapsed = (int)(TimeCurrent() - gHoldStart);
 
-      // Early exit: profit pulled back too far from in-hold peak
-      if(gHoldPeak > 0 && profit <= gHoldPeak * HoldPullbackPct)
+      // If basket went negative during hold — abort, let SL handle, never close at a loss
+      if(profit <= 0)
+      {
+         Print("Hold aborted: basket negative (", DoubleToString(profit,2),
+               ") — resetting hold, SL handles losers");
+         ResetHoldState();
+         return;
+      }
+
+      // Early exit: profit pulled back to 50% of in-hold peak (only after min hold, only in profit)
+      if(elapsed >= HoldMinSeconds && gHoldPeak > 0 && profit <= gHoldPeak * HoldPullbackPct)
       {
          Print("Hold pullback exit: profit=", DoubleToString(profit,2),
                " holdPeak=", DoubleToString(gHoldPeak,2),
@@ -943,13 +952,23 @@ void ManageHFTExits(const string sym, double atr)
          return;   // still holding
       }
 
-      // Hold duration elapsed — close now
-      Print("Hold timer expired: profit=", DoubleToString(profit,2),
-            " holdPeak=", DoubleToString(gHoldPeak,2),
-            " duration=", gHoldDuration, "s");
-      gBasketPeak = 0;
-      ResetHoldState();
-      CloseBasket(sym);
+      // Hold duration elapsed — only close if basket is net positive
+      if(profit > 0)
+      {
+         Print("Hold timer expired: profit=", DoubleToString(profit,2),
+               " holdPeak=", DoubleToString(gHoldPeak,2),
+               " duration=", gHoldDuration, "s");
+         gBasketPeak = 0;
+         ResetHoldState();
+         CloseBasket(sym);
+      }
+      else
+      {
+         // Basket went negative during hold — reset and wait for recovery
+         Print("Hold timer expired but basket negative (", DoubleToString(profit,2),
+               ") — resetting hold, waiting for recovery");
+         ResetHoldState();
+      }
       return;
    }
 
@@ -1057,28 +1076,30 @@ void GraduateBestPosition(const string sym, double atr)
 
    if(bestTicket == 0 || bestScore < ScoreHoldThreshold)
    {
-      // No worthy candidate — close any winning positions, leave losers for SL
-      trade.SetAsyncMode(true);
-      for(int i = PositionsTotal()-1; i >= 0; i--)
+      // No worthy candidate — close entire basket only if net positive; else wait
+      double basketPnl = BasketProfit(sym);
+      if(basketPnl > 0)
       {
-         if(!pos.SelectByIndex(i) || pos.Symbol()!=sym || pos.Magic()!=MagicNumber) continue;
-         if(pos.Profit() + pos.Swap() > 0)
-            trade.PositionClose(pos.Ticket(), DeviationPoints);
+         Print("HFT cycle complete | trades=", hftTradeCount,
+               (bestScore > -99 ? StringFormat(" | best score=%d (below threshold)", bestScore) : ""),
+               " | basket=", DoubleToString(basketPnl,2), " → bulk close");
+         DeletePendingOrders(sym);
+         gBasketPeak = 0;
+         ResetHoldState();
+         CloseBasket(sym);
+         hftTradeCount = 0;
+         eaState = STATE_HFT;
+         SaveState();
       }
-      trade.SetAsyncMode(false);
-      DeletePendingOrders(sym);
-      gBasketPeak = 0;
-      ResetHoldState();
-      hftTradeCount = 0;
-      eaState = STATE_HFT;
-      Print("HFT cycle complete | trades=", hftTradeCount,
-            (bestScore > -99 ? StringFormat(" | best score=%d (below threshold)", bestScore) : ""),
-            " → restarting HFT");
-      SaveState();
+      else
+      {
+         Print("HFT threshold hit but basket negative (", DoubleToString(basketPnl,2),
+               ") — waiting for recovery before closing");
+      }
       return;
    }
 
-   // Close all except the best trade — only those currently showing a gain
+   // Close all except the best trade — bulk close only if each is net positive
    for(int i = PositionsTotal()-1; i >= 0; i--)
    {
       if(!pos.SelectByIndex(i) || pos.Symbol()!=sym || pos.Magic()!=MagicNumber) continue;

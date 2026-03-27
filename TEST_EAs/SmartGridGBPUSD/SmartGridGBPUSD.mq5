@@ -1,19 +1,19 @@
 //+------------------------------------------------------------------+
-//|                                          SmartGridGBPUSD.mq5 |
-//|                        Smart Grid EA with ATR Spacing & News Filter |
-//|                        Prop-Firm Safe (No Martingale) |
+//|                                                 SmartGrid.mq5 |
+//|          Universal Smart Grid EA — Multi-Pair, ATR Spacing     |
+//|          Prop-Firm Safe (No Martingale, No Simultaneous Hedge) |
 //+------------------------------------------------------------------+
 #property copyright "Smart Grid EA"
 #property link      ""
-#property version   "2.00"
+#property version   "3.00"
 #property strict
 
 #include <Trade\Trade.mqh>
 
 // ===== Input Parameters =====
 input group "===== Grid Settings ====="
-input double   LotSize          = 0.01;      // Fixed lot size (No Martingale)
-input double   ATR_Multiplier   = 1.5;       // ATR multiplier for dynamic spacing
+input double   LotSize          = 0.30;      // Fixed lot size (No Martingale)
+input double   ATR_Multiplier   = 1.0;       // ATR multiplier for dynamic spacing
 input int      ATR_Period       = 14;        // ATR period
 input ENUM_TIMEFRAMES ATR_Timeframe = PERIOD_H1; // Timeframe for ATR calculation
 input int      MaxGridLevels    = 10;        // Maximum grid levels
@@ -26,7 +26,7 @@ input double   StopLossPips     = 100;       // Stop loss in pips (per position)
 
 input group "===== News Filter ====="
 input bool     UseNewsFilter    = true;      // Enable news filter
-input int      NewsBlockMinutes = 30;        // Block trading X minutes before news
+input int      NewsBlockMinutes = 15;        // Block trading X minutes before news
 input string   NewsTimes        = "08:30,12:30,13:30,14:00,15:30"; // High-impact news times (GMT)
 
 input group "===== Basket Trailing ====="
@@ -43,7 +43,7 @@ input bool     UseTrendFilter   = true;     // Enable trend filter
 input int      EMA_Fast         = 21;       // Fast EMA period
 input int      EMA_Slow         = 50;       // Slow EMA period
 input int      ADX_Period       = 14;       // ADX period
-input double   ADX_Threshold    = 25.0;     // ADX threshold for trending (below = ranging)
+input double   ADX_Threshold    = 20.0;     // ADX threshold for trending (below = ranging)
 
 input group "===== Market Condition ====="
 input bool     UseMarketCondition = true;   // Enable market condition detection
@@ -52,19 +52,19 @@ input double   BB_Deviation     = 2.0;      // Bollinger Bands deviation
 
 input group "===== Support/Resistance ====="
 input bool     UseSRFilter      = true;     // Enable S/R filter
-input double   SR_DistancePips = 20.0;     // Distance from S/R to avoid (pips)
+input double   SR_DistancePips = 10.0;     // Distance from S/R to avoid (pips)
 
 input group "===== Entry Filters ====="
 input bool     UseRSIFilter     = true;     // Enable RSI filter
 input int      RSI_Period       = 14;       // RSI period
 input bool     UseSpreadFilter  = true;     // Enable spread filter
-input double   MaxSpreadPips    = 3.0;      // Maximum spread in pips
+input double   MaxSpreadPips    = 5.0;      // Maximum spread in pips
 input bool     UseSessionFilter = true;     // Enable session filter
 input int      SessionStartHour = 8;        // Trading session start (GMT)
 input int      SessionEndHour   = 17;       // Trading session end (GMT)
 
 input group "===== Exit Management ====="
-input bool     UsePartialTP     = true;     // Enable partial take profit
+input bool     UsePartialTP     = false;    // Enable partial take profit (BasketTrailing handles this)
 input double   PartialTP1_Pips  = 20.0;     // First partial TP (pips)
 input double   PartialTP2_Pips  = 40.0;     // Second partial TP (pips)
 input bool     UseBreakeven     = true;     // Enable breakeven protection
@@ -74,7 +74,7 @@ input double   MaxBasketHours   = 24.0;     // Max hours basket open without pro
 input group "===== Enhanced Grid Management ====="
 input bool     UseAsymmetricGrid = true;    // More levels in trend direction
 input bool     UseGridRebalancing = true;   // Close losing side when profitable side reaches target
-input double   MaxDrawdownPerSide = 2.0;    // Max drawdown % per side before stopping new levels
+input double   MaxDrawdownPerSide = 3.0;    // Max drawdown % per side before stopping new levels
 
 // ===== Global Variables =====
 CTrade trade;
@@ -93,6 +93,7 @@ bool eaDisabled = false;
 datetime lastNewsCheck = 0;
 string newsTimesArray[];
 datetime basketOpenTime = 0;
+int gridDirection = 0;       // Ranging-mode direction: 1=Buy grid, -1=Sell grid, 0=Unset
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -168,13 +169,8 @@ int OnInit()
       ParseNewsTimes();
    }
    
-   // Verify symbol is GBPUSD
-   if(_Symbol != "GBPUSD")
-   {
-      Print("WARNING: This EA is optimized for GBPUSD. Current symbol: ", _Symbol);
-   }
-   
-   Print("SmartGridGBPUSD EA v2.00 initialized successfully");
+   Print("SmartGrid EA v3.00 initialized successfully | Symbol: ", _Symbol,
+         " | Digits: ", (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
    Print("Lot Size: ", LotSize, " (Fixed - No Martingale)");
    Print("ATR Multiplier: ", ATR_Multiplier);
    Print("Max Grid Levels: ", MaxGridLevels);
@@ -214,7 +210,7 @@ void OnDeinit(const int reason)
    if(rsiHandle != INVALID_HANDLE)
       IndicatorRelease(rsiHandle);
    
-   Print("SmartGridGBPUSD EA deinitialized");
+   Print("SmartGrid EA deinitialized");
 }
 
 //+------------------------------------------------------------------+
@@ -525,12 +521,12 @@ void UpdateGridTracking()
       ulong ticket = PositionGetTicket(i);
       if(ticket > 0 && PositionSelectByTicket(ticket))
       {
-         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber && 
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
             PositionGetString(POSITION_SYMBOL) == _Symbol)
          {
             ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
             double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-            
+
             if(type == POSITION_TYPE_BUY)
             {
                buyLevels++;
@@ -546,6 +542,10 @@ void UpdateGridTracking()
          }
       }
    }
+
+   // Reset ranging direction once the grid cycle is fully closed
+   if(buyLevels == 0 && sellLevels == 0)
+      gridDirection = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -655,6 +655,65 @@ bool ShouldOpenNextLevel(double dynamicGap, int trendDir, int marketCond)
 }
 
 //+------------------------------------------------------------------+
+//| Pick initial direction for a ranging-mode grid cycle            |
+//| Uses RSI → EMA cross → bar direction as fallback chain          |
+//+------------------------------------------------------------------+
+int GetInitialDirection()
+{
+   // 1. RSI bias
+   if(rsiHandle != INVALID_HANDLE)
+   {
+      double rsi[];
+      ArraySetAsSeries(rsi, true);
+      if(CopyBuffer(rsiHandle, 0, 0, 1, rsi) > 0)
+      {
+         if(rsi[0] > 52) return 1;
+         if(rsi[0] < 48) return -1;
+      }
+   }
+
+   // 2. EMA cross
+   if(emaFastHandle != INVALID_HANDLE && emaSlowHandle != INVALID_HANDLE)
+   {
+      double emaFast[], emaSlow[];
+      ArraySetAsSeries(emaFast, true);
+      ArraySetAsSeries(emaSlow, true);
+      if(CopyBuffer(emaFastHandle, 0, 0, 1, emaFast) > 0 &&
+         CopyBuffer(emaSlowHandle, 0, 0, 1, emaSlow) > 0)
+      {
+         if(emaFast[0] > emaSlow[0]) return 1;
+         if(emaFast[0] < emaSlow[0]) return -1;
+      }
+   }
+
+   // 3. Current bar direction
+   double open[];
+   ArraySetAsSeries(open, true);
+   if(CopyOpen(_Symbol, ATR_Timeframe, 0, 1, open) > 0)
+   {
+      double close = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(close > open[0]) return 1;
+      if(close < open[0]) return -1;
+   }
+
+   return 1; // ultimate fallback
+}
+
+//+------------------------------------------------------------------+
+//| Universal pip monetary value for 1 lot                          |
+//+------------------------------------------------------------------+
+double GetPipValue()
+{
+   double point    = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   int    digits   = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double pipSize  = (digits == 3 || digits == 5) ? point * 10.0 : point;
+   if(tickSize <= 0) return pipSize * tickVal;
+   return (pipSize / tickSize) * tickVal;
+}
+
+//+------------------------------------------------------------------+
 //| Execute grid trade                                               |
 //+------------------------------------------------------------------+
 void ExecuteGridTrade(double dynamicGap, int trendDir, int marketCond)
@@ -727,30 +786,25 @@ void ExecuteGridTrade(double dynamicGap, int trendDir, int marketCond)
    }
    else
    {
-      // Ranging market or trend filter disabled - allow both sides
-      if(GridStartSide == 0) // Both sides
+      // Ranging market or trend filter disabled
+      // One direction per grid cycle — no simultaneous hedge entries
+      if(GridStartSide == 0)
       {
-         if(buyLevels == 0 && sellLevels == 0)
+         // Lock in direction for this cycle using momentum signals
+         if(gridDirection == 0)
+            gridDirection = GetInitialDirection();
+
+         if(gridDirection == 1) // Buy grid
          {
-            // Start with both if filters pass
-            if(CheckEntryFilters(1) && !IsNearSupportResistance(ask, 1))
-               openBuy = true;
-            if(CheckEntryFilters(-1) && !IsNearSupportResistance(bid, -1))
-               openSell = true;
-         }
-         else if(buyLevels <= sellLevels && lastBuyPrice > 0)
-         {
-            double distanceFromLastBuy = ask - lastBuyPrice;
-            if(distanceFromLastBuy >= gapInPrice)
+            if(buyLevels == 0 || (lastBuyPrice > 0 && (ask - lastBuyPrice) >= gapInPrice))
             {
                if(CheckEntryFilters(1) && !IsNearSupportResistance(ask, 1))
                   openBuy = true;
             }
          }
-         else if(sellLevels < buyLevels && lastSellPrice > 0)
+         else if(gridDirection == -1) // Sell grid
          {
-            double distanceFromLastSell = lastSellPrice - bid;
-            if(distanceFromLastSell >= gapInPrice)
+            if(sellLevels == 0 || (lastSellPrice > 0 && (lastSellPrice - bid) >= gapInPrice))
             {
                if(CheckEntryFilters(-1) && !IsNearSupportResistance(bid, -1))
                   openSell = true;
@@ -831,38 +885,26 @@ void ManageBasketTrailing()
       highestBasketProfit = currentProfit;
    }
    
-   // Profit lock-in: Close 30% at +30 pips, 50% at +50 pips
+   // Profit lock-in: Close 30% at +30 pips basket profit, 50% at +50 pips
    static bool locked30 = false;
    static bool locked50 = false;
-   
-   // Calculate profit in pips (simplified)
-   double profitPipsValue = 30.0 * point;
-   double profit50PipsValue = 50.0 * point;
-   if(digits == 3 || digits == 5)
+
+   double pipVal      = GetPipValue();
+   double pip30Profit = 30.0 * pipVal * LotSize;
+   double pip50Profit = 50.0 * pipVal * LotSize;
+
+   if(!locked30 && currentProfit >= pip30Profit)
    {
-      profitPipsValue = 30.0 * point * 10;
-      profit50PipsValue = 50.0 * point * 10;
-   }
-   
-   // Approximate profit in pips (using account currency)
-   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   double profitPercent = (currentProfit / balance) * 100.0;
-   
-   // Rough estimate: 30 pips ≈ 0.3% profit for GBPUSD with 0.01 lot
-   if(!locked30 && profitPercent >= 0.3 && currentProfit > 0)
-   {
-      // Close 30% of positions
       ClosePercentageOfPositions(30);
       locked30 = true;
-      Print("PROFIT LOCK-IN: Closed 30% of basket at profit threshold");
+      Print("PROFIT LOCK-IN: Closed 30% of basket at +30 pips profit");
    }
-   
-   if(!locked50 && profitPercent >= 0.5 && currentProfit > 0)
+
+   if(!locked50 && currentProfit >= pip50Profit)
    {
-      // Close 50% of remaining positions
       ClosePercentageOfPositions(50);
       locked50 = true;
-      Print("PROFIT LOCK-IN: Closed 50% of basket at profit threshold");
+      Print("PROFIT LOCK-IN: Closed 50% of basket at +50 pips profit");
    }
    
    // Reset locks if basket is closed
@@ -1246,9 +1288,9 @@ bool CheckEntryFilters(int direction)
       
       if(CopyBuffer(rsiHandle, 0, 0, 1, rsi) > 0)
       {
-         if(direction == 1 && rsi[0] >= 60) // Buy but RSI overbought
+         if(direction == 1  && rsi[0] < 40)  // Buy but no bullish momentum
             return false;
-         if(direction == -1 && rsi[0] <= 40) // Sell but RSI oversold
+         if(direction == -1 && rsi[0] > 60)  // Sell but no bearish momentum
             return false;
       }
    }
@@ -1471,12 +1513,7 @@ void CheckGridRebalancing()
    }
    
    // Check if one side is profitable and other is losing
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   if(digits == 3 || digits == 5)
-      point *= 10;
-   
-   double targetProfit = 50.0 * point * LotSize * 100000; // Approximate 50 pips profit
+   double targetProfit = 50.0 * GetPipValue() * LotSize; // 50-pip profit threshold (universal)
    
    // If buy side is profitable and sell side is losing significantly
    if(buyProfit >= targetProfit && sellProfit < -targetProfit * 0.5)
@@ -1552,7 +1589,7 @@ void MoveToBreakeven()
             }
             else // SELL
             {
-               if(currentSL > openPrice || currentSL == 0)
+               if(currentSL == 0 || currentSL < openPrice) // SL not yet at or above entry
                {
                   if(trade.PositionModify(ticket, openPrice, currentTP))
                   {

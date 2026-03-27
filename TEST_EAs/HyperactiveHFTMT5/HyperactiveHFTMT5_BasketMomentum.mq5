@@ -9,7 +9,7 @@ CTrade trade;
 // =====================================================================================================
 // HYPERACTIVE HFT MT5 SCALPER - BASKET MOMENTUM EDITION
 // Strategy: Ultra-fast momentum breakout scalping with basket trading
-// - Basket trading (up to 5 simultaneous trades)
+// - One position at a time (duplicates bulk-closed)
 // - Basket-level equity percentage exits (TP/SL)
 // - Momentum breakout entry
 // - Fast execution with realistic latency simulation
@@ -22,7 +22,7 @@ input group "===== Core Trading Settings ====="
 input int      MagicNumber         = 202510;
 input string   TradeSymbol         = "";      // Symbol to trade (empty = current chart symbol)
 input bool     UseFixedLot         = true;     // Use fixed lot size (false = dynamic)
-input double   FixedLotSize        = 0.1;      // Fixed lot size (if UseFixedLot = true)
+input double   TradeLot            = 0.1;      // Lot size per trade (adjust here; if UseFixedLot = true)
 input double   DynamicLotBase     = 0.05;     // Base lot for dynamic sizing
 input double   DynamicLotMultiplier = 1.2;    // Multiplier for dynamic lot (based on balance)
 input double   MaxLotSize          = 1.00;     // Maximum lot size (safety limit)
@@ -111,7 +111,7 @@ input double   PartialExitPercent = 50.0;      // Percentage to close (50% = hal
 
 // ===== Basket Trading Settings =====
 input group "===== Basket Trading Settings ====="
-input int      MaxBasketTrades        = 2;        // Maximum simultaneous trades in basket (FX safe)
+input int      MaxBasketTrades        = 1;        // Maximum simultaneous trades (1 = one trade only)
 input double   BasketProfitPercent    = 1.2;      // Basket TP as % of basketStartEquity (reduced for faster exits)
 input double   BasketMaxLossPercent   = 4.0;      // Basket SL as % of basketStartEquity (FX optimized)
 input double   BasketCloseBufferUSD   = 0.3;      // Safety buffer to absorb spread & latency
@@ -322,7 +322,7 @@ int OnInit()
    
    Print("Trade Symbol: ", tradeSymbol);
    Print("Lot Mode: ", (UseFixedLot ? "FIXED" : "DYNAMIC"));
-   Print("Fixed Lot: ", FixedLotSize);
+   Print("Trade Lot: ", TradeLot);
    Print("Max Basket Trades: ", MaxBasketTrades);
    Print("Basket TP: ", BasketProfitPercent, "% of start equity");
    Print("Basket SL: ", BasketMaxLossPercent, "% of start equity");
@@ -489,6 +489,14 @@ void OnTick()
    
    // Check risk management
    CheckRiskManagement();
+   
+   if(OpenTradesCount() > 1)
+   {
+      Print("SINGLE POSITION: bulk closing ", OpenTradesCount(), " positions");
+      CloseAllBasketTrades();
+      UpdateDisplay();
+      return;
+   }
    
    if(tradingStopped)
    {
@@ -1193,7 +1201,7 @@ double CalculateLotSize()
    
    if(UseFixedLot)
    {
-      lotSize = FixedLotSize;
+      lotSize = TradeLot;
    }
    else
    {
@@ -1656,7 +1664,7 @@ void UpdateDisplay()
    status += "Symbol: " + tradeSymbol + "\n";
    status += "Lot Mode: " + (UseFixedLot ? "FIXED" : "DYNAMIC") + "\n";
    if(UseFixedLot)
-      status += "Lot Size: " + DoubleToString(FixedLotSize, 2) + "\n";
+      status += "Lot Size: " + DoubleToString(TradeLot, 2) + "\n";
    else
       status += "Dynamic Lot: " + DoubleToString(CalculateLotSize(), 2) + "\n";
    
