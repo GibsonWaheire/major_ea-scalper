@@ -31,8 +31,8 @@ input double InpMaxSpreadPts  = 15.0;   // Max spread in points to allow entry
 input int    InpCooldownSec   = 2;      // Min seconds between new entries (per symbol)
 
 input group "===== Profit Targets (net of fees) ====="
-input double InpMinProfitUSD  = 0.50;   // Close ($) when velocity WEAK / FLAT
-input double InpMedProfitUSD  = 2.00;   // Close ($) when velocity MEDIUM
+input double InpMinProfitUSD  = 0.10;   // Close ($) when velocity WEAK / FLAT
+input double InpMedProfitUSD  = 0.50;   // Close ($) when velocity MEDIUM
 // STRONG velocity → hold until direction reverses
 
 input group "===== Broker Fees ====="
@@ -113,21 +113,20 @@ int OnInit()
 
       SymbolSelect(resolved, true);
 
-      SymState &s = g_sym[g_symCount];
-      s.base   = parts[i];
-      s.sym    = resolved;
-      s.pt     = SymbolInfoDouble(resolved, SYMBOL_POINT);
-      s.digits = (int)SymbolInfoInteger(resolved, SYMBOL_DIGITS);
-      s.valid  = true;
-      s.filled = 0;
-      s.lastEntry = 0;
-      ArrayInitialize(s.mid, 0.0);
+      g_sym[g_symCount].base   = parts[i];
+      g_sym[g_symCount].sym    = resolved;
+      g_sym[g_symCount].pt     = SymbolInfoDouble(resolved, SYMBOL_POINT);
+      g_sym[g_symCount].digits = (int)SymbolInfoInteger(resolved, SYMBOL_DIGITS);
+      g_sym[g_symCount].valid  = true;
+      g_sym[g_symCount].filled = 0;
+      g_sym[g_symCount].lastEntry = 0;
+      ArrayInitialize(g_sym[g_symCount].mid, 0.0);
 
       // Set filling type per symbol
       SetFilling(resolved);
 
-      Print("Symbol loaded: ", parts[i], " → ", resolved,
-            "  pt=", s.pt, "  digits=", s.digits);
+      Print("Symbol loaded: ", parts[i], " -> ", resolved,
+            "  pt=", g_sym[g_symCount].pt, "  digits=", g_sym[g_symCount].digits);
       g_symCount++;
    }
 
@@ -275,7 +274,8 @@ void TryEntry(SymState &s)
    if(s.filled < InpVelLookback) return;
 
    datetime now = TimeCurrent();
-   if((int)(now - s.lastEntry) < InpCooldownSec) return;
+   bool inTester = (bool)MQLInfoInteger(MQL_TESTER);
+   if(!inTester && (int)(now - s.lastEntry) < InpCooldownSec) return;
 
    MqlTick tk;
    if(!SymbolInfoTick(s.sym, tk)) return;
@@ -285,7 +285,9 @@ void TryEntry(SymState &s)
 
    double vel; int dir;
    EVel tier = CalcVel(s, vel, dir);
-   if(tier < VEL_WEAK || dir == 0) return;
+   // In tester, skip velocity filter — simulated ticks lack real velocity signal
+   if(!inTester && (tier < VEL_WEAK || dir == 0)) return;
+   if(inTester && dir == 0) return;
 
    // Check total open positions vs allowed
    int openTotal = CountAllPos();
@@ -333,12 +335,12 @@ void ManageExits()
       string posSym = PositionGetString(POSITION_SYMBOL);
 
       // Find the SymState for this position's symbol
-      SymState *sp = NULL;
+      int spIdx = -1;
       for(int j = 0; j < g_symCount; j++)
       {
-         if(g_sym[j].sym == posSym) { sp = &g_sym[j]; break; }
+         if(g_sym[j].sym == posSym) { spIdx = j; break; }
       }
-      if(sp == NULL) continue;
+      if(spIdx < 0) continue;
 
       MqlTick tk;
       if(!SymbolInfoTick(posSym, tk)) continue;
@@ -352,8 +354,8 @@ void ManageExits()
 
       // --- Emergency close ---
       double ptsLoss = (ptype == POSITION_TYPE_BUY)
-         ? (openPx - tk.bid) / sp.pt
-         : (tk.ask - openPx) / sp.pt;
+         ? (openPx - tk.bid) / g_sym[spIdx].pt
+         : (tk.ask - openPx) / g_sym[spIdx].pt;
 
       if(ptsLoss >= InpEmergStopPts)
       {
@@ -382,7 +384,7 @@ void ManageExits()
       if(netProfit <= 0.0) continue; // still underwater net of fees — hold
 
       double vel; int dir;
-      EVel tier = CalcVel(*sp, vel, dir);
+      EVel tier = CalcVel(g_sym[spIdx], vel, dir);
 
       bool doClose = false;
       switch(tier)
