@@ -58,7 +58,7 @@ input int      MinTradeMaturitySeconds = 8;    // No exits (except hard loss) be
 
 input group "===== Velocity Decay Exit ====="
 input double   VelocityDecayRatio  = 0.6;      // Exit when tick speed < peak * this ratio
-input double   VelocityDecayMinProfit = 150.0;  // Minimum profit points before velocity decay (FX=25, Gold=40)
+input double   VelocityDecayMinProfit = 25.0;   // Minimum profit points before velocity decay (FX=25, Gold=40)
 
 input group "===== Trailing Stop Settings ====="
 input bool     UseTrailingStop     = true;     // Use trailing stop loss
@@ -707,12 +707,13 @@ int GetMomentumBreakoutSignal()
          return 0;
    }
    
-   // Check tick speed
-   if(UseTickSpeedFilter && ticksPerSecond < MinTickSpeed)
+   // Check tick speed (skip in Strategy Tester — ticks share same timestamp so speed stays 0)
+   bool inTester = MQLInfoInteger(MQL_TESTER);
+   if(!inTester && UseTickSpeedFilter && ticksPerSecond < MinTickSpeed)
       return 0;
-   
-   // Check volatility cycle filter
-   if(!CheckVolatilityCycle())
+
+   // Check volatility cycle filter (skip in Strategy Tester — same reason)
+   if(!inTester && !CheckVolatilityCycle())
       return 0;
    
    // Check spread

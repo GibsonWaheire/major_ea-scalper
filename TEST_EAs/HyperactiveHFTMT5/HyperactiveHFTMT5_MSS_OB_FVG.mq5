@@ -21,7 +21,7 @@ CTrade trade;
 // ===== Core Trading Settings =====
 input group "===== Core Trading Settings ====="
 input int      MagicNumber         = 202520;
-input string   TradeSymbols        = "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD"; // Comma-separated symbols
+input string   TradeSymbols        = "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,XAUUSD"; // Comma-separated symbols (base names, suffix auto-detected)
 input ENUM_TIMEFRAMES Timeframe    = PERIOD_H1;  // Timeframe for MSS/OB/FVG detection
 input double   FixedLotSize        = 1.0;         // Fixed lot size (always 1.0)
 input int      SwingLookbackBars   = 20;         // Bars to look back for swing detection
@@ -48,7 +48,7 @@ input int      MaxDailyTrades      = 100;        // Maximum trades per day (safe
 input group "===== Spread & Execution ====="
 input double   MaxSpreadPoints     = 30.0;       // Maximum spread in points
 input double   MaxSpreadPercent    = 0.15;       // Maximum spread as % of price (for exotics)
-input bool     TradeOnlyMajors     = true;       // Only trade major pairs (EUR, GBP, USD, JPY, AUD, CAD, CHF, NZD)
+input bool     TradeOnlyMajors     = false;      // Only trade major pairs (EUR, GBP, USD, JPY, AUD, CAD, CHF, NZD, XAU)
 input string   BlacklistedSymbols  = "USDSEK,USDCNH,USDTRY,USDZAR,USDMXN,USDBRL"; // Comma-separated blacklist
 input int      MaxSlippagePoints   = 10;         // Maximum slippage in points
 input int      OrderRetries        = 3;          // Number of order retries
@@ -287,8 +287,8 @@ bool IsSymbolBlacklisted(string symbol)
 
 bool IsMajorPair(string symbol)
 {
-   // Major pairs contain: EUR, GBP, USD, JPY, AUD, CAD, CHF, NZD
-   string majors[] = {"EUR", "GBP", "USD", "JPY", "AUD", "CAD", "CHF", "NZD"};
+   // Major pairs contain: EUR, GBP, USD, JPY, AUD, CAD, CHF, NZD, XAU
+   string majors[] = {"EUR", "GBP", "USD", "JPY", "AUD", "CAD", "CHF", "NZD", "XAU"};
    
    for(int i = 0; i < ArraySize(majors); i++)
    {
@@ -354,6 +354,37 @@ bool IsSymbolSuitableForTrading(SymbolData &data)
 }
 
 // =====================================================================================================
+// SYMBOL NAME RESOLUTION (handles broker suffixes like .Z, b, .m, etc.)
+// =====================================================================================================
+
+string ResolveSymbolName(string baseName)
+{
+   // 1. Try exact match first
+   if(SymbolInfoInteger(baseName, SYMBOL_SELECT) || SymbolSelect(baseName, true))
+      return baseName;
+
+   // 2. Scan all available symbols for one that starts with baseName + suffix
+   int total = SymbolsTotal(false);
+   for(int i = 0; i < total; i++)
+   {
+      string sym = SymbolName(i, false);
+      int baseLen = StringLen(baseName);
+      int symLen  = StringLen(sym);
+      // Must start with baseName exactly, followed by a short suffix
+      if(symLen > baseLen && symLen <= baseLen + 4 &&
+         StringFind(sym, baseName) == 0)
+      {
+         if(EnableDebugLogging)
+            Print("Symbol resolved: ", baseName, " -> ", sym);
+         return sym;
+      }
+   }
+
+   // 3. Not found — return original; InitializeSymbol will fail gracefully
+   return baseName;
+}
+
+// =====================================================================================================
 // SYMBOL MANAGEMENT
 // =====================================================================================================
 
@@ -388,13 +419,17 @@ bool ParseSymbolList(string symbols)
 
 bool InitializeSymbol(SymbolData &data, string symbol)
 {
-   data.symbol = symbol;
-   
-   if(!SymbolInfoInteger(symbol, SYMBOL_SELECT))
+   // Auto-resolve broker suffix (e.g. GBPUSD → GBPUSD.Z)
+   string resolved = ResolveSymbolName(symbol);
+   data.symbol = resolved;
+
+   // Ensure symbol is selected/visible in Market Watch
+   if(!SymbolInfoInteger(resolved, SYMBOL_EXIST))
    {
-      Print("ERROR: Symbol ", symbol, " not found!");
+      Print("ERROR: Symbol ", symbol, " not found (resolved: ", resolved, ")");
       return false;
    }
+   SymbolSelect(resolved, true);
    
    data.digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    data.point = SymbolInfoDouble(symbol, SYMBOL_POINT);
