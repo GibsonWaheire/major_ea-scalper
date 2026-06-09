@@ -190,8 +190,8 @@ string FindSymbol(string base)
       int    bLen = StringLen(base);
       int    sLen = StringLen(s);
 
-      // Must start with base name exactly, suffix max 4 chars (.Z .b .m z b etc.)
-      if(sLen > bLen && sLen <= bLen + 4 && StringFind(s, base) == 0)
+      // Must start with base name exactly, suffix max 6 chars (.Z .b .pro .ecn etc.)
+      if(sLen > bLen && sLen <= bLen + 6 && StringFind(s, base) == 0)
          return s;
    }
    return "";
@@ -214,7 +214,9 @@ void OnTick()
    // Manage exits across all positions
    ManageExits();
 
-   // Attempt entries across all symbols
+   // Each symbol is evaluated and traded synchronously — entry fires
+   // immediately for symbol[i] before we move on to symbol[i+1].
+   // No symbol's result blocks another symbol's entry attempt.
    for(int i = 0; i < g_symCount; i++)
       TryEntry(g_sym[i]);
 
@@ -231,6 +233,11 @@ void PushSnapshot(SymState &s)
    if(!SymbolInfoTick(s.sym, tk)) return;
 
    double mid = (tk.bid + tk.ask) * 0.5;
+
+   // Only record a new snapshot when price actually changed.
+   // Without this, every chart-symbol tick floods non-chart symbols'
+   // buffers with the same stale mid, making dir=0 for all of them.
+   if(s.filled > 0 && mid == s.mid[0]) return;
 
    // Shift ring buffer
    for(int i = BUFLEN - 1; i > 0; i--)
@@ -256,7 +263,9 @@ EVel CalcVel(SymState &s, double &ptsPerSnap, int &dir)
    double chg    = newest - oldest;
 
    ptsPerSnap = MathAbs(chg) / s.pt / InpVelLookback;
-   dir        = (chg > 0) ? 1 : (chg < 0 ? -1 : 0);
+   // Require at least 1 point of net movement — prevents dir=0 from
+   // near-zero float noise while still catching genuine flat markets.
+   dir = (chg >  s.pt) ? 1 : (chg < -s.pt ? -1 : 0);
 
    if(ptsPerSnap >= InpVelStrong) return VEL_STRONG;
    if(ptsPerSnap >= InpVelMedium) return VEL_MEDIUM;
@@ -286,7 +295,13 @@ void TryEntry(SymState &s)
    double vel; int dir;
    EVel tier = CalcVel(s, vel, dir);
    // In tester, skip velocity filter — simulated ticks lack real velocity signal
-   if(!inTester && (tier < VEL_WEAK || dir == 0)) return;
+   if(!inTester && (tier < VEL_WEAK || dir == 0))
+   {
+      if(InpLogging && s.filled >= InpVelLookback)
+         Print("SKIP ", s.sym, " vel=", VelStr(tier), "(", DoubleToString(vel,2),
+               ") dir=", dir, " spread=", DoubleToString(spread,1));
+      return;
+   }
    if(inTester && dir == 0) return;
 
    // Check total open positions vs allowed
