@@ -95,7 +95,7 @@ input int    InpLogLevel        = 1;      // 0=errors 1=trades 2=verbose
 
 #define MAGIC    20260605
 #define BUFLEN   60
-#define MAXSYM   16
+#define MAXSYM   48
 
 enum EVel  { VEL_FLAT=0, VEL_WEAK=1, VEL_MEDIUM=2, VEL_STRONG=3 };
 enum ESess { SESS_DEAD=0, SESS_ASIAN=1, SESS_LONDON=2, SESS_NY=3, SESS_OVERLAP=4 };
@@ -197,53 +197,58 @@ int OnInit()
       StringTrimRight(parts[i]);
       if(StringLen(parts[i]) == 0) continue;
 
-      string resolved = FindSymbol(parts[i]);
-      if(resolved == "")
+      string variants[];
+      ArrayResize(variants, MAXSYM);
+      int vCount = FindAllSymbols(parts[i], variants, MAXSYM - g_symCount);
+      if(vCount == 0)
       {
-         Print("WARNING: '", parts[i], "' not found — skipped.");
+         Print("WARNING: '", parts[i], "' not found or trade-disabled — skipped.");
          continue;
       }
 
-      SymbolSelect(resolved, true);
-
-      int si = g_symCount;  // index alias — avoids illegal &ref-to-array-element
-      g_sym[si].base    = parts[i];
-      g_sym[si].sym     = resolved;
-      g_sym[si].pt      = SymbolInfoDouble(resolved, SYMBOL_POINT);
-      g_sym[si].digits  = (int)SymbolInfoInteger(resolved, SYMBOL_DIGITS);
-      g_sym[si].valid   = true;
-      g_sym[si].filled  = 0;
-      g_sym[si].lastEntry = 0;
-      g_sym[si].lotMultiplier = 1.0;
-      g_sym[si].emergStreak   = 0;
-      g_sym[si].paused        = false;
-      ArrayInitialize(g_sym[si].mid, 0.0);
-
-      // Init indicator handles
-      if(!InitHandles(g_sym[si]))
+      for(int v = 0; v < vCount && g_symCount < MAXSYM; v++)
       {
-         Print("WARNING: indicator handles failed for ", resolved, " — skipped.");
-         g_sym[si].valid = false;
+         string resolved = variants[v];
+
+         int si = g_symCount;  // index alias — avoids illegal &ref-to-array-element
+         g_sym[si].base    = parts[i];
+         g_sym[si].sym     = resolved;
+         g_sym[si].pt      = SymbolInfoDouble(resolved, SYMBOL_POINT);
+         g_sym[si].digits  = (int)SymbolInfoInteger(resolved, SYMBOL_DIGITS);
+         g_sym[si].valid   = true;
+         g_sym[si].filled  = 0;
+         g_sym[si].lastEntry = 0;
+         g_sym[si].lotMultiplier = 1.0;
+         g_sym[si].emergStreak   = 0;
+         g_sym[si].paused        = false;
+         ArrayInitialize(g_sym[si].mid, 0.0);
+
+         // Init indicator handles
+         if(!InitHandles(g_sym[si]))
+         {
+            Print("WARNING: indicator handles failed for ", resolved, " — skipped.");
+            g_sym[si].valid = false;
+            g_symCount++;
+            continue;
+         }
+
+         // Init session stats
+         for(int j = 0; j < 5; j++)
+         {
+            g_sym[si].stats[j].trades = 0;
+            g_sym[si].stats[j].wins   = 0;
+            g_sym[si].stats[j].totalPnl = 0;
+            g_sym[si].stats[j].wIdx   = 0;
+            g_sym[si].stats[j].wCount = 0;
+            ArrayInitialize(g_sym[si].stats[j].wBuf, 0);
+         }
+
+         SetFilling(resolved);
+
+         Print("Loaded: ", parts[i], " -> ", resolved,
+               "  pt=", g_sym[si].pt, "  digits=", g_sym[si].digits);
          g_symCount++;
-         continue;
       }
-
-      // Init session stats
-      for(int j = 0; j < 5; j++)
-      {
-         g_sym[si].stats[j].trades = 0;
-         g_sym[si].stats[j].wins   = 0;
-         g_sym[si].stats[j].totalPnl = 0;
-         g_sym[si].stats[j].wIdx   = 0;
-         g_sym[si].stats[j].wCount = 0;
-         ArrayInitialize(g_sym[si].stats[j].wBuf, 0);
-      }
-
-      SetFilling(resolved);
-
-      Print("Loaded: ", parts[i], " -> ", resolved,
-            "  pt=", g_sym[si].pt, "  digits=", g_sym[si].digits);
-      g_symCount++;
    }
 
    if(g_symCount == 0)
@@ -430,6 +435,7 @@ bool VelConsistent(SymState &s, int reqDir, int lookN = 3)
 int H1Bias(SymState &s)
 {
    if(!UseH1Filter) return 0; // neutral = don't filter
+   if(s.h1Ema50 <= 0.0) return 0; // not yet loaded → neutral
    MqlTick tk;
    if(!SymbolInfoTick(s.sym, tk)) return 0;
    double mid = (tk.bid + tk.ask) * 0.5;
@@ -464,6 +470,7 @@ int M1MicroTrend(SymState &s)
 
 bool RsiAllows(SymState &s, int dir)
 {
+   if(s.m5Rsi <= 0.0) return true; // not yet loaded → skip filter
    if(dir ==  1) return (s.m5Rsi >= InpRsiBullLow && s.m5Rsi <= InpRsiBullHigh);
    if(dir == -1) return (s.m5Rsi >= InpRsiBearLow && s.m5Rsi <= InpRsiBearHigh);
    return false;
@@ -1126,19 +1133,35 @@ void SetFilling(string sym)
    else                      trade.SetTypeFilling(ORDER_FILLING_RETURN);
 }
 
-string FindSymbol(string base)
+// Returns all tradable variants of base (e.g. CADJPY -> CADJPY.Z, CADJPY.A, etc.)
+// Skips symbols with SYMBOL_TRADE_DISABLED so we never try to trade them.
+int FindAllSymbols(string base, string &results[], int maxResults)
 {
-   if(SymbolSelect(base, true)) return base;
+   int found = 0;
+   int bLen  = StringLen(base);
    int total = SymbolsTotal(false);
-   for(int i = 0; i < total; i++)
+
+   for(int i = 0; i < total && found < maxResults; i++)
    {
-      string s = SymbolName(i, false);
-      if(StringFind(s, base) == 0 &&
-         StringLen(s) > StringLen(base) &&
-         StringLen(s) <= StringLen(base) + 6)
-         return s;
+      string s    = SymbolName(i, false);
+      int    sLen = StringLen(s);
+
+      // Must start with base name exactly; suffix max 6 chars (.Z .pro .ecn etc.)
+      if(sLen < bLen) continue;
+      if(StringFind(s, base) != 0) continue;
+      if(sLen > bLen + 6) continue;
+
+      // Select into Market Watch
+      if(!SymbolSelect(s, true)) continue;
+
+      // Skip if broker has trading disabled on this symbol
+      ENUM_SYMBOL_TRADE_MODE tmode =
+         (ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(s, SYMBOL_TRADE_MODE);
+      if(tmode == SYMBOL_TRADE_MODE_DISABLED) continue;
+
+      results[found++] = s;
    }
-   return "";
+   return found;
 }
 
 string VelStr(EVel v)
