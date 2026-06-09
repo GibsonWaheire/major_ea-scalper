@@ -181,7 +181,7 @@ int g_newsTimes[] = {
 int OnInit()
 {
    trade.SetExpertMagicNumber(MAGIC);
-   trade.SetDeviationInPoints(50);
+   trade.SetDeviationInPoints(200);
 
    g_symCount    = 0;
    g_startBal    = AccountInfoDouble(ACCOUNT_BALANCE);
@@ -631,9 +631,13 @@ double CalcLot(SymState &s, double askPx, ESess sess)
          lot = MathMax(InpMinLot, lot * (mgnMax / mgnPer));
    }
 
-   // Round to broker step
-   double step = SymbolInfoDouble(s.sym, SYMBOL_VOLUME_STEP);
+   // Normalize to broker step + hard clamp to broker min/max
+   double step   = SymbolInfoDouble(s.sym, SYMBOL_VOLUME_STEP);
+   double volMin = SymbolInfoDouble(s.sym, SYMBOL_VOLUME_MIN);
+   double volMax = SymbolInfoDouble(s.sym, SYMBOL_VOLUME_MAX);
    if(step > 0.0) lot = MathFloor(lot / step) * step;
+   if(volMin > 0.0) lot = MathMax(volMin, lot);
+   if(volMax > 0.0) lot = MathMin(volMax, lot);
 
    return MathMax(InpMinLot, lot);
 }
@@ -741,14 +745,13 @@ void TryEntry(SymState &s, bool inTester)
    // Lot sizing
    double lot = CalcLot(s, tk.ask, sess);
 
-   // Place order
+   // Place order — pass price=0 so broker always uses current market price
    SetFilling(s.sym);
-   double price = (dir == 1) ? tk.ask : tk.bid;
-   string cmt   = "VBS2_" + s.base + "_" + (dir == 1 ? "B" : "S");
+   string cmt = "VBS2_" + s.base + "_" + (dir == 1 ? "B" : "S");
 
    bool ok = (dir == 1)
-      ? trade.Buy(lot,  s.sym, price, 0, 0, cmt)
-      : trade.Sell(lot, s.sym, price, 0, 0, cmt);
+      ? trade.Buy(lot,  s.sym, 0, 0, 0, cmt)
+      : trade.Sell(lot, s.sym, 0, 0, 0, cmt);
 
    if(ok)
    {
@@ -756,13 +759,13 @@ void TryEntry(SymState &s, bool inTester)
       if(InpLogging && InpLogLevel >= 1)
          Print("OPEN ", s.sym, " ", (dir==1?"BUY":"SELL"),
                " lot=", DoubleToString(lot,2),
-               " px=",  DoubleToString(price,s.digits),
                " score=", score,
                " sess=", SessStr(sess),
                " rsi=", DoubleToString(s.m5Rsi,1));
    }
    else if(InpLogging)
-      Print("OPEN FAIL ", s.sym, ": ", trade.ResultRetcodeDescription());
+      Print("OPEN FAIL ", s.sym, " code=", trade.ResultRetcode(),
+            " ", trade.ResultRetcodeDescription());
 }
 
 //=============================================================================
