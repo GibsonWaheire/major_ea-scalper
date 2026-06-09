@@ -44,7 +44,7 @@ input group "===== Tick Velocity ====="
 input int    InpVelLookback     = 10;     // Snapshot depth for velocity
 input double InpVelStrong       = 2.0;    // pts/snap -> STRONG
 input double InpVelMedium       = 1.0;    // pts/snap -> MEDIUM
-input double InpVelWeak         = 0.3;    // pts/snap -> WEAK
+input double InpVelWeak         = 0.1;    // pts/snap -> WEAK
 
 input group "===== Confluence ====="
 input int    InpMinConfluence   = 3;      // Signals needed out of 5 to enter
@@ -59,7 +59,7 @@ input group "===== Volatility (ATR) ====="
 input int    InpAtrPeriod       = 14;
 input double InpAtrMin          = 3.0;    // Minimum ATR in points to trade
 input double InpAtrMax          = 60.0;   // Maximum ATR in points (avoid spikes)
-input double InpSpreadAtrPct    = 25.0;   // Max spread as % of ATR
+input double InpSpreadAtrPct    = 200.0;  // Max spread as % of ATR (200 = 2x ATR)
 
 input group "===== Exit ====="
 input double InpProfitATR       = 0.35;   // Profit target = ATR * this (in $)
@@ -531,7 +531,9 @@ bool SpreadAllows(SymState &s)
    MqlTick tk;
    if(!SymbolInfoTick(s.sym, tk)) return false;
    double spreadPts = (tk.ask - tk.bid) / s.pt;
-   double maxSpread = s.m5Atr * InpSpreadAtrPct / 100.0;
+   // Floor at 30 pts so normal broker spreads (15-30 pts) always pass even
+   // in low-ATR conditions where ATR * pct would be only 1-3 pts.
+   double maxSpread = MathMax(30.0, s.m5Atr * InpSpreadAtrPct / 100.0);
    return (spreadPts <= maxSpread);
 }
 
