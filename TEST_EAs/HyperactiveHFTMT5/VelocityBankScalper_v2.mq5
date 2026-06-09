@@ -206,24 +206,24 @@ int OnInit()
 
       SymbolSelect(resolved, true);
 
-      SymState &s = g_sym[g_symCount];
-      s.base    = parts[i];
-      s.sym     = resolved;
-      s.pt      = SymbolInfoDouble(resolved, SYMBOL_POINT);
-      s.digits  = (int)SymbolInfoInteger(resolved, SYMBOL_DIGITS);
-      s.valid   = true;
-      s.filled  = 0;
-      s.lastEntry = 0;
-      s.lotMultiplier = 1.0;
-      s.emergStreak   = 0;
-      s.paused        = false;
-      ArrayInitialize(s.mid, 0.0);
+      int si = g_symCount;  // index alias — avoids illegal &ref-to-array-element
+      g_sym[si].base    = parts[i];
+      g_sym[si].sym     = resolved;
+      g_sym[si].pt      = SymbolInfoDouble(resolved, SYMBOL_POINT);
+      g_sym[si].digits  = (int)SymbolInfoInteger(resolved, SYMBOL_DIGITS);
+      g_sym[si].valid   = true;
+      g_sym[si].filled  = 0;
+      g_sym[si].lastEntry = 0;
+      g_sym[si].lotMultiplier = 1.0;
+      g_sym[si].emergStreak   = 0;
+      g_sym[si].paused        = false;
+      ArrayInitialize(g_sym[si].mid, 0.0);
 
       // Init indicator handles
-      if(!InitHandles(s))
+      if(!InitHandles(g_sym[si]))
       {
          Print("WARNING: indicator handles failed for ", resolved, " — skipped.");
-         s.valid = false;
+         g_sym[si].valid = false;
          g_symCount++;
          continue;
       }
@@ -231,18 +231,18 @@ int OnInit()
       // Init session stats
       for(int j = 0; j < 5; j++)
       {
-         s.stats[j].trades = 0;
-         s.stats[j].wins   = 0;
-         s.stats[j].totalPnl = 0;
-         s.stats[j].wIdx   = 0;
-         s.stats[j].wCount = 0;
-         ArrayInitialize(s.stats[j].wBuf, 0);
+         g_sym[si].stats[j].trades = 0;
+         g_sym[si].stats[j].wins   = 0;
+         g_sym[si].stats[j].totalPnl = 0;
+         g_sym[si].stats[j].wIdx   = 0;
+         g_sym[si].stats[j].wCount = 0;
+         ArrayInitialize(g_sym[si].stats[j].wBuf, 0);
       }
 
       SetFilling(resolved);
 
       Print("Loaded: ", parts[i], " -> ", resolved,
-            "  pt=", s.pt, "  digits=", s.digits);
+            "  pt=", g_sym[si].pt, "  digits=", g_sym[si].digits);
       g_symCount++;
    }
 
@@ -380,6 +380,9 @@ void PushSnapshot(SymState &s)
    MqlTick tk;
    if(!SymbolInfoTick(s.sym, tk)) return;
    double mid = (tk.bid + tk.ask) * 0.5;
+   // Only record when price actually changed — prevents chart-symbol ticks
+   // from flooding non-chart symbols' buffers with stale prices (dir=0 bug).
+   if(s.filled > 0 && mid == s.mid[0]) return;
    for(int i = BUFLEN - 1; i > 0; i--)
       s.mid[i] = s.mid[i-1];
    s.mid[0] = mid;
@@ -397,7 +400,8 @@ EVel CalcVel(SymState &s, double &ptsPerSnap, int &dir)
    double chg    = newest - oldest;
 
    ptsPerSnap = MathAbs(chg) / s.pt / InpVelLookback;
-   dir        = (chg > 0) ? 1 : (chg < 0 ? -1 : 0);
+   // Require >= 1 point net movement before assigning direction.
+   dir = (chg > s.pt) ? 1 : (chg < -s.pt ? -1 : 0);
 
    if(ptsPerSnap >= InpVelStrong) return VEL_STRONG;
    if(ptsPerSnap >= InpVelMedium) return VEL_MEDIUM;
@@ -1126,7 +1130,7 @@ string FindSymbol(string base)
       string s = SymbolName(i, false);
       if(StringFind(s, base) == 0 &&
          StringLen(s) > StringLen(base) &&
-         StringLen(s) <= StringLen(base) + 4)
+         StringLen(s) <= StringLen(base) + 6)
          return s;
    }
    return "";
