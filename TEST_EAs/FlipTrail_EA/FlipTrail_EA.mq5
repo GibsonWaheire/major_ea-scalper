@@ -54,6 +54,21 @@ input group "=== Flip Guard ==="
 input int    InpMaxSLFlips        = 50;    // MaxSLFlips cap
 input int    InpCooldownSeconds   = 0;     // CooldownSeconds after SL flip (0 = off)
 
+input group "=== Flip Rider Mode (flip-opened positions) ==="
+input int    InpFlipSoftSLPts      = 150; // FlipSoftSLPts: max loss pts before closing flip trade (0=off)
+input int    InpFlipBETriggerPts   = 50;  // FlipBETriggerPts: profit pts to snap SL to entry (0=off)
+input int    InpFlipPartialPct     = 50;  // FlipPartialPct: % to partial-close at ATR target (0=off)
+input double InpFlipPartialATRMult = 2.0; // FlipPartialATRMult: ATR× profit to trigger partial close
+
+input group "=== Peak Profit Lock ==="
+input int    InpPeakLockPct        = 60;  // PeakLockPct: % of peak profit to protect as SL — 0=off
+//  Example: peak=+8000pts, lock=60% → SL moves to entry+4800pts. Trade cannot close at negative.
+
+input group "=== Candle Step Lock ==="
+input int    InpCandleStepBars     = 3;   // CandleStepBars: consecutive favorable bar closes to trigger SL step (0=off)
+input int    InpCandleStepLockPct  = 40;  // CandleStepLockPct: % of current profit to lock on each step
+//  Every N consecutive favorable closes → SL = entry + currentProfit×lock%. Resets on unfavorable bar.
+
 input group "=== Trading Hours ==="
 input bool   InpEnableTradingHours = false;
 input int    InpTradingStartHour   = 8;
@@ -83,6 +98,16 @@ bool     g_closingForCap   = false;
 bool     g_beSet           = false;
 double   g_entryPrice      = 0.0;
 datetime g_lastSLFlipTime  = 0;
+
+// Flip Rider state
+bool     g_isFlipTrade     = false; // Position was opened by a flip stop order
+bool     g_partialDone     = false; // Partial close already executed for this flip trade
+
+// Peak profit lock state
+double   g_peakProfitPts   = 0.0;  // Highest profit in points seen since position opened
+
+// Candle step lock state
+int      g_candleFavorCount = 0;   // Consecutive favorable bar closes since last step
 
 //──────────────────────────────────────────────────────────────────────────────
 // UTILITY
@@ -285,6 +310,243 @@ void ManageFlipOrder()
 }
 
 //──────────────────────────────────────────────────────────────────────────────
+// ManagePeakLockSL
+// Tracks the highest profit seen since entry (g_peakProfitPts) and locks
+// InpPeakLockPct% of it as a hard SL floor. Works for ALL positions (seed and
+// flip) once a SL is set. Runs every tick — whichever is higher (BUY) or
+// lower (SELL) between this and the ATR trail wins.
+//
+// Example: peak=+8000pts, lock=40% → SL snaps to entry+3200pts.
+// The trade CAN NEVER close at negative once the peak lock is active.
+//──────────────────────────────────────────────────────────────────────────────
+void ManagePeakLockSL()
+{
+   if (InpPeakLockPct <= 0)  return;
+   if (!SelectOurPosition()) return;
+
+   double currentSL = g_pos.StopLoss();
+   if (currentSL == 0)       return; // No SL yet — FlipRiderMode handles that phase
+
+   ENUM_POSITION_TYPE posType = g_pos.PositionType();
+   g_sym.RefreshRates();
+   double ask = g_sym.Ask();
+   double bid = g_sym.Bid();
+
+   double profitPts = (posType == POSITION_TYPE_BUY)
+                      ? (bid - g_entryPrice) / _Point
+                      : (g_entryPrice - ask) / _Point;
+
+   // Always keep track of the best profit seen
+   if (profitPts > g_peakProfitPts)
+      g_peakProfitPts = profitPts;
+
+   // Only engage lock once peak is above breakeven
+   if (g_peakProfitPts <= (double)InpBEPoints) return;
+
+   double lockPts = g_peakProfitPts * InpPeakLockPct / 100.0;
+   double newSL;
+   bool   shouldMove;
+
+   if (posType == POSITION_TYPE_BUY)
+   {
+      newSL      = NormalizeDouble(g_entryPrice + lockPts * _Point, _Digits);
+      shouldMove = (newSL > currentSL + _Point * 0.5);
+   }
+   else
+   {
+      newSL      = NormalizeDouble(g_entryPrice - lockPts * _Point, _Digits);
+      shouldMove = (newSL < currentSL - _Point * 0.5);
+   }
+
+   if (!shouldMove) return;
+
+   // Respect broker freeze/stops level
+   int stopsLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   if (posType == POSITION_TYPE_BUY  && (bid - newSL)  / _Point < stopsLevel + 5) return;
+   if (posType == POSITION_TYPE_SELL && (newSL  - ask)  / _Point < stopsLevel + 5) return;
+
+   if (g_trade.PositionModify(g_pos.Ticket(), newSL, 0))
+      PrintFormat("PeakLock: SL → %.5f | peak=%.0fpts × %d%% = %.0fpts locked",
+                  newSL, g_peakProfitPts, InpPeakLockPct, lockPts);
+   else
+      PrintResult("PeakLock: SL modify FAILED");
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// ManageCandleStepLock
+// Called on every NEW BAR only.
+// Counts consecutive bar closes in the favorable direction. Once N consecutive
+// closes are reached, locks InpCandleStepLockPct% of current profit as SL.
+// Counter resets on any unfavorable bar close. SL only ever moves in favor.
+//──────────────────────────────────────────────────────────────────────────────
+void ManageCandleStepLock()
+{
+   if (InpCandleStepBars <= 0)   return;
+   if (!SelectOurPosition())     return;
+
+   double currentSL = g_pos.StopLoss();
+   if (currentSL == 0)           return; // No SL yet — FlipRiderMode handles first
+
+   ENUM_POSITION_TYPE posType = g_pos.PositionType();
+   g_sym.RefreshRates();
+   double ask = g_sym.Ask();
+   double bid = g_sym.Bid();
+
+   // Check if the last completed bar closed in the favorable direction
+   double barClose = iClose(_Symbol, PERIOD_M1, 1);
+   double barOpen  = iOpen (_Symbol, PERIOD_M1, 1);
+   bool   favorable = (posType == POSITION_TYPE_BUY)  ? (barClose > barOpen)
+                                                       : (barClose < barOpen);
+
+   if (!favorable)
+   {
+      g_candleFavorCount = 0;  // Reset streak on any unfavorable close
+      return;
+   }
+
+   g_candleFavorCount++;
+
+   if (g_candleFavorCount < InpCandleStepBars) return; // Not enough yet
+
+   // N consecutive favorable bars hit — lock profit
+   double profitPts = (posType == POSITION_TYPE_BUY)
+                      ? (bid - g_entryPrice) / _Point
+                      : (g_entryPrice - ask) / _Point;
+
+   if (profitPts <= (double)InpBEPoints) { g_candleFavorCount = 0; return; }
+
+   double lockPts = profitPts * InpCandleStepLockPct / 100.0;
+   double newSL;
+   bool   shouldMove;
+
+   if (posType == POSITION_TYPE_BUY)
+   {
+      newSL      = NormalizeDouble(g_entryPrice + lockPts * _Point, _Digits);
+      shouldMove = (newSL > currentSL + _Point * 0.5);
+   }
+   else
+   {
+      newSL      = NormalizeDouble(g_entryPrice - lockPts * _Point, _Digits);
+      shouldMove = (newSL < currentSL - _Point * 0.5);
+   }
+
+   g_candleFavorCount = 0; // Reset after each step regardless of move
+
+   if (!shouldMove) return;
+
+   int stopsLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   if (posType == POSITION_TYPE_BUY  && (bid - newSL) / _Point < stopsLevel + 5) return;
+   if (posType == POSITION_TYPE_SELL && (newSL - ask) / _Point < stopsLevel + 5) return;
+
+   if (g_trade.PositionModify(g_pos.Ticket(), newSL, 0))
+      PrintFormat("CandleStep: SL → %.5f | %d bars × %d%% of %.0fpts = %.0fpts locked",
+                  newSL, InpCandleStepBars, InpCandleStepLockPct, profitPts, lockPts);
+   else
+      PrintResult("CandleStep: SL modify FAILED");
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// ManageFlipRiderMode
+// Called every tick for flip-opened positions (g_isFlipTrade = true).
+//
+//  1. Soft SL   — while SL=0: close if loss exceeds InpFlipSoftSLPts
+//  2. Partial   — close InpFlipPartialPct% at InpFlipPartialATRMult×ATR profit
+//                 then snap remainder SL to breakeven
+//  3. Delayed BE — while SL=0: snap SL to entry+buffer once InpFlipBETriggerPts
+//                  in profit, allowing normal trailing to take over
+//──────────────────────────────────────────────────────────────────────────────
+void ManageFlipRiderMode()
+{
+   if (!g_isFlipTrade)       return;
+   if (!SelectOurPosition()) return;
+
+   ENUM_POSITION_TYPE posType   = g_pos.PositionType();
+   double             currentSL = g_pos.StopLoss();
+
+   g_sym.RefreshRates();
+   double ask = g_sym.Ask();
+   double bid = g_sym.Bid();
+
+   double profitPts = (posType == POSITION_TYPE_BUY)
+                      ? (bid - g_entryPrice) / _Point
+                      : (g_entryPrice - ask) / _Point;
+
+   // ── 1. Soft SL: only active while no hard SL is set ─────────────────────
+   if (InpFlipSoftSLPts > 0 && currentSL == 0
+       && profitPts <= -(double)InpFlipSoftSLPts)
+   {
+      PrintFormat("FlipRider: Soft SL hit (loss=%.0fpts >= %dpts) — closing",
+                  -profitPts, InpFlipSoftSLPts);
+      g_isFlipTrade = false;
+      CloseOurPosition("FlipRider-SoftSL");
+      return;
+   }
+
+   // ── 2. Partial close at ATR× profit ──────────────────────────────────────
+   if (!g_partialDone && InpFlipPartialPct > 0 && InpFlipPartialATRMult > 0.0
+       && g_trailGapInitial > 0)
+   {
+      double threshold = InpFlipPartialATRMult * (double)g_trailGapInitial;
+      if (profitPts >= threshold)
+      {
+         double origLot   = g_pos.Volume();
+         double closeLot  = NormalizeLot(origLot * InpFlipPartialPct / 100.0);
+         double remainLot = origLot - closeLot;
+
+         if (closeLot >= g_sym.LotsMin() && remainLot >= g_sym.LotsMin())
+         {
+            if (g_trade.PositionClosePartial(g_pos.Ticket(), closeLot,
+                                              InpMaxSlippagePoints))
+            {
+               PrintFormat("FlipRider: Partial closed %.2f lots (%.0f%%) at profit=%.0fpts",
+                           closeLot, (double)InpFlipPartialPct, profitPts);
+               g_partialDone = true;
+
+               // Snap remainder SL to entry+buffer immediately
+               Sleep(100);
+               if (SelectOurPosition())
+               {
+                  double beSL = (posType == POSITION_TYPE_BUY)
+                                ? NormalizeDouble(g_entryPrice + InpBEBuffer * _Point, _Digits)
+                                : NormalizeDouble(g_entryPrice - InpBEBuffer * _Point, _Digits);
+                  if (g_trade.PositionModify(g_pos.Ticket(), beSL, 0))
+                  {
+                     g_beSet = true;
+                     PrintFormat("FlipRider: Remainder SL locked to BE=%.5f", beSL);
+                  }
+                  else
+                     PrintResult("FlipRider: BE after partial FAILED — will retry next tick");
+               }
+            }
+            else
+               PrintResult("FlipRider: Partial close FAILED");
+         }
+         else
+            PrintFormat("FlipRider: Partial skipped — remainder %.2f lots < min %.2f",
+                        remainLot, g_sym.LotsMin());
+         return;
+      }
+   }
+
+   // ── 3. Delayed BE: snap SL to entry once profitable (while SL still 0) ──
+   if (InpFlipBETriggerPts > 0 && currentSL == 0
+       && profitPts >= (double)InpFlipBETriggerPts)
+   {
+      double beSL = (posType == POSITION_TYPE_BUY)
+                    ? NormalizeDouble(g_entryPrice + InpBEBuffer * _Point, _Digits)
+                    : NormalizeDouble(g_entryPrice - InpBEBuffer * _Point, _Digits);
+
+      if (g_trade.PositionModify(g_pos.Ticket(), beSL, 0))
+      {
+         g_beSet = true;
+         PrintFormat("FlipRider: Delayed BE → %.5f (profit=%.0fpts)", beSL, profitPts);
+      }
+      else
+         PrintResult("FlipRider: Delayed BE FAILED — will retry next tick");
+   }
+}
+
+//──────────────────────────────────────────────────────────────────────────────
 // ManageTrailingStop — trails SL, flip order follows in ManageFlipOrder
 //──────────────────────────────────────────────────────────────────────────────
 void ManageTrailingStop()
@@ -294,6 +556,9 @@ void ManageTrailingStop()
    ENUM_POSITION_TYPE posType   = g_pos.PositionType();
    double             currentSL = g_pos.StopLoss();
    ulong              ticket    = g_pos.Ticket();
+
+   // Let FlipRiderMode manage the position until it has a hard SL
+   if (g_isFlipTrade && currentSL == 0) return;
 
    g_sym.RefreshRates();
    double ask   = g_sym.Ask();
@@ -337,6 +602,7 @@ void ManageBreakeven()
    if (g_beSet)              return;
    if (InpBEPoints <= 0)     return;
    if (!SelectOurPosition()) return;
+   if (g_isFlipTrade && g_pos.StopLoss() == 0) return; // Handled by FlipRiderMode
 
    ENUM_POSITION_TYPE posType = g_pos.PositionType();
    g_sym.RefreshRates();
@@ -375,12 +641,32 @@ void ManageBreakeven()
 //──────────────────────────────────────────────────────────────────────────────
 void ResetTradeState()
 {
-   g_beSet          = false;
-   g_trailGapInitial = GetATRPoints();
+   g_beSet             = false;
+   g_isFlipTrade       = true;   // Position opened by flip stop — activate rider mode
+   g_partialDone       = false;
+   g_peakProfitPts     = 0.0;
+   g_candleFavorCount  = 0;
+   g_trailGapInitial   = GetATRPoints();
    g_trailGap       = g_trailGapInitial;
    Sleep(100);
-   if (SelectOurPosition())
-      g_entryPrice = g_pos.PriceOpen();
+   if (!SelectOurPosition()) return;
+   g_entryPrice = g_pos.PriceOpen();
+
+   // Every flip-opened position must have an SL immediately — no naked positions
+   if (g_pos.StopLoss() == 0)
+   {
+      g_sym.RefreshRates();
+      double ask   = g_sym.Ask();
+      double bid   = g_sym.Bid();
+      int    slPts = SafeDist(g_trailGapInitial, ask, bid);
+      double sl    = (g_pos.PositionType() == POSITION_TYPE_BUY)
+                     ? NormalizeDouble(ask - slPts * _Point, _Digits)
+                     : NormalizeDouble(bid + slPts * _Point, _Digits);
+      if (g_trade.PositionModify(g_pos.Ticket(), sl, 0))
+         PrintFormat("FlipReset: ATR SL set → %.5f (%dpts)", sl, slPts);
+      else
+         PrintResult("FlipReset: SL set FAILED — soft SL still active via FlipRiderMode");
+   }
    PrintFormat("Trade state reset: entry=%.5f trailGap=%dpts", g_entryPrice, g_trailGap);
 }
 
@@ -431,14 +717,16 @@ bool OpenPosition(ENUM_ORDER_TYPE direction, bool isSeed)
 
       if (rc == TRADE_RETCODE_DONE)
       {
-         if (isSeed) { g_slFlipCount = 0; g_standingDown = false; }
-         g_trailGapInitial = atrPts;
+         if (isSeed) { g_slFlipCount = 0; g_standingDown = false; g_isFlipTrade = false; g_partialDone = false; }
+         g_peakProfitPts    = 0.0;
+         g_candleFavorCount = 0;
+         g_trailGapInitial  = atrPts;
          g_trailGap        = atrPts;
          g_beSet           = false;
          Sleep(100);
          if (SelectOurPosition())
             g_entryPrice = g_pos.PriceOpen();
-         PlaceFlipOrder();   // Flip stop immediately at SL level
+         // Flip stop placed by ManageFlipOrder() on next tick once SL is confirmed
          return true;
       }
 
@@ -581,10 +869,13 @@ void OnTick()
 
    if (SelectOurPosition())
    {
-      UpdateTrailGap();      // Tighten trail as profit grows (ratio-based)
-      ManageBreakeven();     // Lock profit at entry+buffer
-      ManageTrailingStop();  // Move SL
-      ManageFlipOrder();     // Keep flip stop in sync with SL
+      UpdateTrailGap();        // Tighten ATR trail gap as profit grows
+      ManageFlipRiderMode();   // Soft SL + delayed BE + partial close for flip trades
+      ManageBreakeven();       // Lock profit at entry+buffer (skipped for no-SL flips)
+      ManageTrailingStop();    // ATR-based trailing SL (skipped for no-SL flips)
+      ManagePeakLockSL();      // Peak profit lock: SL = entry + peak×60%
+      if (newBar) ManageCandleStepLock(); // Every N favorable closes → lock 40% of profit
+      ManageFlipOrder();       // Keep flip stop in sync with SL
    }
 }
 
@@ -642,7 +933,9 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
    {
       g_slFlipCount++;
       g_lastSLFlipTime = TimeCurrent();
-      g_flipTicket     = 0;   // Old flip order fired or is now invalid
+      g_flipTicket     = 0;
+      g_isFlipTrade    = false;  // Old flip trade position is now closed
+      g_partialDone    = false;
       PrintFormat("SL flip #%d (cap=%d)", g_slFlipCount, InpMaxSLFlips);
 
       if (g_slFlipCount >= InpMaxSLFlips)
@@ -656,11 +949,11 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 
    if (isFlipFire)
    {
-      // New position opened by flip stop — reset state and arm new flip stop
+      // New position opened by flip stop — reset state
+      // Flip stop placed by ManageFlipOrder() on next tick once SL is confirmed
       g_flipTicket = 0;
       PrintFormat("FlipStop fired — new position opened");
+      Sleep(200);      // Give broker time to fully register the new position
       ResetTradeState();
-      Sleep(200);            // Give broker time to fully register the new position
-      PlaceFlipOrder();      // Arm new flip stop on the reverse position
    }
 }
