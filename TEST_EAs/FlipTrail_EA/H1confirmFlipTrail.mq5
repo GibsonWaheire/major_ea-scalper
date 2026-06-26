@@ -1,27 +1,27 @@
 //+------------------------------------------------------------------+
-//|  H1confirmFlipTrail.mq5  v3                                      |
-//|  Retest-limit flip architecture                                   |
+//|  H1confirmFlipTrail.mq5  v3.10                                   |
+//|  Pullback-confirmation entry + dynamic lot sizing                 |
 //|                                                                   |
-//|  WHAT CHANGED FROM v2                                            |
+//|  WHAT CHANGED FROM v3                                            |
 //|  ──────────────────────                                          |
-//|  Flip mechanism redesigned:                                      |
-//|  OLD: SELL_STOP placed alongside running trade, fires on SL hit  |
-//|  NEW: No pending order while trade runs.                         |
-//|       After SL hit → SELL_LIMIT (or BUY_LIMIT) placed at         |
-//|       close price ± InpRetestBufferPts.                          |
-//|       Fires only if price retests that level — cleaner entry.    |
-//|       Limit has ATR SL embedded → no naked positions ever.       |
-//|       If limit expires (InpRetestExpiryBars) or H1 flips         |
-//|       against it → cancelled → TrySeedEntry takes over.         |
+//|  Entry signal redesigned (TrySeedEntry):                         |
+//|  OLD: single M1 candle body filter (noisy on M1)                 |
+//|  NEW: pullback-confirmation pattern —                            |
+//|       2+ opposite candles (pullback) then 2 same-direction       |
+//|       candles (reversal + confirmation) in H1 trend direction    |
 //|                                                                   |
-//|  SAME AS v2                                                      |
-//|  SL=0 bug fix, peak profit lock, H1 EMA filter, progressive     |
-//|  trail 100%→50%→25%→15%, breakeven, body filter                 |
+//|  Dynamic lot sizing (ScorePullbackSetup → CalcDynamicLot):       |
+//|  Score 0-100 based on pullback depth, candle count,              |
+//|  reversal candle body%, confirmation candle body%                |
+//|  Lot = InpMinLot + (InpMaxLot - InpMinLot) × score/100          |
+//|                                                                   |
+//|  SAME AS v3                                                      |
+//|  Retest-limit flip, peak lock, H1 filter, progressive trail     |
 //+------------------------------------------------------------------+
 #property copyright "FlipTrail EA"
 #property link      ""
-#property version   "3.00"
-#property description "H1confirmFlipTrail v3: retest-limit flip + peak lock + H1 filter"
+#property version   "3.10"
+#property description "H1confirmFlipTrail v3.10: pullback entry + dynamic lot + retest-limit flip"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -31,7 +31,8 @@
 // INPUTS
 //──────────────────────────────────────────────────────────────────────────────
 input group "=== Trade ==="
-input double InpLotSize            = 0.1;   // LotSize
+input double InpMinLot             = 0.02;  // MinLot: lot size for lowest-confidence setup
+input double InpMaxLot             = 0.30;  // MaxLot: lot size for highest-confidence setup
 input int    InpSLPoints           = 50;    // SLPoints: minimum SL floor
 input long   InpMagicNumber        = 112234;// MagicNumber
 input int    InpMaxSlippagePoints  = 30;    // MaxSlippagePoints
@@ -45,8 +46,14 @@ input group "=== Breakeven ==="
 input int    InpBEPoints           = 50;    // BEPoints: profit pts to lock BE (0 = off)
 input int    InpBEBuffer           = 10;    // BEBuffer: SL moves to entry + this
 
-input group "=== Candle Body Filter ==="
-input int    InpMinBodyPct         = 30;    // MinBodyPct: min body % of range (0 = off)
+input group "=== Pullback Entry ==="
+input int    InpMinPullbackBars    = 2;     // MinPullbackBars: min opposite candles before reversal
+// Dynamic lot scoring:
+// Pullback depth vs ATR  → 0-30 pts
+// Pullback candle count  → 0-25 pts
+// Reversal candle body%  → 0-25 pts
+// Confirm  candle body%  → 0-20 pts
+// Total 0-100 → MinLot..MaxLot
 
 input group "=== H1 Trend Filter ==="
 input bool   InpH1FilterEnabled    = true;  // H1FilterEnabled
@@ -54,14 +61,10 @@ input int    InpH1EMAPeriod        = 20;    // H1EMAPeriod
 
 input group "=== Peak Profit Lock ==="
 input int    InpPeakLockPct        = 50;    // PeakLockPct: lock % of peak profit (0 = off)
-// Example: peak=+8000pts, lock=50% → SL floor = entry+4000pts
 
 input group "=== Retest Limit ==="
-input int    InpRetestBufferPts    = 10;    // RetestBufferPts: pts above/below close price for limit
+input int    InpRetestBufferPts    = 10;    // RetestBufferPts: pts offset from close price for limit
 input int    InpRetestExpiryBars   = 20;    // RetestExpiryBars: M1 bars before auto-cancel (0 = GTC)
-// After SL close: SELL_LIMIT placed at closePrice+buffer (BUY close) or BUY_LIMIT at closePrice-buffer (SELL close)
-// If price retests → limit fires → new position WITH SL embedded
-// If price never retests → expires after N bars → TrySeedEntry takes over
 
 input group "=== Flip Guard ==="
 input int    InpMaxSLFlips         = 50;    // MaxSLFlips cap
@@ -87,8 +90,8 @@ int      g_effectiveSLMin    = 0;
 int      g_trailGap          = 0;
 int      g_trailGapInitial   = 0;
 datetime g_lastBarTime       = 0;
-ulong    g_flipTicket        = 0;      // Retest limit order ticket
-int      g_retestBarsElapsed = 0;      // M1 bars since retest limit was placed
+ulong    g_flipTicket        = 0;
+int      g_retestBarsElapsed = 0;
 int      g_slFlipCount       = 0;
 bool     g_standingDown      = false;
 ulong    g_lastDeal          = 0;
@@ -130,7 +133,7 @@ double NormalizeLot(double lot)
    double maxL = g_sym.LotsMax();
    if (step <= 0.0) step = 0.01;
    lot = MathFloor(lot / step) * step;
-   lot = MathMax(lot, MathMax(minL, 0.02));
+   lot = MathMax(lot, minL);
    lot = MathMin(lot, maxL);
    return NormalizeDouble(lot, 2);
 }
@@ -171,7 +174,28 @@ int GetATRPoints()
 }
 
 //──────────────────────────────────────────────────────────────────────────────
-// H1TrendAgreesWithFlip
+// GetH1Bias — silent H1 direction check (no log output)
+// Returns  1 = bullish (price > EMA)
+//         -1 = bearish (price < EMA)
+//          0 = filter off or data unavailable
+//──────────────────────────────────────────────────────────────────────────────
+int GetH1Bias()
+{
+   if (!InpH1FilterEnabled)           return 0;
+   if (g_emaHandle == INVALID_HANDLE) return 0;
+
+   double ema[];
+   ArraySetAsSeries(ema, true);
+   if (CopyBuffer(g_emaHandle, 0, 0, 1, ema) <= 0) return 0;
+
+   double h1Close = iClose(_Symbol, PERIOD_H1, 0);
+   if (h1Close == 0) return 0;
+
+   return (h1Close > ema[0]) ? 1 : -1;
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// H1TrendAgreesWithFlip — used by retest limit management (logs when blocked)
 //──────────────────────────────────────────────────────────────────────────────
 bool H1TrendAgreesWithFlip(ENUM_ORDER_TYPE dir)
 {
@@ -191,6 +215,108 @@ bool H1TrendAgreesWithFlip(ENUM_ORDER_TYPE dir)
       PrintFormat("H1 filter: %s blocked (H1=%.5f EMA%d=%.5f)",
                   (dir==ORDER_TYPE_BUY?"BUY":"SELL"), h1Close, InpH1EMAPeriod, ema[0]);
    return agrees;
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// ScorePullbackSetup
+// Detects: 2+ opposite candles (pullback) → 2 same-direction candles
+// (reversal + confirmation) consistent with `dir`.
+//
+// Returns score 0-100 on valid setup, -1 if pattern not found.
+//
+// Scoring:
+//   Pullback depth vs ATR (0-30): deeper = trend is pausing, not reversing
+//   Pullback candle count (0-25): cleaner pullback = more reliable signal
+//   Reversal candle body%  (0-25): first recovery candle strength
+//   Confirm  candle body%  (0-20): second candle confirms buyers/sellers back
+//──────────────────────────────────────────────────────────────────────────────
+int ScorePullbackSetup(ENUM_ORDER_TYPE dir)
+{
+   bool isBuy = (dir == ORDER_TYPE_BUY);
+
+   // ── Confirmation candles: [1]=confirm, [2]=reversal ──────────────────────
+   double c1 = iClose(_Symbol, PERIOD_M1, 1);
+   double o1 = iOpen (_Symbol, PERIOD_M1, 1);
+   double h1 = iHigh (_Symbol, PERIOD_M1, 1);
+   double l1 = iLow  (_Symbol, PERIOD_M1, 1);
+
+   double c2 = iClose(_Symbol, PERIOD_M1, 2);
+   double o2 = iOpen (_Symbol, PERIOD_M1, 2);
+   double h2 = iHigh (_Symbol, PERIOD_M1, 2);
+   double l2 = iLow  (_Symbol, PERIOD_M1, 2);
+
+   // Both candles must be in the entry direction
+   bool c1inDir = isBuy ? (c1 > o1) : (c1 < o1);
+   bool c2inDir = isBuy ? (c2 > o2) : (c2 < o2);
+   if (!c1inDir || !c2inDir) return -1;
+
+   // Doji filter: both candles need at least 20% body (not noise)
+   double range1 = h1 - l1;
+   double range2 = h2 - l2;
+   double body1  = MathAbs(c1 - o1);
+   double body2  = MathAbs(c2 - o2);
+   if (range1 > 0 && body1 / range1 < 0.20) return -1;
+   if (range2 > 0 && body2 / range2 < 0.20) return -1;
+
+   // ── Pullback: count consecutive opposite candles before candle[2] ────────
+   int    pullbackCount = 0;
+   double pbHigh = 0.0, pbLow = DBL_MAX;
+
+   for (int i = 3; i <= 3 + 6; i++)   // look back up to 6 pullback candles
+   {
+      double ci = iClose(_Symbol, PERIOD_M1, i);
+      double oi = iOpen (_Symbol, PERIOD_M1, i);
+      bool   ciOpposite = isBuy ? (ci < oi) : (ci > oi);
+      if (!ciOpposite) break;          // pullback ended — stop counting
+
+      pullbackCount++;
+      pbHigh = MathMax(pbHigh, iHigh(_Symbol, PERIOD_M1, i));
+      pbLow  = MathMin(pbLow,  iLow (_Symbol, PERIOD_M1, i));
+   }
+
+   if (pullbackCount < InpMinPullbackBars) return -1;  // not enough pullback
+
+   // ── Score ────────────────────────────────────────────────────────────────
+   int score = 0;
+
+   // 1. Pullback depth relative to ATR (0-30 pts)
+   double atrPrice   = GetATRPoints() * _Point;
+   double pbDepth    = pbHigh - pbLow;
+   if (atrPrice > 0)
+   {
+      double ratio = pbDepth / atrPrice;
+      if      (ratio >= 1.0) score += 30;
+      else if (ratio >= 0.5) score += 20;
+      else if (ratio >= 0.3) score += 10;
+   }
+
+   // 2. Pullback candle count (0-25 pts)
+   if      (pullbackCount >= 4) score += 25;
+   else if (pullbackCount == 3) score += 20;
+   else                         score += 10;  // == 2
+
+   // 3. Reversal candle body% [2] (0-25 pts)
+   double bodyPct2 = (range2 > 0) ? body2 / range2 * 100.0 : 0;
+   if      (bodyPct2 >= 70) score += 25;
+   else if (bodyPct2 >= 50) score += 15;
+   else                     score += 5;
+
+   // 4. Confirmation candle body% [1] (0-20 pts)
+   double bodyPct1 = (range1 > 0) ? body1 / range1 * 100.0 : 0;
+   if      (bodyPct1 >= 70) score += 20;
+   else if (bodyPct1 >= 50) score += 12;
+   else                     score += 4;
+
+   return score;  // 0-100
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// CalcDynamicLot — maps score 0-100 to MinLot..MaxLot
+//──────────────────────────────────────────────────────────────────────────────
+double CalcDynamicLot(int score)
+{
+   double pct = MathMax(0, MathMin(score, 100)) / 100.0;
+   return NormalizeLot(InpMinLot + (InpMaxLot - InpMinLot) * pct);
 }
 
 //──────────────────────────────────────────────────────────────────────────────
@@ -249,20 +375,10 @@ void CancelRetestLimit()
 
 //──────────────────────────────────────────────────────────────────────────────
 // PlaceRetestLimit
-// Called from OTT after a position closes by SL.
-// closedPosType = the type of the position that just closed.
-// closePrice    = the deal fill price (where SL was hit).
-//
-// BUY closed  → SELL_LIMIT at closePrice + buffer  (above current price)
-//               fires if price bounces back up
-// SELL closed → BUY_LIMIT  at closePrice - buffer  (below current price)
-//               fires if price bounces back down
-//
-// Both orders have ATR-based SL embedded at placement.
 //──────────────────────────────────────────────────────────────────────────────
 void PlaceRetestLimit(double closePrice, ENUM_POSITION_TYPE closedPosType)
 {
-   if (PendingOrderExists(g_flipTicket)) return; // Already have one
+   if (PendingOrderExists(g_flipTicket)) return;
 
    g_sym.RefreshRates();
    int stopsLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
@@ -270,13 +386,12 @@ void PlaceRetestLimit(double closePrice, ENUM_POSITION_TYPE closedPosType)
    int minDist    = MathMax(stopsLevel + spread + 2, 1);
    int bufferPts  = MathMax(InpRetestBufferPts, minDist);
 
-   int    atrPts  = GetATRPoints();
-   double lot     = NormalizeLot(g_isNetting ? InpLotSize * 2.0 : InpLotSize);
-   bool   ok      = false;
+   int    atrPts = GetATRPoints();
+   double lot    = NormalizeLot(g_isNetting ? InpMinLot * 2.0 : InpMinLot);
+   bool   ok     = false;
 
    if (closedPosType == POSITION_TYPE_BUY)
    {
-      // BUY closed → place SELL_LIMIT above close price
       double limitPrice = NormalizeDouble(closePrice + bufferPts * _Point, _Digits);
       double limitSL    = NormalizeDouble(limitPrice + atrPts * _Point, _Digits);
       ok = g_trade.SellLimit(lot, limitPrice, _Symbol, limitSL, 0,
@@ -285,7 +400,6 @@ void PlaceRetestLimit(double closePrice, ENUM_POSITION_TYPE closedPosType)
    }
    else
    {
-      // SELL closed → place BUY_LIMIT below close price
       double limitPrice = NormalizeDouble(closePrice - bufferPts * _Point, _Digits);
       double limitSL    = NormalizeDouble(limitPrice - atrPts * _Point, _Digits);
       ok = g_trade.BuyLimit(lot, limitPrice, _Symbol, limitSL, 0,
@@ -306,18 +420,11 @@ void PlaceRetestLimit(double closePrice, ENUM_POSITION_TYPE closedPosType)
 
 //──────────────────────────────────────────────────────────────────────────────
 // ManageRetestOrder
-// Runs only when there is NO open position.
-// Watches the pending retest limit order:
-//   - Count bars elapsed since placement
-//   - Cancel if expired (InpRetestExpiryBars)
-//   - Cancel if H1 has flipped against the limit direction
-// When cancelled: g_flipTicket = 0 → TrySeedEntry unblocked
 //──────────────────────────────────────────────────────────────────────────────
 void ManageRetestOrder(bool newBar)
 {
    if (g_flipTicket == 0) return;
 
-   // Clean up stale ticket
    if (!PendingOrderExists(g_flipTicket))
    {
       g_flipTicket        = 0;
@@ -325,10 +432,8 @@ void ManageRetestOrder(bool newBar)
       return;
    }
 
-   // Count elapsed M1 bars
    if (newBar) g_retestBarsElapsed++;
 
-   // Expiry check
    if (InpRetestExpiryBars > 0 && g_retestBarsElapsed >= InpRetestExpiryBars)
    {
       PrintFormat("RetestLimit expired after %d bars — cancelling, seed entry takes over",
@@ -337,14 +442,13 @@ void ManageRetestOrder(bool newBar)
       return;
    }
 
-   // H1 filter check — cancel if H1 no longer agrees with limit direction
    if (!InpH1FilterEnabled) return;
 
    for (int i = OrdersTotal() - 1; i >= 0; i--)
    {
       if (OrderGetTicket(i) != g_flipTicket) continue;
 
-      ENUM_ORDER_TYPE otype  = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      ENUM_ORDER_TYPE otype   = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
       ENUM_ORDER_TYPE flipDir = (otype == ORDER_TYPE_SELL_LIMIT)
                                  ? ORDER_TYPE_SELL
                                  : ORDER_TYPE_BUY;
@@ -361,9 +465,6 @@ void ManageRetestOrder(bool newBar)
 
 //──────────────────────────────────────────────────────────────────────────────
 // ManageTrailingStop
-// FIX: shouldMove uses (currentSL==0 OR better than current).
-// Handles flip-opened positions that start with SL=0 as a safety net,
-// though with retest limits the SL is embedded at order placement.
 //──────────────────────────────────────────────────────────────────────────────
 void ManageTrailingStop()
 {
@@ -501,14 +602,14 @@ void ManageBreakeven()
 }
 
 //──────────────────────────────────────────────────────────────────────────────
-// ResetTradeState — called after retest limit fires
+// ResetTradeState
 //──────────────────────────────────────────────────────────────────────────────
 void ResetTradeState()
 {
-   g_beSet             = false;
-   g_peakProfitPts     = 0.0;
-   g_trailGapInitial   = GetATRPoints();
-   g_trailGap          = g_trailGapInitial;
+   g_beSet           = false;
+   g_peakProfitPts   = 0.0;
+   g_trailGapInitial = GetATRPoints();
+   g_trailGap        = g_trailGapInitial;
    Sleep(100);
    if (SelectOurPosition())
       g_entryPrice = g_pos.PriceOpen();
@@ -516,9 +617,10 @@ void ResetTradeState()
 }
 
 //──────────────────────────────────────────────────────────────────────────────
-// OpenPosition — seed entry only
+// OpenPosition
+// lot: pass CalcDynamicLot() result for seed entries; 0 = use InpMinLot
 //──────────────────────────────────────────────────────────────────────────────
-bool OpenPosition(ENUM_ORDER_TYPE direction, bool isSeed)
+bool OpenPosition(ENUM_ORDER_TYPE direction, bool isSeed, double lot = 0.0)
 {
    if (SelectOurPosition()) { Print("OpenPosition: already open — skip"); return false; }
 
@@ -533,8 +635,8 @@ bool OpenPosition(ENUM_ORDER_TYPE direction, bool isSeed)
       }
    }
 
-   int    atrPts = GetATRPoints();
-   double lot    = NormalizeLot(InpLotSize);
+   int atrPts = GetATRPoints();
+   if (lot <= 0) lot = NormalizeLot(InpMinLot);
 
    for (int attempt = 1; attempt <= 3; attempt++)
    {
@@ -556,9 +658,9 @@ bool OpenPosition(ENUM_ORDER_TYPE direction, bool isSeed)
       }
 
       uint rc = g_trade.ResultRetcode();
-      PrintResult(StringFormat("[%s] OpenPos %s%s attempt=%d SL=%dpts",
+      PrintResult(StringFormat("[%s] OpenPos %s%s attempt=%d lot=%.2f SL=%dpts",
                   _Symbol, (direction==ORDER_TYPE_BUY?"BUY":"SELL"),
-                  (isSeed?"[SEED]":""), attempt, slPts));
+                  (isSeed?"[SEED]":""), attempt, lot, slPts));
 
       if (rc == TRADE_RETCODE_DONE)
       {
@@ -603,7 +705,10 @@ bool CloseOurPosition(const string reason)
 
 //──────────────────────────────────────────────────────────────────────────────
 // TrySeedEntry
-// Blocked while a retest limit order is pending (g_flipTicket != 0).
+// Pattern: InpMinPullbackBars+ opposite candles → 2 in-direction candles
+// H1 bias gates which direction we look for.
+// Score 0-100 → dynamic lot MinLot..MaxLot.
+// Blocked while a retest limit is pending.
 //──────────────────────────────────────────────────────────────────────────────
 void TrySeedEntry()
 {
@@ -611,7 +716,6 @@ void TrySeedEntry()
    if (g_standingDown)      return;
    if (!IsInTradingHours()) return;
 
-   // Block seed entry while retest limit is waiting to fill
    if (g_flipTicket != 0 && PendingOrderExists(g_flipTicket)) return;
 
    if (InpCooldownSeconds > 0 && g_lastSLFlipTime > 0)
@@ -624,34 +728,38 @@ void TrySeedEntry()
       }
    }
 
-   double c  = iClose(_Symbol, PERIOD_M1, 1);
-   double o  = iOpen (_Symbol, PERIOD_M1, 1);
-   double hi = iHigh (_Symbol, PERIOD_M1, 1);
-   double lo = iLow  (_Symbol, PERIOD_M1, 1);
+   int            h1Bias = GetH1Bias();
+   ENUM_ORDER_TYPE dir   = ORDER_TYPE_BUY;
+   int             score = -1;
 
-   if (InpMinBodyPct > 0)
+   if (h1Bias == 1)       // H1 bullish → look for BUY pullback
    {
-      double range = hi - lo;
-      double body  = MathAbs(c - o);
-      if (range > 0 && (body / range) * 100.0 < (double)InpMinBodyPct)
-      {
-         PrintFormat("Skip: body=%.0f%% < %d%%", (body/range)*100.0, InpMinBodyPct);
-         return;
-      }
+      score = ScorePullbackSetup(ORDER_TYPE_BUY);
+      dir   = ORDER_TYPE_BUY;
+   }
+   else if (h1Bias == -1) // H1 bearish → look for SELL pullback
+   {
+      score = ScorePullbackSetup(ORDER_TYPE_SELL);
+      dir   = ORDER_TYPE_SELL;
+   }
+   else                   // H1 filter off → try both, take higher score
+   {
+      int scoreBuy  = ScorePullbackSetup(ORDER_TYPE_BUY);
+      int scoreSell = ScorePullbackSetup(ORDER_TYPE_SELL);
+
+      if (scoreBuy >= 0 && scoreBuy >= scoreSell)
+         { dir = ORDER_TYPE_BUY;  score = scoreBuy; }
+      else if (scoreSell >= 0)
+         { dir = ORDER_TYPE_SELL; score = scoreSell; }
    }
 
-   ENUM_ORDER_TYPE dir = (c > o) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   if (score < 0) return;  // no valid pullback pattern on this bar
 
-   if (!H1TrendAgreesWithFlip(dir))
-   {
-      PrintFormat("Seed %s skipped — H1 disagrees", (dir==ORDER_TYPE_BUY?"BUY":"SELL"));
-      return;
-   }
+   double lot = CalcDynamicLot(score);
+   PrintFormat("Pullback %s: score=%d/100 → lot=%.2f",
+               (dir==ORDER_TYPE_BUY ? "BUY" : "SELL"), score, lot);
 
-   if (c > o)
-      { PrintFormat("Seed BUY  (O=%.5f C=%.5f)", o, c); OpenPosition(ORDER_TYPE_BUY,  true); }
-   else
-      { PrintFormat("Seed SELL (O=%.5f C=%.5f)", o, c); OpenPosition(ORDER_TYPE_SELL, true); }
+   OpenPosition(dir, true, lot);
 }
 
 //==============================================================================
@@ -696,22 +804,25 @@ int OnInit()
    g_trailGap        = g_effectiveSLMin;
    g_trailGapInitial = g_effectiveSLMin;
 
-   double lot = NormalizeLot(InpLotSize);
-   if (lot < g_sym.LotsMin())
+   double minLot = NormalizeLot(InpMinLot);
+   if (minLot < g_sym.LotsMin())
    {
-      PrintFormat("INIT FAILED: lot %.2f < min %.2f", lot, g_sym.LotsMin());
+      PrintFormat("INIT FAILED: MinLot %.2f < broker min %.2f", minLot, g_sym.LotsMin());
       return INIT_FAILED;
    }
 
-   PrintFormat("H1confirmFlipTrail v3.00 | %s | ATR(%d)×%.1f(floor=%dpts) | "
-               "Trail:100%%→50%%→25%%→15%% | BE@%dpts+%d | Body>=%d%% | "
-               "H1EMA%d=%s | PeakLock=%d%% | Retest: buffer=%dpts expiry=%dbars | "
-               "Lot=%.2f MaxFlips=%d | Fill=%s | Magic=%lld",
+   PrintFormat("H1confirmFlipTrail v3.10 | %s | ATR(%d)×%.1f(floor=%dpts) | "
+               "Trail:100%%→50%%→25%%→15%% | BE@%dpts+%d | "
+               "H1EMA%d=%s | PeakLock=%d%% | "
+               "Entry: pullback≥%dbar+2confirm | Lot:%.2f→%.2f | "
+               "Retest: buf=%dpts exp=%dbars | MaxFlips=%d | Fill=%s | Magic=%lld",
                _Symbol, InpATRPeriod, InpATRMultiplier, g_effectiveSLMin,
-               InpBEPoints, InpBEBuffer, InpMinBodyPct,
+               InpBEPoints, InpBEBuffer,
                InpH1EMAPeriod, InpH1FilterEnabled ? "ON" : "OFF",
-               InpPeakLockPct, InpRetestBufferPts, InpRetestExpiryBars,
-               lot, InpMaxSLFlips, EnumToString(filling), InpMagicNumber);
+               InpPeakLockPct,
+               InpMinPullbackBars, InpMinLot, InpMaxLot,
+               InpRetestBufferPts, InpRetestExpiryBars,
+               InpMaxSLFlips, EnumToString(filling), InpMagicNumber);
    return INIT_SUCCEEDED;
 }
 
@@ -720,7 +831,7 @@ void OnDeinit(const int reason)
    if (g_atrHandle != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
    if (g_emaHandle != INVALID_HANDLE) IndicatorRelease(g_emaHandle);
    CancelRetestLimit();
-   PrintFormat("H1confirmFlipTrail v3.00 deinit (reason=%d).", reason);
+   PrintFormat("H1confirmFlipTrail v3.10 deinit (reason=%d).", reason);
 }
 
 void OnTick()
@@ -734,8 +845,6 @@ void OnTick()
 
    if (SelectOurPosition())
    {
-      // ── Active trade: trail SL, BE, peak lock ──────────────────────────
-      // No pending flip order while position is alive.
       UpdateTrailGap();
       ManageBreakeven();
       ManageTrailingStop();
@@ -743,9 +852,6 @@ void OnTick()
    }
    else
    {
-      // ── No position: manage retest limit then try seed ──────────────────
-      // ManageRetestOrder watches expiry and H1 flip, runs on new bar.
-      // TrySeedEntry is blocked while g_flipTicket is pending.
       if (newBar)
       {
          ManageRetestOrder(true);
@@ -792,11 +898,9 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 
    g_lastDeal = deal;
 
-   // Position closed by SL
    bool isSLClose = (reason == DEAL_REASON_SL &&
                      (entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_INOUT));
 
-   // Retest limit order filled — new position opened
    bool isFlipFire = (g_flipTicket != 0 && dealOrder == g_flipTicket &&
                       (entry == DEAL_ENTRY_IN || entry == DEAL_ENTRY_INOUT));
 
@@ -806,7 +910,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
    {
       g_slFlipCount++;
       g_lastSLFlipTime = TimeCurrent();
-      g_flipTicket     = 0;   // No flip stop was running, but clear just in case
+      g_flipTicket     = 0;
       PrintFormat("SL close #%d (cap=%d)", g_slFlipCount, InpMaxSLFlips);
 
       if (g_slFlipCount >= InpMaxSLFlips)
@@ -817,9 +921,6 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
          return;
       }
 
-      // Determine what type of position just closed so we know which limit to place
-      // dealType == DEAL_TYPE_SELL (exit deal sells to close a BUY position)
-      // dealType == DEAL_TYPE_BUY  (exit deal buys  to close a SELL position)
       ENUM_POSITION_TYPE closedPosType = (dealType == DEAL_TYPE_SELL)
                                           ? POSITION_TYPE_BUY
                                           : POSITION_TYPE_SELL;
@@ -843,7 +944,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
       g_flipTicket        = 0;
       g_retestBarsElapsed = 0;
       PrintFormat("RetestLimit fired — new position opened with SL embedded");
-      Sleep(200);    // Give broker time to fully register the new position
+      Sleep(200);
       ResetTradeState();
    }
 }
