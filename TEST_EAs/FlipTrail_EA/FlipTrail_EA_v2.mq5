@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|  FlipTrail_EA_v2.mq5  v2.50                                      |
+//|  FlipTrail_EA_v2.mq5  v2.60                                      |
 //|  HFT Basket Scalper — New York Session Only                      |
 //|                                                                   |
 //|  MECHANICS                                                        |
@@ -24,7 +24,7 @@
 //|  3. PROGRESSIVE SL LOCK: after each partial close SL moves      |
 //|     to entry + InpBELockPct% (TP1) or InpSL2LockPct% (rev).    |
 //|                                                                   |
-//|  v2.30 FIXES (the 20% account-wipe problem):                    |
+//|  v2.60 ADDITIONS (entry quality + fast profits + protection):   |\n//|  1. CONFIRM CANDLES: require N consecutive same-direction M1    |\n//|     candles before entry — rejects chop, enters on momentum.   |\n//|  2. FLASH TP: instant full-basket close on first tick avg move  |\n//|     >= InpFlashTPPct% — millisecond profit capture.            |\n//|  3. REPEATING PARTIALS: partial closes repeat every new bar     |\n//|     (per-bar gate replaces one-time flags).                    |\n//|  4. DAILY CIRCUIT BREAKERS: session equity snapshot + daily    |\n//|     loss % limit + optional basket cap per session.            |\n//|                                                                   |\n//|  v2.30 FIXES (the 20% account-wipe problem):                    |
 //|  1. BASKET RISK: RiskPct% = total budget for whole basket.      |
 //|     Divided by BasketSize per trade → max exposure = RiskPct%.  |
 //|  2. HARD SL at broker on every order (InpSLFloorPct% from       |
@@ -36,8 +36,8 @@
 //+------------------------------------------------------------------+
 #property copyright "FlipTrail EA v2"
 #property link      ""
-#property version   "2.50"
-#property description "FlipTrail v2.50: reversal partial + time-based partial + progressive SL lock"
+#property version   "2.60"
+#property description "FlipTrail v2.60: multi-candle confirm + flash TP + daily circuit breakers + repeating partials"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -63,11 +63,13 @@ input group "=== Basket Close Conditions ==="
 input double InpMinChangePct      = 0.13;   // MinChangePct: min % price move from entry per trade to qualify (keep ≥ SLFloorPct for positive R:R)
 input double InpMinQualifiedPct   = 50.0;   // MinQualifiedPct: close basket when X% of trades are qualified
 input double InpMinBasketProfit   = 0.0;    // MinBasketProfit: min total basket $ P&L to close (0=off)
+input double InpFlashTPPct        = 0.07;   // FlashTPPct: instant close ALL when avg move hits this % on ANY tick (0=off). Set < MinChangePct for a fast scalp exit before full TP.
 //  R:R: InpMinChangePct (TP) vs InpSLFloorPct (SL). Default 0.13/0.12 ≈ 1.08:1.
 //  At 80% win rate: E[V] = 0.8×0.13% − 0.2×0.12% = +0.08% per basket (was −0.008% in v2.20).
 
 input group "=== Candle Body Filter ==="
 input int    InpMinBodyPct        = 30;     // MinBodyPct: min body as % of bar range (0=off)
+input int    InpConfirmCandles    = 2;      // ConfirmCandles: require N consecutive same-direction M1 candles before entry (1=any single candle, 2=momentum confirmed)
 
 input group "=== New York Session ==="
 input int    InpNYStartHour       = 13;     // NYStartHour: server time (13 = NY open / London overlap)
@@ -77,7 +79,11 @@ input int    InpNYEndHour         = 22;     // NYEndHour: server time (22 = NY c
 
 input group "=== Consecutive Loss Pause ==="
 input int    InpMaxConsecLosses   = 2;      // MaxConsecLosses: SL hits in a row before pause (0=off)
-input int    InpPauseBars         = 5;      // PauseBars: M1 bars to skip after consecutive losses hit
+input int    InpPauseBars         = 10;     // PauseBars: M1 bars to skip after consecutive losses hit
+
+input group "=== Daily Circuit Breakers ==="
+input double InpMaxDailyLossPct   = 5.0;   // MaxDailyLossPct: halt for the day if equity drops this % from NY-session-open equity (0=off)
+input int    InpMaxDailyBaskets   = 0;     // MaxDailyBaskets: max baskets per NY session (0=off)
 
 input group "=== Partial Close — Profit ==="
 input double InpPartialTPPct      = 0.08;   // PartialTPPct: avg basket move % to trigger partial profit close
@@ -123,11 +129,15 @@ int    g_historyCount = 0;
 int g_consecLosses  = 0;
 int g_pauseBarsLeft = 0;
 
-// Partial close flags — reset on every new basket
-bool g_partial1Done    = false; // profit partial (TP1) already fired
-bool g_reversalDone    = false; // reversal pullback partial already fired
-bool g_timeExitDone    = false; // time-based partial already fired
-bool g_lossPartialDone = false; // loss cut already fired
+// Daily circuit breakers — reset at each NY session open
+double   g_sessionStartEquity = 0.0;  // equity snapshot when NY session opened today
+int      g_sessionBaskets     = 0;    // baskets opened this NY session
+datetime g_sessionDate        = 0;    // date of the current session snapshot
+
+// Per-bar partial gate — one partial close per M1 bar prevents same-tick re-fire
+// Remaining positions are re-evaluated every new bar using the same rules
+datetime g_lastPartialBar  = 0;     // bar time of last partial close
+bool     g_lossPartialDone = false; // loss cut (one-time per basket)
 
 // Peak tracking — highest avg move % seen during this basket
 double g_peakMovePct   = 0.0;
@@ -205,9 +215,7 @@ void CloseAllOurPositions(const string reason)
 
    PrintFormat("[Basket] CloseAll [%s] | %d positions closed", reason, total);
    g_basketOpen       = false;
-   g_partial1Done     = false;
-   g_reversalDone     = false;
-   g_timeExitDone     = false;
+   g_lastPartialBar   = 0;
    g_lossPartialDone  = false;
    g_peakMovePct      = 0.0;
    g_basketBarCount   = 0;
@@ -341,16 +349,16 @@ void OpenBasket(ENUM_ORDER_TYPE dir)
       g_basketDir      = dir;
       g_basketOpen     = true;
       g_basketAvgEntry = entrySum / opened;
-      g_peakMovePct    = 0.0;
-      g_basketBarCount = 0;
-      g_partial1Done   = false;
-      g_reversalDone   = false;
-      g_timeExitDone   = false;
-      g_lossPartialDone= false;
+      g_peakMovePct      = 0.0;
+      g_basketBarCount   = 0;
+      g_lastPartialBar   = 0;
+      g_lossPartialDone  = false;
+      g_sessionBaskets++;
       double thresh    = GetDynamicThreshold();
-      PrintFormat("[Basket OPEN] %s | %d/%d trades | %.2f lot each | DynSL=%.2f%% (floor=%.1f%%) | target: %.2f%% on %.0f%%+ trades",
+      PrintFormat("[Basket OPEN] %s | %d/%d trades | %.2f lot each | DynSL=%.2f%% (floor=%.1f%%) | target: %.2f%% on %.0f%%+ trades | session basket %d/%d",
                   (dir==ORDER_TYPE_BUY?"BUY":"SELL"), opened, tradesTarget, lot,
-                  thresh, InpSLFloorPct, InpMinChangePct, InpMinQualifiedPct);
+                  thresh, InpSLFloorPct, InpMinChangePct, InpMinQualifiedPct,
+                  g_sessionBaskets, InpMaxDailyBaskets > 0 ? InpMaxDailyBaskets : 9999);
    }
 }
 
@@ -514,7 +522,7 @@ void SetRemainingToLock(double lockPct)
 void CheckBasketClose()
 {
    int total = CountOurPositions();
-   if (total == 0) { g_basketOpen = false; g_partial1Done = false; g_reversalDone = false; g_timeExitDone = false; g_lossPartialDone = false; return; }
+   if (total == 0) { g_basketOpen = false; g_lastPartialBar = 0; g_lossPartialDone = false; return; }
 
    g_sym.RefreshRates();
    double ask = g_sym.Ask();
@@ -552,6 +560,16 @@ void CheckBasketClose()
                    : (g_basketAvgEntry - currentPrice) / g_basketAvgEntry * 100.0;
    }
 
+   // ── 0. FLASH TP — instant full-basket close on first tick price crosses threshold ──
+   // Fires before every other check so tiny favourable moves are captured immediately.
+   if (InpFlashTPPct > 0 && g_basketAvgEntry > 0 && avgMovePct >= InpFlashTPPct)
+   {
+      PrintFormat("[Flash TP] move=+%.4f%% >= +%.4f%% | P&L=%.2f — instant basket close",
+                  avgMovePct, InpFlashTPPct, totalProfit);
+      CloseAllOurPositions("FlashTP");
+      return;
+   }
+
    // ── 1. DYNAMIC SL — soft backup (broker hard SL is primary) ──────────────
    if (g_basketAvgEntry > 0 && avgMovePct <= -GetDynamicThreshold())
    {
@@ -570,7 +588,7 @@ void CheckBasketClose()
    // (c) price has pulled back >= ReversalPullbackPct% from that peak,
    // (d) still above zero (don't cut a basket that's already gone negative).
    if (InpReversalPullbackPct > 0 &&
-       !g_reversalDone &&
+       g_lastPartialBar != g_lastBarTime &&   // one partial per bar
        g_peakMovePct >= InpPartialTPPct &&
        (g_peakMovePct - avgMovePct) >= InpReversalPullbackPct &&
        avgMovePct > 0 &&        // price is still above avg entry — don't cut a losing basket
@@ -581,14 +599,15 @@ void CheckBasketClose()
                   InpReversalPullbackPct, totalProfit, InpReversalCount, InpSL2LockPct);
       CloseNBest(InpReversalCount);
       SetRemainingToLock(InpSL2LockPct);
-      g_reversalDone = true;
+      g_peakMovePct    = avgMovePct;   // reset peak — next reversal needs a fresh high
+      g_lastPartialBar = g_lastBarTime;
       return;
    }
 
    // ── 4. TIME-BASED PARTIAL ─────────────────────────────────────────────────
    // Fires when basket has lingered >= InpTimeExitBars and is in profit.
    if (InpTimeExitBars > 0 &&
-       !g_timeExitDone &&
+       g_lastPartialBar != g_lastBarTime &&   // one partial per bar
        g_basketBarCount >= InpTimeExitBars &&
        avgMovePct >= InpTimeExitMinPct &&  // price move % is the gate — not broker floating P&L (spread distorts it)
        total > InpTimeExitCount)
@@ -598,20 +617,22 @@ void CheckBasketClose()
                   totalProfit, InpTimeExitCount, InpBELockPct);
       CloseNBest(InpTimeExitCount);
       SetRemainingToLock(InpBELockPct);
-      g_timeExitDone = true;
+      g_lastPartialBar = g_lastBarTime;
       return;
    }
 
    // ── 5. PARTIAL CLOSE — PROFIT (TP1) ───────────────────────────────────────
    // When basket has moved +InpPartialTPPct% in our favour: close best N trades,
    // lock remaining SL at entry + InpBELockPct%. Fires once per basket.
-   if (!g_partial1Done && avgMovePct >= InpPartialTPPct && total > InpPartialTPCount)
+   if (g_lastPartialBar != g_lastBarTime &&
+       avgMovePct >= InpPartialTPPct &&
+       total > InpPartialTPCount)
    {
       PrintFormat("[Partial TP1] move=+%.3f%% >= +%.3f%% | P&L=%.2f — closing %d best, rest → lock SL +%.2f%%",
                   avgMovePct, InpPartialTPPct, totalProfit, InpPartialTPCount, InpBELockPct);
       CloseNBest(InpPartialTPCount);
       SetRemainingToLock(InpBELockPct);
-      g_partial1Done = true;
+      g_lastPartialBar = g_lastBarTime;
       return;
    }
 
@@ -672,6 +693,48 @@ void TrySeedEntry()
    if (CountOurPositions() > 0) return;
    if (g_pauseBarsLeft > 0)     { g_pauseBarsLeft--; return; }
 
+   // ── Daily circuit breakers ────────────────────────────────────────────────
+   // Snapshot equity once per session-day (first bar inside the NY window)
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   datetime today = (datetime)StringToTime(StringFormat("%04d.%02d.%02d 00:00",
+                                           dt.year, dt.mon, dt.day));
+   if (g_sessionDate != today)
+   {
+      g_sessionDate         = today;
+      g_sessionStartEquity  = AccountInfoDouble(ACCOUNT_EQUITY);
+      g_sessionBaskets      = 0;
+      PrintFormat("[Session Reset] NY equity snapshot = %.2f", g_sessionStartEquity);
+   }
+
+   // Daily loss limit — halt if equity has dropped >= InpMaxDailyLossPct% this session
+   if (InpMaxDailyLossPct > 0 && g_sessionStartEquity > 0)
+   {
+      double lostPct = (g_sessionStartEquity - AccountInfoDouble(ACCOUNT_EQUITY))
+                       / g_sessionStartEquity * 100.0;
+      if (lostPct >= InpMaxDailyLossPct)
+      {
+         // log once per bar (not every tick) by relying on caller being newBar-gated
+         PrintFormat("[DailyStop] %.2f%% session loss >= %.2f%% limit — no new baskets today",
+                     lostPct, InpMaxDailyLossPct);
+         return;
+      }
+   }
+
+   // Session basket cap
+   if (InpMaxDailyBaskets > 0 && g_sessionBaskets >= InpMaxDailyBaskets)
+   {
+      PrintFormat("[BasketCap] %d/%d baskets used this session — skipping",
+                  g_sessionBaskets, InpMaxDailyBaskets);
+      return;
+   }
+   // ─────────────────────────────────────────────────────────────────────────
+
+   // ── Candle confirmation ──────────────────────────────────────────────────
+   // Require InpConfirmCandles consecutive same-direction M1 candles.
+   // Candle[1] is the signal bar; candle[2..N] must agree.
+   // This is the primary chop filter — in alternating markets every second
+   // candle flips, so requiring 2+ aligned candles rejects most noise entries.
+   int confirmNeeded = MathMax(1, InpConfirmCandles);
    double c  = iClose(_Symbol, PERIOD_M1, 1);
    double o  = iOpen (_Symbol, PERIOD_M1, 1);
    double hi = iHigh (_Symbol, PERIOD_M1, 1);
@@ -680,6 +743,22 @@ void TrySeedEntry()
    if (c == o) return; // doji — no direction
 
    ENUM_ORDER_TYPE dir = (c > o) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+
+   // Check candles[2..confirmNeeded] all agree with candle[1]
+   for (int k = 2; k <= confirmNeeded; k++)
+   {
+      double ck = iClose(_Symbol, PERIOD_M1, k);
+      double ok = iOpen (_Symbol, PERIOD_M1, k);
+      if (ck == ok) { PrintFormat("Skip[Confirm]: candle[%d] is doji", k); return; }
+      bool kBull = (ck > ok);
+      bool dirBull = (dir == ORDER_TYPE_BUY);
+      if (kBull != dirBull)
+      {
+         PrintFormat("Skip[Confirm]: candle[%d] disagrees — need %d consecutive %s",
+                     k, confirmNeeded, dirBull ? "BUY" : "SELL");
+         return;
+      }
+   }
 
    if (InpMinBodyPct > 0)
    {
@@ -727,17 +806,18 @@ int OnInit()
    ArrayInitialize(g_changeHistory, 0.0);
    g_historyIndex    = 0;
    g_historyCount    = 0;
-   g_consecLosses    = 0;
-   g_pauseBarsLeft   = 0;
-   g_partial1Done    = false;
-   g_reversalDone    = false;
-   g_timeExitDone    = false;
+   g_consecLosses        = 0;
+   g_pauseBarsLeft       = 0;
+   g_sessionStartEquity  = 0.0;
+   g_sessionBaskets      = 0;
+   g_sessionDate         = 0;
+   g_lastPartialBar  = 0;
    g_lossPartialDone = false;
    g_peakMovePct     = 0.0;
    g_basketBarCount  = 0;
 
    int numTrades = g_isNetting ? 1 : MathMin(InpBasketSize, 10);
-   PrintFormat("FlipTrail v2.50 | %s | Basket=%d | BasketRisk=%.1f%% (%.2f%% per trade) | "
+   PrintFormat("FlipTrail v2.60 | %s | Basket=%d | BasketRisk=%.1f%% (%.2f%% per trade) | "
                "HardSL=%.2f%% (broker) | FullExit: %.2f%% on %.0f%%+ trades | "
                "PartialTP1: +%.2f%% close %d best → lock SL +%.2f%% | "
                "Reversal: %.2f%% pullback from peak → close %d best → lock SL +%.2f%% | "
@@ -762,7 +842,7 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
-   PrintFormat("FlipTrail v2.50 deinit (reason=%d).", reason);
+   PrintFormat("FlipTrail v2.60 deinit (reason=%d).", reason);
 }
 
 void OnTick()
@@ -843,6 +923,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
          g_basketAvgEntry = 0.0;
          g_peakMovePct    = 0.0;
          g_basketBarCount = 0;
+         g_lastPartialBar = 0;
          PrintFormat("Ready for next NY signal");
       }
    }
