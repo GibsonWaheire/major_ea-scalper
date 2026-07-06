@@ -1,7 +1,7 @@
 //+------------------------------------------------------------------+
 //|  FVG_EA.mq5                                                      |
-//|  Multi-Strategy Day Trade EA v5.00                               |
-//|  M15 Entry | H4 Bias | Pure Price Action | MQL5                  |
+//|  Multi-Strategy Day Trade EA v6.00                               |
+//|  M15 Entry | H4 Bias | ICT: FVG/BOS/OB/S&R | MQL5              |
 //|                                                                  |
 //|  Entry hierarchy:                                                |
 //|   1. FVG     → 3 limit orders (level, -5p, -10p)               |
@@ -16,16 +16,17 @@
 //|   - Session ends                                                 |
 //|   - Level invalidated                                           |
 //|                                                                  |
-//|  Exit (day trade):                                               |
-//|   BE: T1+25p T2+20p T3+15p                                     |
-//|   Partial: 50% at +40p                                          |
-//|   Trail: 20p after partial                                       |
-//|   Time exit: 8 bars below BE                                    |
-//|   Min SL: 15 pips floor on all strategies                       |
-//|   Session: entries only 08:00-21:00 server time                 |
+//|  Exit (v6.00):                                                   |
+//|   Risk: 5% of equity per trade (dynamic lot sizing)             |
+//|   TP:   Hard 1:3 R:R (TP = SL distance × 3)                    |
+//|   Partial: close InpPartialClosePct% every InpPartialIntervalPips|
+//|   Trail: swing-based before first partial, tight 5p after       |
+//|   Min SL: InpSLPips pips floor, capped at InpATRMaxPips         |
+//|   Session: entries only from 08:00 server time (no Asian session)|
+//|   Works on any instrument: XAUUSD, EURUSD, GBPUSD, NAS100, etc |
 //+------------------------------------------------------------------+
-#property copyright "FVG EA v5"
-#property version   "5.00"
+#property copyright "FVG EA v6"
+#property version   "6.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -36,7 +37,7 @@
 //| INPUTS                                                           |
 //+------------------------------------------------------------------+
 input group "=== LOT & ENTRY ==="
-input double InpLotSize           = 0.5;  // Lot size (all 3 trades)
+input double InpRiskPct           = 5.0;  // Risk % of equity per trade (dynamic lot)
 input int    InpProximityPips     = 5;    // Pips from level to trigger scan
 input int    InpLimitDepth1       = 5;    // T2 limit depth into zone (pips)
 input int    InpLimitDepth2       = 10;   // T3 limit depth into zone (pips)
@@ -72,14 +73,13 @@ input int    InpSessionSLPips     = 20;   // Fixed SL for session levels (pips)
 
 input group "=== EXIT ==="
 input int    InpSLPips            = 20;   // Minimum SL pips (floor)
-input double InpATRMultiplier     = 1.5;   // ATR multiplier for SL (1.5 x ATR14)
-input int    InpATRMaxPips        = 35;    // Maximum SL pips cap
-input int    InpEarlyPartialRatio  = 25;   // Early partial at X% of SL (25=0.25R)
-input int    InpEarlyPartialPct    = 25;   // % to close at early partial (0.25R level)
-input int    InpPartialRatio       = 150;  // Main partial at X% of SL (150=1.5R)
-input int    InpPartialPct        = 50;   // % to close at main partial (1.5R level)
+input double InpATRMultiplier     = 1.5;  // ATR multiplier for SL (1.5 x ATR14)
+input int    InpATRMaxPips        = 35;   // Maximum SL pips cap
+input int    InpRRRatio           = 3;    // R:R ratio — TP = SL distance × this (1:3)
+input int    InpPartialIntervalPips = 100; // Take partial every X pips of profit
+input int    InpPartialClosePct   = 33;   // % of current volume to close at each partial
 input int    InpTrailSwingBars    = 3;    // Candles each side for trail swing detection
-input int    InpTightTrailPips    = 5;    // Tight trail on remainder after partial (pips)
+input int    InpTightTrailPips    = 5;    // Tight trail on remainder after first partial (pips)
 input int    InpInvalidPips       = 5;    // Invalidation: pips through level to cancel limits
 
 input group "=== SESSION FILTER ==="
@@ -122,11 +122,10 @@ struct TradeState
     ulong    ticket;
     int      index;
     double   entryPrice;
-    double   stopLoss;        // Current SL price
-    bool     earlyPartialDone;   // 25% early partial taken (0.5R)
-    double   earlyPartialTarget; // Entry + 0.5R
-    bool     partialDone;        // 75% main partial taken (1.5R)
-    double   partialTarget;      // Entry + 1.5R
+    double   stopLoss;           // Current SL price
+    int      partialsCount;      // Number of partials taken so far
+    double   nextPartialTarget;  // Price level of next partial
+    bool     allPartialsDone;    // True when position too small for more partials
     datetime openTime;
 };
 
@@ -186,7 +185,9 @@ int OnInit()
     ActiveSetup.isValid = false;
     ResetTradeStates();
 
-    Print("FVG EA v5 | ", _Symbol, " | PipSize=", PipSize,
+    Print("FVG EA v6 | ", _Symbol, " | PipSize=", PipSize,
+          " | Risk=", InpRiskPct, "% equity | TP=1:", InpRRRatio, " R:R",
+          " | Partials every ", InpPartialIntervalPips, "p (", InpPartialClosePct, "% each)",
           " | No-Asia mode | Trading from ", InpTradingStart, ":00");
     return INIT_SUCCEEDED;
 }
@@ -308,15 +309,19 @@ void PlaceEntry(SetupZone &sz)
 void FireT1Market(SetupZone &sz)
 {
     string names[]={"NONE","FVG","BOS","S&R","OB","SESSION"};
-    double bid    = SymbolInfoDouble(_Symbol,SYMBOL_BID);
-    double ask    = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
-    double slDist = InpSLPips * PipSize;
-    double sl     = sz.isBullish ? NormalizeDouble(ask-slDist,_Digits)
-                                 : NormalizeDouble(bid+slDist,_Digits);
+    double bid     = SymbolInfoDouble(_Symbol,SYMBOL_BID);
+    double ask     = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+    double atrPips = GetATRSlPips();
+    double slDist  = atrPips * PipSize;
+    double lot     = CalcLot(atrPips);
+    double sl      = sz.isBullish ? NormalizeDouble(ask - slDist, _Digits)
+                                  : NormalizeDouble(bid + slDist, _Digits);
+    double tp      = sz.isBullish ? NormalizeDouble(ask + InpRRRatio * slDist, _Digits)
+                                  : NormalizeDouble(bid - InpRRRatio * slDist, _Digits);
 
     ENUM_ORDER_TYPE ot = sz.isBullish ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
     string cmt = "FVG_T1";
-    bool ok = Trade.PositionOpen(_Symbol, ot, InpLotSize, 0, sl, 0, cmt);
+    bool ok = Trade.PositionOpen(_Symbol, ot, lot, 0, sl, tp, cmt);
 
     if(ok)
     {
@@ -324,7 +329,8 @@ void FireT1Market(SetupZone &sz)
         SetupActive = true;
         double fillPx = Trade.ResultPrice();
         Print("=== T1 MARKET [",names[sz.type],"] Bull=",sz.isBullish,
-              " Fill=",fillPx," SL=",sl," (",InpSLPips,"p)");
+              " Fill=",fillPx," Lot=",lot," SL=",sl," TP=",tp,
+              " (",DoubleToString(atrPips,1),"p SL | 1:",InpRRRatio," R:R | 5% risk)");
 
         // T2/T3 placed on next bar ONLY if T1 shows profit
         // See CheckT2T3Placement() called on each M15 close
@@ -343,10 +349,11 @@ void FireT1Market(SetupZone &sz)
 //+------------------------------------------------------------------+
 void PlaceT2T3Limits(bool bull, double t1Fill, double sl)
 {
-    double depth1 = InpLimitDepth1 * PipSize;
-    double depth2 = InpLimitDepth2 * PipSize;
-    double slDist = InpSLPips * PipSize;
-    double minDist= SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL)*_Point;
+    double depth1  = InpLimitDepth1 * PipSize;
+    double depth2  = InpLimitDepth2 * PipSize;
+    double atrPips = GetATRSlPips();
+    double slDist  = atrPips * PipSize;
+    double minDist = SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL)*_Point;
     double bid    = SymbolInfoDouble(_Symbol,SYMBOL_BID);
     double ask    = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
 
@@ -368,8 +375,10 @@ void PlaceT2T3Limits(bool bull, double t1Fill, double sl)
         sl2 = NormalizeDouble(price2 - slDist, _Digits);
         sl3 = NormalizeDouble(price3 - slDist, _Digits);
 
-        PlaceSingleLimit(ORDER_TYPE_BUY_LIMIT,  InpLotSize, price2, sl2, 2);
-        PlaceSingleLimit(ORDER_TYPE_BUY_LIMIT,  InpLotSize, price3, sl3, 3);
+        double tp2 = NormalizeDouble(price2 + InpRRRatio * slDist, _Digits);
+        double tp3 = NormalizeDouble(price3 + InpRRRatio * slDist, _Digits);
+        PlaceSingleLimit(ORDER_TYPE_BUY_LIMIT,  price2, sl2, tp2, 2);
+        PlaceSingleLimit(ORDER_TYPE_BUY_LIMIT,  price3, sl3, tp3, 3);
     }
     else
     {
@@ -384,8 +393,10 @@ void PlaceT2T3Limits(bool bull, double t1Fill, double sl)
         sl2 = NormalizeDouble(price2 + slDist, _Digits);
         sl3 = NormalizeDouble(price3 + slDist, _Digits);
 
-        PlaceSingleLimit(ORDER_TYPE_SELL_LIMIT, InpLotSize, price2, sl2, 2);
-        PlaceSingleLimit(ORDER_TYPE_SELL_LIMIT, InpLotSize, price3, sl3, 3);
+        double tp2 = NormalizeDouble(price2 - InpRRRatio * slDist, _Digits);
+        double tp3 = NormalizeDouble(price3 - InpRRRatio * slDist, _Digits);
+        PlaceSingleLimit(ORDER_TYPE_SELL_LIMIT, price2, sl2, tp2, 2);
+        PlaceSingleLimit(ORDER_TYPE_SELL_LIMIT, price3, sl3, tp3, 3);
     }
 
     LimitsPlaced = true;
@@ -393,17 +404,19 @@ void PlaceT2T3Limits(bool bull, double t1Fill, double sl)
     Print("T2 @ ",price2," T3 @ ",price3," (limits placed after T1 fill)");
 }
 
-bool PlaceSingleLimit(ENUM_ORDER_TYPE type, double lot,
-                      double price, double sl, int idx)
+bool PlaceSingleLimit(ENUM_ORDER_TYPE type, double price, double sl, double tp, int idx)
 {
+    double lot = CalcLot(GetATRSlPips());
     string cmt = "FVG_T" + IntegerToString(idx);
     bool res = Trade.OrderOpen(_Symbol, type, lot, 0,
                                NormalizeDouble(price,_Digits),
                                NormalizeDouble(sl,_Digits),
-                               0, ORDER_TIME_GTC, 0, cmt);
+                               NormalizeDouble(tp,_Digits),
+                               ORDER_TIME_GTC, 0, cmt);
     if(!res) Print("Limit T",idx," failed [",Trade.ResultRetcode(),"] ",
                    Trade.ResultRetcodeDescription());
-    else     Print("Limit T",idx," placed @ ",NormalizeDouble(price,_Digits));
+    else     Print("Limit T",idx," placed @ ",NormalizeDouble(price,_Digits),
+                   " TP=",NormalizeDouble(tp,_Digits)," Lot=",lot);
     return res;
 }
 
@@ -472,13 +485,14 @@ void SyncFilledTrades()
         if(found) continue;
 
         int slot=idx-1;
-        Trades[slot].ticket        = ticket;
-        Trades[slot].index         = idx;
-        Trades[slot].entryPrice    = PositionGetDouble(POSITION_PRICE_OPEN);
-        Trades[slot].stopLoss      = PositionGetDouble(POSITION_SL);
-        Trades[slot].partialDone   = false;
-        Trades[slot].partialTarget = 0;
-        Trades[slot].openTime      = TimeCurrent();
+        Trades[slot].ticket             = ticket;
+        Trades[slot].index              = idx;
+        Trades[slot].entryPrice         = PositionGetDouble(POSITION_PRICE_OPEN);
+        Trades[slot].stopLoss           = PositionGetDouble(POSITION_SL);
+        Trades[slot].partialsCount      = 0;
+        Trades[slot].nextPartialTarget  = 0;
+        Trades[slot].allPartialsDone    = false;
+        Trades[slot].openTime           = TimeCurrent();
 
         bool   bull    = (PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY);
         double entry   = Trades[slot].entryPrice;
@@ -499,35 +513,29 @@ void SyncFilledTrades()
         if(!bull && (slPx-ask) < minDist) slPx = ask + minDist + _Point;
         slPx = NormalizeDouble(slPx, _Digits);
 
-        if(Trade.PositionModify(ticket, slPx, 0))
+        // Hard 1:R TP on the position (overrides any TP set at entry for limit fills)
+        double tpPx = bull ? NormalizeDouble(entry + InpRRRatio * slDist, _Digits)
+                           : NormalizeDouble(entry - InpRRRatio * slDist, _Digits);
+        if(Trade.PositionModify(ticket, slPx, tpPx))
         {
             Trades[slot].stopLoss = slPx;
             double actualPips = MathAbs(entry-slPx)/PipSize;
-            Print("T",idx," SL=",slPx," (",DoubleToString(actualPips,1),"p from entry)");
+            double tpPips     = MathAbs(tpPx-entry)/PipSize;
+            Print("T",idx," SL=",slPx," (",DoubleToString(actualPips,1),"p)",
+                  " TP=",tpPx," (",DoubleToString(tpPips,1),"p | 1:",InpRRRatio," R:R)");
         }
 
-        // Early partial target = entry + 0.5R
-        double earlyDist = slDist * InpEarlyPartialRatio / 100.0;
-        Trades[slot].earlyPartialTarget = bull
-            ? entry + earlyDist
-            : entry - earlyDist;
-        Trades[slot].earlyPartialDone = false;
-
-        // Main partial target = entry + 1.5R
-        double partialDist = slDist * InpPartialRatio / 100.0;
-        Trades[slot].partialTarget = bull
-            ? entry + partialDist
-            : entry - partialDist;
-        Trades[slot].partialDone = false;
-
-        double earlyPips   = earlyDist / PipSize;
-        double partialPips = partialDist / PipSize;
-        Print("T",idx," Early partial @ ",
-              NormalizeDouble(Trades[slot].earlyPartialTarget,_Digits),
-              " (+",DoubleToString(earlyPips,1),"p = 0.25R)",
-              " | Main partial @ ",
-              NormalizeDouble(Trades[slot].partialTarget,_Digits),
-              " (+",DoubleToString(partialPips,1),"p = 1.5R)");
+        // Partial targets: every InpPartialIntervalPips from entry
+        double intervalDist            = InpPartialIntervalPips * PipSize;
+        Trades[slot].partialsCount     = 0;
+        Trades[slot].allPartialsDone   = false;
+        Trades[slot].nextPartialTarget = bull
+            ? entry + intervalDist
+            : entry - intervalDist;
+        Print("T",idx," First partial @ ",
+              NormalizeDouble(Trades[slot].nextPartialTarget,_Digits),
+              " (+",InpPartialIntervalPips,"p), then every ",
+              InpPartialIntervalPips,"p | ",InpPartialClosePct,"% closed each time");
 
         // First fill — activate setup and count basket
         if(!SetupActive)
@@ -683,9 +691,9 @@ void ManageTrades()
         // After partial:  tight 5p trail to lock profit aggressively
         double newSL = 0;
 
-        if(!Trades[t].partialDone)
+        if(Trades[t].partialsCount == 0)
         {
-            // Swing-based trail — only while building to partial target
+            // Swing-based trail — before first partial
             double swingSL = GetTrailSwing(bull);
             if(swingSL != 0)
             {
@@ -713,18 +721,20 @@ void ManageTrades()
 
         if(newSL != 0)
         {
-            if(Trade.PositionModify(Trades[t].ticket, newSL, 0))
+            // Preserve existing TP when moving SL
+            double curTP = PositionGetDouble(POSITION_TP);
+            if(Trade.PositionModify(Trades[t].ticket, newSL, curTP))
             {
                 Trades[t].stopLoss = newSL;
                 Print("T",Trades[t].index," Trail → ",newSL,
-                      Trades[t].partialDone ? " (tight 5p)" : " (swing)");
+                      (Trades[t].partialsCount > 0) ? " (tight 5p)" : " (swing)");
             }
         }
 
         // ── NO DIRECTION EXIT ────────────────────────────────────────
         // If trade open X bars and price hasn't moved meaningfully
         // in our direction — close it. Prevents dead money.
-        if(InpNoDirectionBars > 0 && !Trades[t].partialDone)
+        if(InpNoDirectionBars > 0 && Trades[t].partialsCount == 0)
         {
             int barsOpen = (int)((TimeCurrent() - Trades[t].openTime) / 900);
             if(barsOpen >= InpNoDirectionBars)
@@ -747,19 +757,19 @@ void ManageTrades()
             }
         }
 
-        // ── EARLY PARTIAL: close 25% at 0.5R ────────────────────────
-        if(!Trades[t].earlyPartialDone && Trades[t].earlyPartialTarget != 0)
+        // ── INTERVAL PARTIALS: close InpPartialClosePct% every InpPartialIntervalPips ──
+        if(!Trades[t].allPartialsDone && Trades[t].nextPartialTarget != 0)
         {
-            bool earlyHit = bull ? (closePx >= Trades[t].earlyPartialTarget)
-                                 : (closePx <= Trades[t].earlyPartialTarget);
-            if(earlyHit)
+            bool partialHit = bull ? (closePx >= Trades[t].nextPartialTarget)
+                                   : (closePx <= Trades[t].nextPartialTarget);
+            if(partialHit)
             {
                 double vol  = PositionGetDouble(POSITION_VOLUME);
                 double step = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
                 double minV = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
-                double cVol = MathFloor(vol*(InpEarlyPartialPct/100.0)/step)*step;
+                double cVol = MathFloor(vol * (InpPartialClosePct / 100.0) / step) * step;
                 if(cVol < minV) cVol = minV;
-                if(cVol >= vol) cVol = MathFloor((vol-minV)/step)*step;
+                if(cVol >= vol) cVol = MathFloor((vol - minV) / step) * step;
 
                 if(cVol >= minV)
                 {
@@ -767,42 +777,30 @@ void ManageTrades()
                     if(!ok) { Sleep(200); ok = Trade.PositionClosePartial(Trades[t].ticket, minV); }
                     if(ok)
                     {
-                        Trades[t].earlyPartialDone = true;
-                        double profPips = MathAbs(closePx-openPx)/PipSize;
-                        Print("T",Trades[t].index," EARLY PARTIAL 25% → ",cVol,
-                              " lots @ +",DoubleToString(profPips,1),"p (0.25R)");
-                    }
-                }
-            }
-        }
-
-        // ── MAIN PARTIAL: close 75% of remainder at 1.5R ─────────────
-        if(!Trades[t].partialDone && Trades[t].partialTarget != 0)
-        {
-            bool hit = bull ? (closePx >= Trades[t].partialTarget)
-                            : (closePx <= Trades[t].partialTarget);
-            if(hit)
-            {
-                double vol  = PositionGetDouble(POSITION_VOLUME);
-                double step = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
-                double minV = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
-                double cVol = MathFloor(vol*(InpPartialPct/100.0)/step)*step;
-                if(cVol<minV) cVol=minV;
-                if(cVol>=vol) cVol=MathFloor((vol-minV)/step)*step;
-
-                if(cVol >= minV)
-                {
-                    bool partOk = Trade.PositionClosePartial(Trades[t].ticket, cVol);
-                    if(!partOk) { Sleep(200); partOk = Trade.PositionClosePartial(Trades[t].ticket, minV); }
-                    if(partOk)
-                    {
-                        Trades[t].partialDone = true;
-                        double profPips = MathAbs(closePx-openPx)/PipSize;
-                        Print("T",Trades[t].index," MAIN PARTIAL 50% → ",cVol,
-                              " lots @ +",DoubleToString(profPips,1),"p (1.5R)");
+                        Trades[t].partialsCount++;
+                        double profPips = MathAbs(closePx - openPx) / PipSize;
+                        Print("T",Trades[t].index," PARTIAL #",Trades[t].partialsCount,
+                              " (",InpPartialClosePct,"% → ",cVol," lots) @ +",
+                              DoubleToString(profPips,1),"p (+",InpPartialIntervalPips,
+                              "p interval)");
+                        // Advance to next partial level
+                        double intervalDist = InpPartialIntervalPips * PipSize;
+                        Trades[t].nextPartialTarget = bull
+                            ? Trades[t].nextPartialTarget + intervalDist
+                            : Trades[t].nextPartialTarget - intervalDist;
                     }
                     else
-                        Print("T",Trades[t].index," partial failed — retry next bar.");
+                    {
+                        // Volume too small for another partial — stop trying
+                        Trades[t].allPartialsDone = true;
+                        Print("T",Trades[t].index," partial failed — position too small, done.");
+                    }
+                }
+                else
+                {
+                    // Lot below broker minimum — no more partials possible
+                    Trades[t].allPartialsDone = true;
+                    Print("T",Trades[t].index," volume below min lot — partial chain done.");
                 }
             }
         }
@@ -958,7 +956,37 @@ double GetATRSlPips()
 }
 
 //+------------------------------------------------------------------+
-//| NORMALISE SL — enforce min distance AND 15 pip floor            |
+//| CALC LOT — 5% equity risk based on SL distance                  |
+//| Works on any instrument: forex, gold, indices, etc.             |
+//+------------------------------------------------------------------+
+double CalcLot(double slPips)
+{
+    if(slPips <= 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+    double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
+    double riskMoney = equity * InpRiskPct / 100.0;
+    double slDist    = slPips * PipSize;
+    double tickVal   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if(tickVal <= 0 || tickSize <= 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+    // slMoney = cost of SL distance per 1 lot
+    double slMoney = (slDist / tickSize) * tickVal;
+    if(slMoney <= 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+    double lot  = riskMoney / slMoney;
+    double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    double minL = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double maxL = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    if(step <= 0) step = 0.01;
+    lot = MathFloor(lot / step) * step;
+    lot = MathMax(lot, minL);
+    lot = MathMin(lot, maxL);
+    return NormalizeDouble(lot, 2);
+}
+
+//+------------------------------------------------------------------+
+//| NORMALISE SL — enforce min distance AND pip floor               |
 //+------------------------------------------------------------------+
 double NormaliseSL(bool bull, double sl)
 {
@@ -1517,13 +1545,13 @@ void ResetTradeStates()
 {
     for(int t=0;t<3;t++)
     {
-        Trades[t].ticket=0;       Trades[t].index=0;
-        Trades[t].entryPrice=0;   Trades[t].stopLoss=0;
-        Trades[t].openTime=0;
-        Trades[t].earlyPartialDone   = false;
-        Trades[t].earlyPartialTarget = 0;
-        Trades[t].partialDone        = false;
-        Trades[t].partialTarget      = 0;
+        Trades[t].ticket             = 0;
+        Trades[t].index              = 0;
+        Trades[t].entryPrice         = 0;
+        Trades[t].stopLoss           = 0;
+        Trades[t].partialsCount      = 0;
+        Trades[t].nextPartialTarget  = 0;
+        Trades[t].allPartialsDone    = false;
         Trades[t].openTime           = 0;
     }
     InvalidCount=0;

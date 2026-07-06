@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|  FlipTrail_EA_v2.mq5  v2.20                                      |
+//|  FlipTrail_EA_v2.mq5  v2.50                                      |
 //|  HFT Basket Scalper — New York Session Only                      |
 //|                                                                   |
 //|  MECHANICS                                                        |
@@ -15,14 +15,29 @@
 //|  2. Total basket floating P&L >= InpMinBasketProfit (0=off)      |
 //|  Both must be true simultaneously to trigger basket close.       |
 //|                                                                   |
-//|  NO SL. NO TP. NO TRAILING. NO PROTECTION.                      |
-//|  GAMBLER GAMBIT — flipper by name, flipper by nature.            |
-//|  Designed for hedging accounts. NY session, high volatility.     |
+//|  v2.50 ADDITIONS (faster profit exit + progressive SL):         |
+//|  1. REVERSAL PARTIAL: track peak avg move %; if price pulls      |
+//|     back InpReversalPullbackPct% from peak while in profit       |
+//|     → close N best + tighten SL on remaining.                   |
+//|  2. TIME PARTIAL: if basket open >= InpTimeExitBars M1 bars      |
+//|     AND avg move >= InpTimeExitMinPct% → close N best.          |
+//|  3. PROGRESSIVE SL LOCK: after each partial close SL moves      |
+//|     to entry + InpBELockPct% (TP1) or InpSL2LockPct% (rev).    |
+//|                                                                   |
+//|  v2.30 FIXES (the 20% account-wipe problem):                    |
+//|  1. BASKET RISK: RiskPct% = total budget for whole basket.      |
+//|     Divided by BasketSize per trade → max exposure = RiskPct%.  |
+//|  2. HARD SL at broker on every order (InpSLFloorPct% from       |
+//|     entry). Protects against gaps and disconnections.           |
+//|  3. R:R fix: InpMinChangePct default raised to 0.13% to sit    |
+//|     above SLFloorPct (0.12%). Positive expected value.         |
+//|  4. CONSECUTIVE LOSS PAUSE: after N SL hits in a row, skip     |
+//|     X bars before re-entering. Prevents spiral losses.         |
 //+------------------------------------------------------------------+
 #property copyright "FlipTrail EA v2"
 #property link      ""
-#property version   "2.20"
-#property description "FlipTrail v2.20: HFT basket scalper — NY session, bulk close on price target, no SL"
+#property version   "2.50"
+#property description "FlipTrail v2.50: reversal partial + time-based partial + progressive SL lock"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -33,23 +48,23 @@
 //──────────────────────────────────────────────────────────────────────────────
 input group "=== Basket ==="
 input int    InpBasketSize        = 5;      // BasketSize: trades to open per signal (1–10)
-input double InpRiskPct           = 10.0;   // RiskPct: % of equity risked per trade — scales lots automatically
-input double InpMinLot            = 0.01;   // MinLot: broker floor (rarely hit at 10% risk)
-input double InpMaxLot            = 100.0;  // MaxLot: ceiling — uncapped for full gambler mode
+input double InpRiskPct           = 10.0;   // RiskPct: % of equity for the WHOLE basket (divided per trade — not multiplied)
+input double InpMinLot            = 0.01;   // MinLot: broker floor
+input double InpMaxLot            = 5.0;    // MaxLot: ceiling per trade
 input long   InpMagicNumber       = 112234; // MagicNumber (v2 = 112234)
 input int    InpMaxSlippagePoints = 30;     // MaxSlippagePoints
-input int    InpMaxSpreadPoints   = 50;     // MaxSpreadPoints: skip if spread > this (50 = safe for XAUUSD)
+input int    InpMaxSpreadPoints   = 0;      // MaxSpreadPoints: skip if spread > this (0=off — required for Deriv synthetics)
 
 input group "=== Dynamic SL ==="
 input int    InpSLHistoryTrades   = 20;     // SLHistoryTrades: look back N closed trades for avg change
-input double InpSLFloorPct        = 0.1;    // SLFloorPct: minimum SL threshold % (0.1% = tighter = bigger lots)
+input double InpSLFloorPct        = 0.12;   // SLFloorPct: minimum SL threshold % (0.12% = slight breathing room)
 
 input group "=== Basket Close Conditions ==="
-input double InpMinChangePct      = 0.02;   // MinChangePct: min % price move from entry per trade to qualify
+input double InpMinChangePct      = 0.13;   // MinChangePct: min % price move from entry per trade to qualify (keep ≥ SLFloorPct for positive R:R)
 input double InpMinQualifiedPct   = 50.0;   // MinQualifiedPct: close basket when X% of trades are qualified
 input double InpMinBasketProfit   = 0.0;    // MinBasketProfit: min total basket $ P&L to close (0=off)
-//  Example at InpMinChangePct=0.02: XAUUSD @ 3900 → trade must move 0.78 pts ($0.78 per 0.01 lot)
-//  Basket of 5 trades: closes when 3+ trades (60%) each moved 0.02%+ AND total P&L positive.
+//  R:R: InpMinChangePct (TP) vs InpSLFloorPct (SL). Default 0.13/0.12 ≈ 1.08:1.
+//  At 80% win rate: E[V] = 0.8×0.13% − 0.2×0.12% = +0.08% per basket (was −0.008% in v2.20).
 
 input group "=== Candle Body Filter ==="
 input int    InpMinBodyPct        = 30;     // MinBodyPct: min body as % of bar range (0=off)
@@ -59,6 +74,32 @@ input int    InpNYStartHour       = 13;     // NYStartHour: server time (13 = NY
 input int    InpNYEndHour         = 22;     // NYEndHour: server time (22 = NY close)
 //  High volatility window: 13:00–16:00 (NY open overlap) and 14:30–16:00 (US data releases).
 //  EA runs the full window. Adjust hours to focus on specific spikes.
+
+input group "=== Consecutive Loss Pause ==="
+input int    InpMaxConsecLosses   = 2;      // MaxConsecLosses: SL hits in a row before pause (0=off)
+input int    InpPauseBars         = 5;      // PauseBars: M1 bars to skip after consecutive losses hit
+
+input group "=== Partial Close — Profit ==="
+input double InpPartialTPPct      = 0.08;   // PartialTPPct: avg basket move % to trigger partial profit close
+input int    InpPartialTPCount    = 2;      // PartialTPCount: how many trades to close at partial TP
+
+input group "=== Reversal Partial Close ==="
+input double InpReversalPullbackPct = 0.04; // ReversalPullbackPct: % pullback from peak avg move to trigger partial (0=off)
+input int    InpReversalCount       = 2;    // ReversalCount: trades to close on reversal signal
+
+input group "=== Time-Based Partial Close ==="
+input int    InpTimeExitBars      = 8;      // TimeExitBars: M1 bars open before time exit check (0=off)
+input double InpTimeExitMinPct    = 0.05;   // TimeExitMinPct: min avg move % required for time exit
+input int    InpTimeExitCount     = 2;      // TimeExitCount: trades to close on time exit
+
+input group "=== Progressive SL Lock After Partial ==="
+input double InpBELockPct         = 0.02;   // BELockPct: SL lock % above entry after TP1 or time exit (0=exact BE)
+input double InpSL2LockPct        = 0.04;   // SL2LockPct: SL lock % above entry after reversal partial (tighter)
+
+input group "=== Partial Close — Loss Management ==="
+input double InpLossWatchPct      = 0.08;   // LossWatchPct: adverse avg move % to start watching
+input int    InpLossPartialCount  = 2;      // LossPartialCount: worst trades to cut when no reversal
+input int    InpDojiBodyPct       = 25;     // DojiBodyPct: max body % of range to qualify as doji (reversal hold)
 
 //──────────────────────────────────────────────────────────────────────────────
 // STATE
@@ -77,6 +118,22 @@ double          g_basketAvgEntry = 0.0;   // average entry price of current bask
 double g_changeHistory[];
 int    g_historyIndex = 0;
 int    g_historyCount = 0;
+
+// Consecutive loss pause
+int g_consecLosses  = 0;
+int g_pauseBarsLeft = 0;
+
+// Partial close flags — reset on every new basket
+bool g_partial1Done    = false; // profit partial (TP1) already fired
+bool g_reversalDone    = false; // reversal pullback partial already fired
+bool g_timeExitDone    = false; // time-based partial already fired
+bool g_lossPartialDone = false; // loss cut already fired
+
+// Peak tracking — highest avg move % seen during this basket
+double g_peakMovePct   = 0.0;
+
+// Time tracking — M1 bars elapsed since basket opened
+int    g_basketBarCount = 0;
 
 //──────────────────────────────────────────────────────────────────────────────
 // UTILITY
@@ -147,7 +204,13 @@ void CloseAllOurPositions(const string reason)
    }
 
    PrintFormat("[Basket] CloseAll [%s] | %d positions closed", reason, total);
-   g_basketOpen = false;
+   g_basketOpen       = false;
+   g_partial1Done     = false;
+   g_reversalDone     = false;
+   g_timeExitDone     = false;
+   g_lossPartialDone  = false;
+   g_peakMovePct      = 0.0;
+   g_basketBarCount   = 0;
 }
 
 //──────────────────────────────────────────────────────────────────────────────
@@ -177,10 +240,11 @@ double CalcDynamicLot()
    int    slPts   = (int)MathRound(threshold / 100.0 * price / _Point);
    if (slPts <= 0) return NormalizeLot(InpMinLot);
 
-   double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
-   double riskMoney = equity * InpRiskPct / 100.0;
-   double tickVal   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double equity      = AccountInfoDouble(ACCOUNT_EQUITY);
+   int    numTrades   = g_isNetting ? 1 : MathMax(1, MathMin(InpBasketSize, 10));
+   double riskMoney   = (equity * InpRiskPct / 100.0) / numTrades; // basket risk split equally per trade
+   double tickVal     = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize    = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    if (tickVal <= 0 || tickSize <= 0) return NormalizeLot(InpMinLot);
 
    double slMoney = (slPts * _Point / tickSize) * tickVal;
@@ -194,7 +258,8 @@ double CalcDynamicLot()
 
 //──────────────────────────────────────────────────────────────────────────────
 // OpenBasket
-// Fires InpBasketSize trades at market with no SL and no TP.
+// Fires InpBasketSize trades at market with a hard broker-level SL on each.
+// SL price = entry ± InpSLFloorPct%. Protects against gaps and disconnections.
 // On netting accounts: opens 1 large trade (basket behavior not possible).
 //──────────────────────────────────────────────────────────────────────────────
 void OpenBasket(ENUM_ORDER_TYPE dir)
@@ -222,19 +287,43 @@ void OpenBasket(ENUM_ORDER_TYPE dir)
       double bid = g_sym.Bid();
       bool   ok  = false;
 
+      // Hard SL at broker level: SL distance = InpSLFloorPct% of price.
+      // If broker rejects (10016 invalid stops — common on Deriv synthetics with
+      // large minimum stop levels), retry without SL. Soft DynSL in CheckBasketClose
+      // handles the exit in that case.
+      double slDist  = ask * InpSLFloorPct / 100.0;
+      double slPrice;
       if (dir == ORDER_TYPE_BUY)
-         ok = g_trade.Buy(lot, _Symbol, ask, 0, 0, "FTV2-HFT");
+      {
+         slPrice = NormalizeDouble(ask - slDist, _Digits);
+         ok = g_trade.Buy(lot, _Symbol, ask, slPrice, 0, "FTV2-HFT");
+      }
       else
-         ok = g_trade.Sell(lot, _Symbol, bid, 0, 0, "FTV2-HFT");
+      {
+         slDist  = bid * InpSLFloorPct / 100.0;
+         slPrice = NormalizeDouble(bid + slDist, _Digits);
+         ok = g_trade.Sell(lot, _Symbol, bid, slPrice, 0, "FTV2-HFT");
+      }
+
+      // Retry without SL if broker rejects the stop level
+      if (g_trade.ResultRetcode() == TRADE_RETCODE_INVALID_STOPS)
+      {
+         PrintFormat("[SL Fallback] Broker rejected hard SL=%.5f — retrying without SL (soft DynSL active)", slPrice);
+         slPrice = 0.0;
+         if (dir == ORDER_TYPE_BUY)
+            ok = g_trade.Buy(lot, _Symbol, ask, 0, 0, "FTV2-HFT");
+         else
+            ok = g_trade.Sell(lot, _Symbol, bid, 0, 0, "FTV2-HFT");
+      }
 
       uint rc = g_trade.ResultRetcode();
-      PrintResult(StringFormat("[%s] HFT %s t=%d/%d lot=%.2f",
-                  _Symbol, (dir==ORDER_TYPE_BUY?"BUY":"SELL"), t+1, tradesTarget, lot));
+      PrintResult(StringFormat("[%s] HFT %s t=%d/%d lot=%.2f SL=%.5f",
+                  _Symbol, (dir==ORDER_TYPE_BUY?"BUY":"SELL"), t+1, tradesTarget, lot, slPrice));
 
       if (rc == TRADE_RETCODE_DONE)
       {
          opened++;
-         entrySum += (dir == ORDER_TYPE_BUY) ? g_sym.Ask() : g_sym.Bid();
+         entrySum += g_trade.ResultPrice(); // actual fill price — not re-read ask/bid which may have moved
       }
       else if (rc == TRADE_RETCODE_REQUOTE      ||
                rc == TRADE_RETCODE_PRICE_CHANGED ||
@@ -251,7 +340,13 @@ void OpenBasket(ENUM_ORDER_TYPE dir)
    {
       g_basketDir      = dir;
       g_basketOpen     = true;
-      g_basketAvgEntry = (opened > 0) ? entrySum / opened : 0.0;
+      g_basketAvgEntry = entrySum / opened;
+      g_peakMovePct    = 0.0;
+      g_basketBarCount = 0;
+      g_partial1Done   = false;
+      g_reversalDone   = false;
+      g_timeExitDone   = false;
+      g_lossPartialDone= false;
       double thresh    = GetDynamicThreshold();
       PrintFormat("[Basket OPEN] %s | %d/%d trades | %.2f lot each | DynSL=%.2f%% (floor=%.1f%%) | target: %.2f%% on %.0f%%+ trades",
                   (dir==ORDER_TYPE_BUY?"BUY":"SELL"), opened, tradesTarget, lot,
@@ -260,14 +355,166 @@ void OpenBasket(ENUM_ORDER_TYPE dir)
 }
 
 //──────────────────────────────────────────────────────────────────────────────
+// CloseNBest — close N most profitable positions (lock in gains)
+//──────────────────────────────────────────────────────────────────────────────
+void CloseNBest(int n)
+{
+   ulong  tickets[];
+   double profits[];
+   int    total = 0;
+
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if (!g_pos.SelectByIndex(i))                 continue;
+      if (g_pos.Magic()  != (ulong)InpMagicNumber) continue;
+      if (g_pos.Symbol() != _Symbol)               continue;
+      ArrayResize(tickets, total + 1);
+      ArrayResize(profits, total + 1);
+      tickets[total] = g_pos.Ticket();
+      profits[total] = g_pos.Profit();
+      total++;
+   }
+
+   // Sort descending — best P&L first
+   for (int a = 0; a < total - 1; a++)
+      for (int b = a + 1; b < total; b++)
+         if (profits[b] > profits[a])
+         {
+            double tp = profits[a]; profits[a] = profits[b]; profits[b] = tp;
+            ulong  tt = tickets[a]; tickets[a] = tickets[b]; tickets[b] = tt;
+         }
+
+   int closeCount = MathMin(n, total);
+   for (int j = 0; j < closeCount; j++)
+      for (int attempt = 0; attempt < 3; attempt++)
+      {
+         if (g_trade.PositionClose(tickets[j], InpMaxSlippagePoints)) break;
+         Sleep(50);
+      }
+   PrintFormat("[CloseNBest] %d positions closed", closeCount);
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// CloseNWorst — close N least profitable positions (cut dead weight)
+//──────────────────────────────────────────────────────────────────────────────
+void CloseNWorst(int n)
+{
+   ulong  tickets[];
+   double profits[];
+   int    total = 0;
+
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if (!g_pos.SelectByIndex(i))                 continue;
+      if (g_pos.Magic()  != (ulong)InpMagicNumber) continue;
+      if (g_pos.Symbol() != _Symbol)               continue;
+      ArrayResize(tickets, total + 1);
+      ArrayResize(profits, total + 1);
+      tickets[total] = g_pos.Ticket();
+      profits[total] = g_pos.Profit();
+      total++;
+   }
+
+   // Sort ascending — worst P&L first
+   for (int a = 0; a < total - 1; a++)
+      for (int b = a + 1; b < total; b++)
+         if (profits[b] < profits[a])
+         {
+            double tp = profits[a]; profits[a] = profits[b]; profits[b] = tp;
+            ulong  tt = tickets[a]; tickets[a] = tickets[b]; tickets[b] = tt;
+         }
+
+   int closeCount = MathMin(n, total);
+   for (int j = 0; j < closeCount; j++)
+      for (int attempt = 0; attempt < 3; attempt++)
+      {
+         if (g_trade.PositionClose(tickets[j], InpMaxSlippagePoints)) break;
+         Sleep(50);
+      }
+   PrintFormat("[CloseNWorst] %d positions cut", closeCount);
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// SetRemainingToLock
+// Move SL on all open positions to entry ± lockPct% in profit direction.
+// lockPct=0 → exact breakeven. lockPct=0.02 → 0.02% profit buffer locked in.
+// Only moves SL in the improving direction — never pulls back a tighter SL.
+//──────────────────────────────────────────────────────────────────────────────
+void SetRemainingToLock(double lockPct)
+{
+   int moved = 0;
+
+   // Broker minimum stop distance — SL must be at least this many points from current price
+   long   stopLevelPts = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double stopLevelDist = stopLevelPts * _Point;
+
+   g_sym.RefreshRates();
+
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if (!g_pos.SelectByIndex(i))                 continue;
+      if (g_pos.Magic()  != (ulong)InpMagicNumber) continue;
+      if (g_pos.Symbol() != _Symbol)               continue;
+
+      double entry    = g_pos.PriceOpen();
+      double lockDist = entry * lockPct / 100.0;
+      double newSL;
+
+      if (g_pos.PositionType() == POSITION_TYPE_BUY)
+      {
+         newSL = NormalizeDouble(entry + lockDist, _Digits);
+         // Enforce broker minimum stop distance from current bid
+         double minAllowed = g_sym.Bid() - stopLevelDist;
+         if (newSL > minAllowed)
+         {
+            PrintFormat("[LockSL] BUY ticket=%llu newSL=%.5f violates stop level (min=%.5f) — clamping",
+                        g_pos.Ticket(), newSL, minAllowed);
+            newSL = NormalizeDouble(minAllowed, _Digits);
+         }
+         // Only move SL if it improves (moves up) — never pull back a tighter SL
+         if (g_pos.StopLoss() >= newSL - _Point) continue;
+      }
+      else
+      {
+         newSL = NormalizeDouble(entry - lockDist, _Digits);
+         // Enforce broker minimum stop distance from current ask
+         double minAllowed = g_sym.Ask() + stopLevelDist;
+         if (newSL < minAllowed)
+         {
+            PrintFormat("[LockSL] SELL ticket=%llu newSL=%.5f violates stop level (min=%.5f) — clamping",
+                        g_pos.Ticket(), newSL, minAllowed);
+            newSL = NormalizeDouble(minAllowed, _Digits);
+         }
+         // Only move SL if it improves (moves down) — never pull back a tighter SL
+         if (g_pos.StopLoss() > 0 && g_pos.StopLoss() <= newSL + _Point) continue;
+      }
+
+      if (g_trade.PositionModify(g_pos.Ticket(), newSL, g_pos.TakeProfit()))
+         moved++;
+      else
+         PrintFormat("[LockSL] FAILED ticket=%llu newSL=%.5f rc=%u (%s)",
+                     g_pos.Ticket(), newSL, g_trade.ResultRetcode(),
+                     g_trade.ResultRetcodeDescription());
+   }
+   if (moved > 0)
+      PrintFormat("[LockSL] %d positions SL locked at entry+%.2f%%", moved, lockPct);
+}
+
+//──────────────────────────────────────────────────────────────────────────────
 // CheckBasketClose — called every tick
-// Scans all basket positions for price change vs entry.
-// Closes everything when InpMinQualifiedPct% of trades hit InpMinChangePct% move.
+// Priority order:
+//   1. Dynamic SL (loss protection)         — close all
+//   2. Peak update
+//   3. Reversal partial (peak pullback)     — close N best + tighten SL
+//   4. Time-based partial                   — close N best + lock SL
+//   5. Profit partial TP1                   — close N best + lock SL
+//   6. Loss management (doji hold / cut)    — cut N worst
+//   7. Full profit exit                     — close all
 //──────────────────────────────────────────────────────────────────────────────
 void CheckBasketClose()
 {
    int total = CountOurPositions();
-   if (total == 0) { g_basketOpen = false; return; }
+   if (total == 0) { g_basketOpen = false; g_partial1Done = false; g_reversalDone = false; g_timeExitDone = false; g_lossPartialDone = false; return; }
 
    g_sym.RefreshRates();
    double ask = g_sym.Ask();
@@ -295,33 +542,122 @@ void CheckBasketClose()
       totalProfit += g_pos.Profit();
    }
 
+   // Basket avg move from avg entry price
+   double avgMovePct = 0.0;
+   if (g_basketAvgEntry > 0)
+   {
+      double currentPrice = (g_basketDir == ORDER_TYPE_BUY) ? bid : ask;
+      avgMovePct = (g_basketDir == ORDER_TYPE_BUY)
+                   ? (currentPrice - g_basketAvgEntry) / g_basketAvgEntry * 100.0
+                   : (g_basketAvgEntry - currentPrice) / g_basketAvgEntry * 100.0;
+   }
+
+   // ── 1. DYNAMIC SL — soft backup (broker hard SL is primary) ──────────────
+   if (g_basketAvgEntry > 0 && avgMovePct <= -GetDynamicThreshold())
+   {
+      PrintFormat("[Basket DynSL] move=%.3f%% <= -%.3f%% | P&L=%.2f — SL hit",
+                  avgMovePct, GetDynamicThreshold(), totalProfit);
+      CloseAllOurPositions("DynSL");
+      return;
+   }
+
+   // ── 2. PEAK TRACKING ─────────────────────────────────────────────────────
+   if (avgMovePct > g_peakMovePct)
+      g_peakMovePct = avgMovePct;
+
+   // ── 3. REVERSAL PARTIAL — peak pullback detection ─────────────────────────
+   // Fires when: (a) not yet done, (b) peak reached meaningful profit,
+   // (c) price has pulled back >= ReversalPullbackPct% from that peak,
+   // (d) still above zero (don't cut a basket that's already gone negative).
+   if (InpReversalPullbackPct > 0 &&
+       !g_reversalDone &&
+       g_peakMovePct >= InpPartialTPPct &&
+       (g_peakMovePct - avgMovePct) >= InpReversalPullbackPct &&
+       avgMovePct > 0 &&        // price is still above avg entry — don't cut a losing basket
+       total > InpReversalCount)
+   {
+      PrintFormat("[Reversal Partial] peak=+%.3f%% pulled back to +%.3f%% (Δ=%.3f%% >= %.3f%%) | P&L=%.2f — closing %d best + tighten SL to +%.2f%%",
+                  g_peakMovePct, avgMovePct, g_peakMovePct - avgMovePct,
+                  InpReversalPullbackPct, totalProfit, InpReversalCount, InpSL2LockPct);
+      CloseNBest(InpReversalCount);
+      SetRemainingToLock(InpSL2LockPct);
+      g_reversalDone = true;
+      return;
+   }
+
+   // ── 4. TIME-BASED PARTIAL ─────────────────────────────────────────────────
+   // Fires when basket has lingered >= InpTimeExitBars and is in profit.
+   if (InpTimeExitBars > 0 &&
+       !g_timeExitDone &&
+       g_basketBarCount >= InpTimeExitBars &&
+       avgMovePct >= InpTimeExitMinPct &&  // price move % is the gate — not broker floating P&L (spread distorts it)
+       total > InpTimeExitCount)
+   {
+      PrintFormat("[Time Partial] %d bars open | move=+%.3f%% >= +%.3f%% | P&L=%.2f — closing %d best + lock SL to +%.2f%%",
+                  g_basketBarCount, avgMovePct, InpTimeExitMinPct,
+                  totalProfit, InpTimeExitCount, InpBELockPct);
+      CloseNBest(InpTimeExitCount);
+      SetRemainingToLock(InpBELockPct);
+      g_timeExitDone = true;
+      return;
+   }
+
+   // ── 5. PARTIAL CLOSE — PROFIT (TP1) ───────────────────────────────────────
+   // When basket has moved +InpPartialTPPct% in our favour: close best N trades,
+   // lock remaining SL at entry + InpBELockPct%. Fires once per basket.
+   if (!g_partial1Done && avgMovePct >= InpPartialTPPct && total > InpPartialTPCount)
+   {
+      PrintFormat("[Partial TP1] move=+%.3f%% >= +%.3f%% | P&L=%.2f — closing %d best, rest → lock SL +%.2f%%",
+                  avgMovePct, InpPartialTPPct, totalProfit, InpPartialTPCount, InpBELockPct);
+      CloseNBest(InpPartialTPCount);
+      SetRemainingToLock(InpBELockPct);
+      g_partial1Done = true;
+      return;
+   }
+
+   // ── 6. LOSS MANAGEMENT — doji hold / no-reversal cut ─────────────────────
+   // Fires once per basket when basket is down InpLossWatchPct%.
+   // Reads the last closed M1 bar to determine market intent.
+   if (!g_lossPartialDone && avgMovePct <= -InpLossWatchPct && totalProfit < 0)
+   {
+      double c     = iClose(_Symbol, PERIOD_M1, 1);
+      double o     = iOpen (_Symbol, PERIOD_M1, 1);
+      double hi    = iHigh (_Symbol, PERIOD_M1, 1);
+      double lo    = iLow  (_Symbol, PERIOD_M1, 1);
+      double range = hi - lo;
+      double body  = MathAbs(c - o);
+
+      bool isDoji      = (range > 0 && (body / range) * 100.0 < (double)InpDojiBodyPct);
+      bool isAgainstUs = (g_basketDir == ORDER_TYPE_BUY) ? (c < o) : (c > o);
+
+      if (isDoji)
+      {
+         // Indecision candle — possible reversal, hold the basket
+         PrintFormat("[Loss Hold] Doji (body=%.0f%% < %d%%) — holding, watching for reversal | move=%.3f%% | P&L=%.2f",
+                     (range > 0 ? body / range * 100.0 : 0.0), InpDojiBodyPct, avgMovePct, totalProfit);
+         // Note: g_lossPartialDone stays false so we re-check next bar
+      }
+      else if (isAgainstUs)
+      {
+         // Strong candle going further against us — cut worst trades now
+         PrintFormat("[Loss Cut] Strong candle against basket (body=%.0f%%) | move=%.3f%% | P&L=%.2f — cutting %d worst",
+                     (range > 0 ? body / range * 100.0 : 0.0), avgMovePct, totalProfit, InpLossPartialCount);
+         CloseNWorst(InpLossPartialCount);
+         g_lossPartialDone = true;
+         return;
+      }
+   }
+
+   // ── 7. FULL PROFIT EXIT ───────────────────────────────────────────────────
    double qualifiedRatio = (double)qualified / total * 100.0;
    bool   profitOK       = (InpMinBasketProfit <= 0.0 || totalProfit >= InpMinBasketProfit);
 
-   // Profit exit — unchanged
    if (qualifiedRatio >= InpMinQualifiedPct && profitOK)
    {
       PrintFormat("[Basket Target] %d/%d qualified (%.0f%% >= %.0f%%) | P&L=%.2f — closing basket",
                   qualified, total, qualifiedRatio, InpMinQualifiedPct, totalProfit);
       CloseAllOurPositions("Target");
       return;
-   }
-
-   // Dynamic SL — close if basket moves against us by threshold%
-   if (g_basketAvgEntry > 0)
-   {
-      double dynamicThresh = GetDynamicThreshold();
-      double currentPrice  = (g_basketDir == ORDER_TYPE_BUY) ? bid : ask;
-      double changePct     = (g_basketDir == ORDER_TYPE_BUY)
-                             ? (currentPrice - g_basketAvgEntry) / g_basketAvgEntry * 100.0
-                             : (g_basketAvgEntry - currentPrice) / g_basketAvgEntry * 100.0;
-
-      if (changePct <= -dynamicThresh)
-      {
-         PrintFormat("[Basket DynSL] change=%.3f%% <= -%.3f%% | P&L=%.2f | history=%d trades — SL hit",
-                     changePct, dynamicThresh, totalProfit, g_historyCount);
-         CloseAllOurPositions("DynSL");
-      }
    }
 }
 
@@ -334,6 +670,7 @@ void TrySeedEntry()
    if (!IsNYSession())          return;
    if (g_basketOpen)            return;
    if (CountOurPositions() > 0) return;
+   if (g_pauseBarsLeft > 0)     { g_pauseBarsLeft--; return; }
 
    double c  = iClose(_Symbol, PERIOD_M1, 1);
    double o  = iOpen (_Symbol, PERIOD_M1, 1);
@@ -388,18 +725,36 @@ int OnInit()
 
    ArrayResize(g_changeHistory, InpSLHistoryTrades);
    ArrayInitialize(g_changeHistory, 0.0);
-   g_historyIndex = 0;
-   g_historyCount = 0;
+   g_historyIndex    = 0;
+   g_historyCount    = 0;
+   g_consecLosses    = 0;
+   g_pauseBarsLeft   = 0;
+   g_partial1Done    = false;
+   g_reversalDone    = false;
+   g_timeExitDone    = false;
+   g_lossPartialDone = false;
+   g_peakMovePct     = 0.0;
+   g_basketBarCount  = 0;
 
-   PrintFormat("FlipTrail v2.20 HFT | %s | Basket=%d | Risk=%.1f%% lot min=%.2f max=%.2f | "
-               "Profit exit: %.2f%% on %.0f%%+ trades | "
-               "DynSL: avg of last %d trades, floor=%.1f%% | "
-               "NY Session %d:00–%d:00 | Magic=%lld",
-               _Symbol,
-               g_isNetting ? 1 : MathMin(InpBasketSize, 10),
-               InpRiskPct, InpMinLot, InpMaxLot,
+   int numTrades = g_isNetting ? 1 : MathMin(InpBasketSize, 10);
+   PrintFormat("FlipTrail v2.50 | %s | Basket=%d | BasketRisk=%.1f%% (%.2f%% per trade) | "
+               "HardSL=%.2f%% (broker) | FullExit: %.2f%% on %.0f%%+ trades | "
+               "PartialTP1: +%.2f%% close %d best → lock SL +%.2f%% | "
+               "Reversal: %.2f%% pullback from peak → close %d best → lock SL +%.2f%% | "
+               "Time: %d bars + %.2f%% → close %d best → lock SL +%.2f%% | "
+               "LossWatch: -%.2f%% → doji=hold / strong=cut %d worst | DojiBody<%d%% | "
+               "DynSL floor=%.2f%% | ConsecPause: %d losses → %d bars | "
+               "NY %d:00–%d:00 | Magic=%lld",
+               _Symbol, numTrades,
+               InpRiskPct, InpRiskPct / numTrades,
+               InpSLFloorPct,
                InpMinChangePct, InpMinQualifiedPct,
-               InpSLHistoryTrades, InpSLFloorPct,
+               InpPartialTPPct, InpPartialTPCount, InpBELockPct,
+               InpReversalPullbackPct, InpReversalCount, InpSL2LockPct,
+               InpTimeExitBars, InpTimeExitMinPct, InpTimeExitCount, InpBELockPct,
+               InpLossWatchPct, InpLossPartialCount, InpDojiBodyPct,
+               InpSLFloorPct,
+               InpMaxConsecLosses, InpPauseBars,
                InpNYStartHour, InpNYEndHour, InpMagicNumber);
 
    return INIT_SUCCEEDED;
@@ -407,7 +762,7 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
-   PrintFormat("FlipTrail v2.20 deinit (reason=%d).", reason);
+   PrintFormat("FlipTrail v2.50 deinit (reason=%d).", reason);
 }
 
 void OnTick()
@@ -415,6 +770,10 @@ void OnTick()
    datetime bt     = iTime(_Symbol, PERIOD_M1, 0);
    bool     newBar = (bt != 0 && bt != g_lastBarTime);
    if (newBar) g_lastBarTime = bt;
+
+   // Increment bar counter while a basket is active
+   if (newBar && g_basketOpen)
+      g_basketBarCount++;
 
    CheckBasketClose(); // every tick — instant exit when target hit
 
@@ -457,12 +816,33 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
             g_historyIndex++;
             g_historyCount = MathMin(g_historyCount + 1, InpSLHistoryTrades);
 
-            PrintFormat("Basket closed | change=%.3f%% | DynSL history updated: avg=%.3f%% (%d trades)",
-                        changePct, GetDynamicThreshold(), g_historyCount);
+            // Consecutive loss pause tracking
+            if (changePct < 0)
+            {
+               g_consecLosses++;
+               if (InpMaxConsecLosses > 0 && g_consecLosses >= InpMaxConsecLosses)
+               {
+                  g_pauseBarsLeft = InpPauseBars;
+                  g_consecLosses  = 0;
+                  PrintFormat("Basket closed | change=%.3f%% [LOSS] | %d consec losses — pausing %d bars | DynSL avg=%.3f%%",
+                              changePct, InpMaxConsecLosses, InpPauseBars, GetDynamicThreshold());
+               }
+               else
+                  PrintFormat("Basket closed | change=%.3f%% [LOSS] | consec=%d/%d | DynSL avg=%.3f%%",
+                              changePct, g_consecLosses, InpMaxConsecLosses, GetDynamicThreshold());
+            }
+            else
+            {
+               g_consecLosses = 0;
+               PrintFormat("Basket closed | change=%.3f%% [PROFIT] | consec reset | DynSL avg=%.3f%% (%d trades)",
+                           changePct, GetDynamicThreshold(), g_historyCount);
+            }
          }
 
          g_basketOpen     = false;
          g_basketAvgEntry = 0.0;
+         g_peakMovePct    = 0.0;
+         g_basketBarCount = 0;
          PrintFormat("Ready for next NY signal");
       }
    }

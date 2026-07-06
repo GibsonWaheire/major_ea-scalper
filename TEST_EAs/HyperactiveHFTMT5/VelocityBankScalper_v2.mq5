@@ -33,10 +33,10 @@ input group "===== Trend Filter (EMA) ====="
 input int    InpEmaPeriod       = 50;     // EMA period on M5
 input double InpEmaBufferPts    = 3.0;    // Price must be >= X pts beyond EMA
 
-input group "===== RSI Guard ====="
+input group "===== RSI Momentum Confirm ====="
 input int    InpRsiPeriod       = 14;
-input double InpRsiBuyMax       = 65.0;   // Don't buy above this RSI (overbought)
-input double InpRsiSellMin      = 35.0;   // Don't sell below this RSI (oversold)
+input double InpRsiBuyMin       = 50.0;   // Buy only when RSI > this (momentum bullish)
+input double InpRsiSellMax      = 50.0;   // Sell only when RSI < this (momentum bearish)
 
 input group "===== Tick Velocity ====="
 input int    InpVelLookback     = 12;     // Snapshot depth
@@ -176,7 +176,7 @@ int OnInit()
    Print("Risk/trade: ", InpRiskPct, "%  Min:", InpMinLot, " Max:", InpMaxLot);
    Print("SL/TP     : ", InpAtrSlMult, "x ATR / ", InpAtrTpMult, "x ATR (", DoubleToString(InpAtrTpMult/InpAtrSlMult,1), ":1 R:R)");
    Print("EMA filter: ", InpEmaPeriod, " period, buffer=", InpEmaBufferPts, " pts");
-   Print("RSI guard : buy<=", InpRsiBuyMax, "  sell>=", InpRsiSellMin);
+   Print("RSI confirm: buy>", InpRsiBuyMin, "  sell<", InpRsiSellMax);
    Print("Cooldown  : ", InpCooldownSec, "s per symbol");
    Print("==============================================");
    return INIT_SUCCEEDED;
@@ -349,8 +349,7 @@ void TryEntry(SymState &s)
    if(s.atrPts <= 0.0 || s.emaVal <= 0.0) return;
    if(s.filled < InpVelLookback) return;
 
-   // Session gate — applies in live AND tester
-   if(!SessionAllows()) return;
+   // Session gate removed — trades 24/7
 
    // ATR range
    if(s.atrPts < InpAtrMin || s.atrPts > InpAtrMax) return;
@@ -383,9 +382,9 @@ void TryEntry(SymState &s)
    if(velDir ==  1 && !emaUp)   return;  // velocity up but price below EMA
    if(velDir == -1 && !emaDown) return;  // velocity down but price above EMA
 
-   // RSI guard — avoid buying into overbought / selling into oversold
-   if(velDir ==  1 && s.rsiVal > InpRsiBuyMax)  return;
-   if(velDir == -1 && s.rsiVal < InpRsiSellMin) return;
+   // RSI momentum confirm — only enter when RSI agrees with direction
+   if(velDir ==  1 && s.rsiVal < InpRsiBuyMin)  return;
+   if(velDir == -1 && s.rsiVal > InpRsiSellMax) return;
 
    // Max open positions per symbol
    if(CountOpenForSymbol(s.sym) >= InpMaxOpenPerSym) return;

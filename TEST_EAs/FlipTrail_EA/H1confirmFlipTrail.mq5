@@ -1,27 +1,24 @@
 //+------------------------------------------------------------------+
-//|  H1confirmFlipTrail.mq5  v3.10                                   |
+//|  H1confirmFlipTrail.mq5  v3.13                                   |
 //|  Pullback-confirmation entry + dynamic lot sizing                 |
 //|                                                                   |
-//|  WHAT CHANGED FROM v3                                            |
-//|  ──────────────────────                                          |
-//|  Entry signal redesigned (TrySeedEntry):                         |
-//|  OLD: single M1 candle body filter (noisy on M1)                 |
-//|  NEW: pullback-confirmation pattern —                            |
-//|       2+ opposite candles (pullback) then 2 same-direction       |
-//|       candles (reversal + confirmation) in H1 trend direction    |
+//|  WHAT CHANGED IN v3.11                                           |
+//|  ─────────────────────                                           |
+//|  Loosened entry filter in ScorePullbackSetup:                    |
+//|  v3.10: required BOTH candle[1] AND candle[2] in direction       |
+//|         (4+ candle sequence: too rare on live M1 XAUUSD)         |
+//|  v3.11: only candle[1] MUST be in direction (hard requirement)   |
+//|         candle[2] in direction gives +25 score bonus (more lot)  |
+//|         → more entries, candle[2] alignment rewarded with size   |
 //|                                                                   |
-//|  Dynamic lot sizing (ScorePullbackSetup → CalcDynamicLot):       |
-//|  Score 0-100 based on pullback depth, candle count,              |
-//|  reversal candle body%, confirmation candle body%                |
-//|  Lot = InpMinLot + (InpMaxLot - InpMinLot) × score/100          |
-//|                                                                   |
-//|  SAME AS v3                                                      |
-//|  Retest-limit flip, peak lock, H1 filter, progressive trail     |
+//|  SAME AS v3.10                                                   |
+//|  Retest-limit flip, peak lock, H1 filter, progressive trail,    |
+//|  dynamic lot from pullback score                                  |
 //+------------------------------------------------------------------+
 #property copyright "FlipTrail EA"
 #property link      ""
-#property version   "3.10"
-#property description "H1confirmFlipTrail v3.10: pullback entry + dynamic lot + retest-limit flip"
+#property version   "3.13"
+#property description "H1confirmFlipTrail v3.13: AggressiveMode — trade every bar on candle direction, no pullback required"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -41,13 +38,15 @@ input int    InpMaxSpreadPoints    = 0;     // MaxSpreadPoints (0 = off)
 input group "=== ATR Stop Loss ==="
 input int    InpATRPeriod          = 14;    // ATRPeriod
 input double InpATRMultiplier      = 1.5;   // ATRMultiplier: SL = ATR × this
+input double InpTPMultiplier       = 1.5;   // TPMultiplier: TP = ATR × this (0 = trail only)
 
 input group "=== Breakeven ==="
 input int    InpBEPoints           = 50;    // BEPoints: profit pts to lock BE (0 = off)
 input int    InpBEBuffer           = 10;    // BEBuffer: SL moves to entry + this
 
 input group "=== Pullback Entry ==="
-input int    InpMinPullbackBars    = 2;     // MinPullbackBars: min opposite candles before reversal
+input bool   InpAggressiveMode     = false; // AggressiveMode: trade every bar on candle direction — no pullback confirmation
+input int    InpMinPullbackBars    = 2;     // MinPullbackBars: min opposite candles before reversal (ignored in AggressiveMode)
 // Dynamic lot scoring:
 // Pullback depth vs ATR  → 0-30 pts
 // Pullback candle count  → 0-25 pts
@@ -218,47 +217,46 @@ bool H1TrendAgreesWithFlip(ENUM_ORDER_TYPE dir)
 }
 
 //──────────────────────────────────────────────────────────────────────────────
-// ScorePullbackSetup
-// Detects: 2+ opposite candles (pullback) → 2 same-direction candles
-// (reversal + confirmation) consistent with `dir`.
+// ScorePullbackSetup  (v3.11 — loosened)
+// Detects: InpMinPullbackBars+ opposite candles → at least 1 same-direction
+// candle (candle[1], HARD required).  Candle[2] also in direction is a bonus.
 //
 // Returns score 0-100 on valid setup, -1 if pattern not found.
 //
 // Scoring:
-//   Pullback depth vs ATR (0-30): deeper = trend is pausing, not reversing
-//   Pullback candle count (0-25): cleaner pullback = more reliable signal
-//   Reversal candle body%  (0-25): first recovery candle strength
-//   Confirm  candle body%  (0-20): second candle confirms buyers/sellers back
+//   Pullback depth vs ATR  (0-30): deeper pause = stronger trend continuation
+//   Pullback candle count  (0-25): cleaner pullback = more reliable signal
+//   Confirm candle[1] body% (0-25): entry candle strength (always scored)
+//   Candle[2] bonus        (0-20): both confirm candles in direction → larger lot
 //──────────────────────────────────────────────────────────────────────────────
 int ScorePullbackSetup(ENUM_ORDER_TYPE dir)
 {
    bool isBuy = (dir == ORDER_TYPE_BUY);
 
-   // ── Confirmation candles: [1]=confirm, [2]=reversal ──────────────────────
+   // ── Candle[1] = entry trigger (MUST be in direction) ─────────────────────
    double c1 = iClose(_Symbol, PERIOD_M1, 1);
    double o1 = iOpen (_Symbol, PERIOD_M1, 1);
    double h1 = iHigh (_Symbol, PERIOD_M1, 1);
    double l1 = iLow  (_Symbol, PERIOD_M1, 1);
 
+   bool   c1inDir = isBuy ? (c1 > o1) : (c1 < o1);
+   if (!c1inDir) return -1;
+
+   double range1 = h1 - l1;
+   double body1  = MathAbs(c1 - o1);
+   if (range1 > 0 && body1 / range1 < 0.20) return -1;  // doji — skip
+
+   // ── Candle[2] = bonus (not required) ─────────────────────────────────────
    double c2 = iClose(_Symbol, PERIOD_M1, 2);
    double o2 = iOpen (_Symbol, PERIOD_M1, 2);
    double h2 = iHigh (_Symbol, PERIOD_M1, 2);
    double l2 = iLow  (_Symbol, PERIOD_M1, 2);
+   bool   c2inDir = isBuy ? (c2 > o2) : (c2 < o2);
 
-   // Both candles must be in the entry direction
-   bool c1inDir = isBuy ? (c1 > o1) : (c1 < o1);
-   bool c2inDir = isBuy ? (c2 > o2) : (c2 < o2);
-   if (!c1inDir || !c2inDir) return -1;
-
-   // Doji filter: both candles need at least 20% body (not noise)
-   double range1 = h1 - l1;
    double range2 = h2 - l2;
-   double body1  = MathAbs(c1 - o1);
    double body2  = MathAbs(c2 - o2);
-   if (range1 > 0 && body1 / range1 < 0.20) return -1;
-   if (range2 > 0 && body2 / range2 < 0.20) return -1;
 
-   // ── Pullback: count consecutive opposite candles before candle[2] ────────
+   // ── Pullback: consecutive opposite candles before candle[2] ──────────────
    int    pullbackCount = 0;
    double pbHigh = 0.0, pbLow = DBL_MAX;
 
@@ -267,21 +265,21 @@ int ScorePullbackSetup(ENUM_ORDER_TYPE dir)
       double ci = iClose(_Symbol, PERIOD_M1, i);
       double oi = iOpen (_Symbol, PERIOD_M1, i);
       bool   ciOpposite = isBuy ? (ci < oi) : (ci > oi);
-      if (!ciOpposite) break;          // pullback ended — stop counting
+      if (!ciOpposite) break;
 
       pullbackCount++;
       pbHigh = MathMax(pbHigh, iHigh(_Symbol, PERIOD_M1, i));
       pbLow  = MathMin(pbLow,  iLow (_Symbol, PERIOD_M1, i));
    }
 
-   if (pullbackCount < InpMinPullbackBars) return -1;  // not enough pullback
+   if (pullbackCount < InpMinPullbackBars) return -1;
 
    // ── Score ────────────────────────────────────────────────────────────────
    int score = 0;
 
    // 1. Pullback depth relative to ATR (0-30 pts)
-   double atrPrice   = GetATRPoints() * _Point;
-   double pbDepth    = pbHigh - pbLow;
+   double atrPrice = GetATRPoints() * _Point;
+   double pbDepth  = pbHigh - pbLow;
    if (atrPrice > 0)
    {
       double ratio = pbDepth / atrPrice;
@@ -295,17 +293,20 @@ int ScorePullbackSetup(ENUM_ORDER_TYPE dir)
    else if (pullbackCount == 3) score += 20;
    else                         score += 10;  // == 2
 
-   // 3. Reversal candle body% [2] (0-25 pts)
-   double bodyPct2 = (range2 > 0) ? body2 / range2 * 100.0 : 0;
-   if      (bodyPct2 >= 70) score += 25;
-   else if (bodyPct2 >= 50) score += 15;
+   // 3. Confirm candle[1] body% — entry candle strength (0-25 pts)
+   double bodyPct1 = (range1 > 0) ? body1 / range1 * 100.0 : 0;
+   if      (bodyPct1 >= 70) score += 25;
+   else if (bodyPct1 >= 50) score += 15;
    else                     score += 5;
 
-   // 4. Confirmation candle body% [1] (0-20 pts)
-   double bodyPct1 = (range1 > 0) ? body1 / range1 * 100.0 : 0;
-   if      (bodyPct1 >= 70) score += 20;
-   else if (bodyPct1 >= 50) score += 12;
-   else                     score += 4;
+   // 4. Candle[2] bonus: also in direction and not a doji → higher lot (0-20 pts)
+   if (c2inDir && range2 > 0 && body2 / range2 >= 0.20)
+   {
+      double bodyPct2 = body2 / range2 * 100.0;
+      if      (bodyPct2 >= 70) score += 20;
+      else if (bodyPct2 >= 50) score += 12;
+      else                     score += 5;
+   }
 
    return score;  // 0-100
 }
@@ -646,15 +647,19 @@ bool OpenPosition(ENUM_ORDER_TYPE direction, bool isSeed, double lot = 0.0)
       int    slPts = SafeDist(atrPts, ask, bid);
       double sl;
 
+      int    tpPts = (InpTPMultiplier > 0) ? (int)MathRound(atrPts * InpTPMultiplier) : 0;
+      double tp;
       if (direction == ORDER_TYPE_BUY)
       {
          sl = NormalizeDouble(ask - slPts * _Point, _Digits);
-         g_trade.Buy(lot, _Symbol, ask, sl, 0, "H1FlipTrail");
+         tp = (tpPts > 0) ? NormalizeDouble(ask + tpPts * _Point, _Digits) : 0;
+         g_trade.Buy(lot, _Symbol, ask, sl, tp, "H1FlipTrail");
       }
       else
       {
          sl = NormalizeDouble(bid + slPts * _Point, _Digits);
-         g_trade.Sell(lot, _Symbol, bid, sl, 0, "H1FlipTrail");
+         tp = (tpPts > 0) ? NormalizeDouble(bid - tpPts * _Point, _Digits) : 0;
+         g_trade.Sell(lot, _Symbol, bid, sl, tp, "H1FlipTrail");
       }
 
       uint rc = g_trade.ResultRetcode();
@@ -728,32 +733,54 @@ void TrySeedEntry()
       }
    }
 
-   int            h1Bias = GetH1Bias();
    ENUM_ORDER_TYPE dir   = ORDER_TYPE_BUY;
    int             score = -1;
 
-   if (h1Bias == 1)       // H1 bullish → look for BUY pullback
+   if (InpAggressiveMode)
    {
-      score = ScorePullbackSetup(ORDER_TYPE_BUY);
-      dir   = ORDER_TYPE_BUY;
-   }
-   else if (h1Bias == -1) // H1 bearish → look for SELL pullback
-   {
-      score = ScorePullbackSetup(ORDER_TYPE_SELL);
-      dir   = ORDER_TYPE_SELL;
-   }
-   else                   // H1 filter off → try both, take higher score
-   {
-      int scoreBuy  = ScorePullbackSetup(ORDER_TYPE_BUY);
-      int scoreSell = ScorePullbackSetup(ORDER_TYPE_SELL);
+      // Fire on every bar — no pullback required, just follow candle[1] direction
+      double c1 = iClose(_Symbol, PERIOD_M1, 1);
+      double o1 = iOpen (_Symbol, PERIOD_M1, 1);
+      if (c1 == o1) return;  // doji — skip
 
-      if (scoreBuy >= 0 && scoreBuy >= scoreSell)
-         { dir = ORDER_TYPE_BUY;  score = scoreBuy; }
-      else if (scoreSell >= 0)
-         { dir = ORDER_TYPE_SELL; score = scoreSell; }
-   }
+      int h1Bias = GetH1Bias();
+      dir = (c1 > o1) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
 
-   if (score < 0) return;  // no valid pullback pattern on this bar
+      // If H1 filter on, only take trades that align with H1 bias
+      if (InpH1FilterEnabled && h1Bias != 0 &&
+          ((dir == ORDER_TYPE_BUY  && h1Bias != 1) ||
+           (dir == ORDER_TYPE_SELL && h1Bias != -1)))
+         return;
+
+      score = 50;  // fixed mid-range score → mid-range lot
+   }
+   else
+   {
+      int h1Bias = GetH1Bias();
+
+      if (h1Bias == 1)       // H1 bullish → look for BUY pullback
+      {
+         score = ScorePullbackSetup(ORDER_TYPE_BUY);
+         dir   = ORDER_TYPE_BUY;
+      }
+      else if (h1Bias == -1) // H1 bearish → look for SELL pullback
+      {
+         score = ScorePullbackSetup(ORDER_TYPE_SELL);
+         dir   = ORDER_TYPE_SELL;
+      }
+      else                   // H1 filter off → try both, take higher score
+      {
+         int scoreBuy  = ScorePullbackSetup(ORDER_TYPE_BUY);
+         int scoreSell = ScorePullbackSetup(ORDER_TYPE_SELL);
+
+         if (scoreBuy >= 0 && scoreBuy >= scoreSell)
+            { dir = ORDER_TYPE_BUY;  score = scoreBuy; }
+         else if (scoreSell >= 0)
+            { dir = ORDER_TYPE_SELL; score = scoreSell; }
+      }
+
+      if (score < 0) return;  // no valid pullback pattern on this bar
+   }
 
    double lot = CalcDynamicLot(score);
    PrintFormat("Pullback %s: score=%d/100 → lot=%.2f",
@@ -811,10 +838,10 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   PrintFormat("H1confirmFlipTrail v3.10 | %s | ATR(%d)×%.1f(floor=%dpts) | "
+   PrintFormat("H1confirmFlipTrail v3.13 | %s | ATR(%d)×%.1f(floor=%dpts) | "
                "Trail:100%%→50%%→25%%→15%% | BE@%dpts+%d | "
                "H1EMA%d=%s | PeakLock=%d%% | "
-               "Entry: pullback≥%dbar+2confirm | Lot:%.2f→%.2f | "
+               "Entry: pullback≥%dbar+1confirm(+2ndbonus) | Lot:%.2f→%.2f | "
                "Retest: buf=%dpts exp=%dbars | MaxFlips=%d | Fill=%s | Magic=%lld",
                _Symbol, InpATRPeriod, InpATRMultiplier, g_effectiveSLMin,
                InpBEPoints, InpBEBuffer,
@@ -831,7 +858,7 @@ void OnDeinit(const int reason)
    if (g_atrHandle != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
    if (g_emaHandle != INVALID_HANDLE) IndicatorRelease(g_emaHandle);
    CancelRetestLimit();
-   PrintFormat("H1confirmFlipTrail v3.10 deinit (reason=%d).", reason);
+   PrintFormat("H1confirmFlipTrail v3.13 deinit (reason=%d).", reason);
 }
 
 void OnTick()

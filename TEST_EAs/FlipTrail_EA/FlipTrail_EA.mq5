@@ -1,16 +1,13 @@
 //+------------------------------------------------------------------+
-//|  FlipTrail_EA.mq5  v11                                            |
-//|  Progressive trail + instant flip stop order                     |
+//|  FlipTrail_EA.mq5  v11.04                                         |
+//|  ATR trail + fixed TP — good R:R scalper                         |
 //|                                                                    |
 //|  MECHANICS                                                        |
 //|  ─────────                                                        |
-//|  Position opens with ATR-based SL, no TP.                       |
-//|  A SELL STOP / BUY STOP (flip order) is placed AT the SL level. |
-//|  Both trail together — SL moves, flip order follows immediately. |
-//|  When SL level is hit:                                           |
-//|    • Position closes (SL)                                        |
-//|    • Flip stop fires → reverse position opens instantly          |
-//|    • New flip stop placed at new SL level                        |
+//|  Entry: new bar candle body direction (optional body % filter)   |
+//|  Exit:  ATR trailing SL — moves with price every tick            |
+//|  When SL is hit → position closes, EA waits for next bar signal  |
+//|  No pending stop orders placed at any time                       |
 //|                                                                   |
 //|  PROGRESSIVE TRAIL TIGHTENING                                    |
 //|  ──────────────────────────────                                  |
@@ -18,12 +15,11 @@
 //|  ≥ 1× ATR gap in profit  → trail = 50% of ATR gap               |
 //|  ≥ 2× ATR gap in profit  → trail = 25% of ATR gap               |
 //|  ≥ 3× ATR gap in profit  → trail = 15% of ATR gap (very tight)  |
-//|  Captures far more of the move on strong gold momentum           |
 //+------------------------------------------------------------------+
 #property copyright "FlipTrail EA"
 #property link      ""
-#property version   "11.00"
-#property description "Progressive trail + flip stop order. SL and flip order always in sync."
+#property version   "11.04"
+#property description "FlipTrail v11.04: ATR SL + fixed TP (ATR × multiplier) for positive R:R scalping"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -33,15 +29,20 @@
 // INPUTS
 //──────────────────────────────────────────────────────────────────────────────
 input group "=== Trade ==="
-input double InpLotSize           = 0.1;   // LotSize
+input double InpRiskPct           = 1.0;   // RiskPct: % of equity to risk per trade (e.g. 1.0 = 1%)
+input double InpMinLot            = 0.01;  // MinLot: floor lot size
+input double InpMaxLot            = 1.00;  // MaxLot: ceiling lot size
 input int    InpSLPoints          = 50;    // SLPoints: minimum SL floor
 input long   InpMagicNumber       = 112233;// MagicNumber
 input int    InpMaxSlippagePoints = 30;    // MaxSlippagePoints
 input int    InpMaxSpreadPoints   = 0;     // MaxSpreadPoints (0 = off)
 
-input group "=== ATR Stop Loss ==="
+input group "=== ATR Stop Loss & Take Profit ==="
 input int    InpATRPeriod         = 14;    // ATRPeriod
 input double InpATRMultiplier     = 1.5;   // ATRMultiplier: SL = ATR × this
+input double InpTPMultiplier      = 2.0;   // TPMultiplier: TP = ATR × this (0 = trail only, no TP)
+//  R:R = TPMultiplier / ATRMultiplier. Default 2.0/1.5 = 1.33 R:R.
+//  Recommended: TPMultiplier >= 2× ATRMultiplier for positive expectancy.
 
 input group "=== Breakeven ==="
 input int    InpBEPoints          = 50;    // BEPoints: profit pts to lock BE (0 = off)
@@ -49,16 +50,6 @@ input int    InpBEBuffer          = 10;    // BEBuffer: SL moves to entry + this
 
 input group "=== Candle Body Filter ==="
 input int    InpMinBodyPct        = 30;    // MinBodyPct: min body as % of range (0 = off)
-
-input group "=== Flip Guard ==="
-input int    InpMaxSLFlips        = 50;    // MaxSLFlips cap
-input int    InpCooldownSeconds   = 0;     // CooldownSeconds after SL flip (0 = off)
-
-input group "=== Flip Rider Mode (flip-opened positions) ==="
-input int    InpFlipSoftSLPts      = 150; // FlipSoftSLPts: max loss pts before closing flip trade (0=off)
-input int    InpFlipBETriggerPts   = 50;  // FlipBETriggerPts: profit pts to snap SL to entry (0=off)
-input int    InpFlipPartialPct     = 50;  // FlipPartialPct: % to partial-close at ATR target (0=off)
-input double InpFlipPartialATRMult = 2.0; // FlipPartialATRMult: ATR× profit to trigger partial close
 
 input group "=== Peak Profit Lock ==="
 input int    InpPeakLockPct        = 60;  // PeakLockPct: % of peak profit to protect as SL — 0=off
@@ -85,29 +76,15 @@ int      g_atrHandle       = INVALID_HANDLE;
 bool     g_isNetting       = false;
 
 int      g_effectiveSLMin  = 0;
-int      g_trailGap        = 0;     // Current trail gap (tightens progressively)
-int      g_trailGapInitial = 0;     // ATR SL at entry (reference for ratio)
+int      g_trailGap        = 0;
+int      g_trailGapInitial = 0;
 datetime g_lastBarTime     = 0;
-ulong    g_flipTicket      = 0;     // Flip stop order — always at SL level
-int      g_slFlipCount     = 0;
-bool     g_standingDown    = false;
-ulong    g_lastDeal        = 0;
-bool     g_closingForCap   = false;
 
 // Per-trade state
 bool     g_beSet           = false;
 double   g_entryPrice      = 0.0;
-datetime g_lastSLFlipTime  = 0;
-
-// Flip Rider state
-bool     g_isFlipTrade     = false; // Position was opened by a flip stop order
-bool     g_partialDone     = false; // Partial close already executed for this flip trade
-
-// Peak profit lock state
-double   g_peakProfitPts   = 0.0;  // Highest profit in points seen since position opened
-
-// Candle step lock state
-int      g_candleFavorCount = 0;   // Consecutive favorable bar closes since last step
+double   g_peakProfitPts   = 0.0;
+int      g_candleFavorCount = 0;
 
 //──────────────────────────────────────────────────────────────────────────────
 // UTILITY
@@ -124,14 +101,6 @@ bool SelectOurPosition()
    return false;
 }
 
-bool PendingOrderExists(ulong ticket)
-{
-   if (ticket == 0) return false;
-   for (int i = OrdersTotal() - 1; i >= 0; i--)
-      if (OrderGetTicket(i) == ticket) return true;
-   return false;
-}
-
 double NormalizeLot(double lot)
 {
    double step = g_sym.LotsStep();
@@ -139,7 +108,7 @@ double NormalizeLot(double lot)
    double maxL = g_sym.LotsMax();
    if (step <= 0.0) step = 0.01;
    lot = MathFloor(lot / step) * step;
-   lot = MathMax(lot, MathMax(minL, 0.02));
+   lot = MathMax(lot, MathMax(minL, InpMinLot));
    lot = MathMin(lot, maxL);
    return NormalizeDouble(lot, 2);
 }
@@ -180,6 +149,31 @@ int GetATRPoints()
 }
 
 //──────────────────────────────────────────────────────────────────────────────
+// CalcLotByRisk
+// Sizes lot so that the ATR SL costs exactly InpRiskPct% of current equity.
+// Clamped to [InpMinLot, InpMaxLot].
+//──────────────────────────────────────────────────────────────────────────────
+double CalcLotByRisk(int slPts)
+{
+   if (slPts <= 0) return NormalizeLot(InpMinLot);
+
+   double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskMoney = equity * InpRiskPct / 100.0;
+   double tickVal   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if (tickVal <= 0 || tickSize <= 0) return NormalizeLot(InpMinLot);
+
+   // slPts × _Point = SL distance in price; convert to ticks then to money per lot
+   double slMoney   = (slPts * _Point / tickSize) * tickVal;
+   if (slMoney <= 0) return NormalizeLot(InpMinLot);
+
+   double lot = riskMoney / slMoney;
+   lot = MathMax(lot, InpMinLot);
+   lot = MathMin(lot, InpMaxLot);
+   return NormalizeLot(lot);
+}
+
+//──────────────────────────────────────────────────────────────────────────────
 // UpdateTrailGap
 // Tightens g_trailGap as profit grows relative to initial ATR SL.
 // All ratios — no fixed points.
@@ -215,97 +209,6 @@ void UpdateTrailGap()
       PrintFormat("Trail tightened: profit=%.0fpts (%.1f×ATR) → gap %d→%dpts",
                   profitPts, ratio, g_trailGap, newGap);
       g_trailGap = newGap;
-   }
-}
-
-//──────────────────────────────────────────────────────────────────────────────
-// CancelFlipOrder
-//──────────────────────────────────────────────────────────────────────────────
-void CancelFlipOrder()
-{
-   if (g_flipTicket == 0) return;
-   if (!PendingOrderExists(g_flipTicket)) { g_flipTicket = 0; return; }
-   if (g_trade.OrderDelete(g_flipTicket))
-   {
-      PrintFormat("FlipStop %llu cancelled", g_flipTicket);
-      g_flipTicket = 0;
-   }
-   else
-      PrintResult(StringFormat("CancelFlipStop %llu FAILED", g_flipTicket));
-}
-
-//──────────────────────────────────────────────────────────────────────────────
-// PlaceFlipOrder
-// SELL STOP (BUY pos) / BUY STOP (SELL pos) placed exactly at SL level.
-// On netting accounts: 2× lot so net position flips (closes old + opens new).
-// On hedging accounts: 1× lot (opens reverse alongside closing old via SL).
-//──────────────────────────────────────────────────────────────────────────────
-void PlaceFlipOrder()
-{
-   if (!SelectOurPosition())              return;
-   if (PendingOrderExists(g_flipTicket))  return;
-
-   double slLevel = g_pos.StopLoss();
-   if (slLevel == 0) return;
-
-   // Netting needs 2× lot: closes existing 1× + opens reverse 1×
-   double lot = NormalizeLot(g_isNetting ? InpLotSize * 2.0 : InpLotSize);
-   bool   ok  = false;
-
-   if (g_pos.PositionType() == POSITION_TYPE_BUY)
-      ok = g_trade.SellStop(lot, slLevel, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "FlipStop");
-   else
-      ok = g_trade.BuyStop(lot, slLevel, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "FlipStop");
-
-   PrintResult("PlaceFlipOrder");
-   if (ok || g_trade.ResultRetcode() == TRADE_RETCODE_DONE)
-   {
-      g_flipTicket = g_trade.ResultOrder();
-      PrintFormat("FlipStop placed: ticket=%llu at %.5f (lot=%.2f)",
-                  g_flipTicket, slLevel, lot);
-   }
-}
-
-//──────────────────────────────────────────────────────────────────────────────
-// ManageFlipOrder
-// Keeps flip stop order at current SL level. Moves with every trail update.
-//──────────────────────────────────────────────────────────────────────────────
-void ManageFlipOrder()
-{
-   if (!SelectOurPosition()) { CancelFlipOrder(); return; }
-
-   if (!PendingOrderExists(g_flipTicket))
-   {
-      g_flipTicket = 0;
-      PlaceFlipOrder();
-      return;
-   }
-
-   double slLevel = g_pos.StopLoss();
-   if (slLevel == 0) return;
-
-   // Find current flip order price
-   double flipPrice = 0;
-   for (int i = OrdersTotal()-1; i >= 0; i--)
-   {
-      if (OrderGetTicket(i) == g_flipTicket)
-      {
-         flipPrice = OrderGetDouble(ORDER_PRICE_OPEN);
-         break;
-      }
-   }
-   if (flipPrice == 0) return;
-
-   // Update only if SL has moved by at least 1pt
-   if (MathAbs(flipPrice - slLevel) / _Point < 1.0) return;
-
-   if (g_trade.OrderModify(g_flipTicket, slLevel, 0, 0, ORDER_TIME_GTC, 0))
-      PrintFormat("FlipStop → %.5f (tracking SL)", slLevel);
-   else
-   {
-      PrintResult("FlipStop modify FAILED — replacing");
-      CancelFlipOrder();
-      PlaceFlipOrder();
    }
 }
 
@@ -446,108 +349,7 @@ void ManageCandleStepLock()
 }
 
 //──────────────────────────────────────────────────────────────────────────────
-// ManageFlipRiderMode
-// Called every tick for flip-opened positions (g_isFlipTrade = true).
-//
-//  1. Soft SL   — while SL=0: close if loss exceeds InpFlipSoftSLPts
-//  2. Partial   — close InpFlipPartialPct% at InpFlipPartialATRMult×ATR profit
-//                 then snap remainder SL to breakeven
-//  3. Delayed BE — while SL=0: snap SL to entry+buffer once InpFlipBETriggerPts
-//                  in profit, allowing normal trailing to take over
-//──────────────────────────────────────────────────────────────────────────────
-void ManageFlipRiderMode()
-{
-   if (!g_isFlipTrade)       return;
-   if (!SelectOurPosition()) return;
-
-   ENUM_POSITION_TYPE posType   = g_pos.PositionType();
-   double             currentSL = g_pos.StopLoss();
-
-   g_sym.RefreshRates();
-   double ask = g_sym.Ask();
-   double bid = g_sym.Bid();
-
-   double profitPts = (posType == POSITION_TYPE_BUY)
-                      ? (bid - g_entryPrice) / _Point
-                      : (g_entryPrice - ask) / _Point;
-
-   // ── 1. Soft SL: only active while no hard SL is set ─────────────────────
-   if (InpFlipSoftSLPts > 0 && currentSL == 0
-       && profitPts <= -(double)InpFlipSoftSLPts)
-   {
-      PrintFormat("FlipRider: Soft SL hit (loss=%.0fpts >= %dpts) — closing",
-                  -profitPts, InpFlipSoftSLPts);
-      g_isFlipTrade = false;
-      CloseOurPosition("FlipRider-SoftSL");
-      return;
-   }
-
-   // ── 2. Partial close at ATR× profit ──────────────────────────────────────
-   if (!g_partialDone && InpFlipPartialPct > 0 && InpFlipPartialATRMult > 0.0
-       && g_trailGapInitial > 0)
-   {
-      double threshold = InpFlipPartialATRMult * (double)g_trailGapInitial;
-      if (profitPts >= threshold)
-      {
-         double origLot   = g_pos.Volume();
-         double closeLot  = NormalizeLot(origLot * InpFlipPartialPct / 100.0);
-         double remainLot = origLot - closeLot;
-
-         if (closeLot >= g_sym.LotsMin() && remainLot >= g_sym.LotsMin())
-         {
-            if (g_trade.PositionClosePartial(g_pos.Ticket(), closeLot,
-                                              InpMaxSlippagePoints))
-            {
-               PrintFormat("FlipRider: Partial closed %.2f lots (%.0f%%) at profit=%.0fpts",
-                           closeLot, (double)InpFlipPartialPct, profitPts);
-               g_partialDone = true;
-
-               // Snap remainder SL to entry+buffer immediately
-               Sleep(100);
-               if (SelectOurPosition())
-               {
-                  double beSL = (posType == POSITION_TYPE_BUY)
-                                ? NormalizeDouble(g_entryPrice + InpBEBuffer * _Point, _Digits)
-                                : NormalizeDouble(g_entryPrice - InpBEBuffer * _Point, _Digits);
-                  if (g_trade.PositionModify(g_pos.Ticket(), beSL, 0))
-                  {
-                     g_beSet = true;
-                     PrintFormat("FlipRider: Remainder SL locked to BE=%.5f", beSL);
-                  }
-                  else
-                     PrintResult("FlipRider: BE after partial FAILED — will retry next tick");
-               }
-            }
-            else
-               PrintResult("FlipRider: Partial close FAILED");
-         }
-         else
-            PrintFormat("FlipRider: Partial skipped — remainder %.2f lots < min %.2f",
-                        remainLot, g_sym.LotsMin());
-         return;
-      }
-   }
-
-   // ── 3. Delayed BE: snap SL to entry once profitable (while SL still 0) ──
-   if (InpFlipBETriggerPts > 0 && currentSL == 0
-       && profitPts >= (double)InpFlipBETriggerPts)
-   {
-      double beSL = (posType == POSITION_TYPE_BUY)
-                    ? NormalizeDouble(g_entryPrice + InpBEBuffer * _Point, _Digits)
-                    : NormalizeDouble(g_entryPrice - InpBEBuffer * _Point, _Digits);
-
-      if (g_trade.PositionModify(g_pos.Ticket(), beSL, 0))
-      {
-         g_beSet = true;
-         PrintFormat("FlipRider: Delayed BE → %.5f (profit=%.0fpts)", beSL, profitPts);
-      }
-      else
-         PrintResult("FlipRider: Delayed BE FAILED — will retry next tick");
-   }
-}
-
-//──────────────────────────────────────────────────────────────────────────────
-// ManageTrailingStop — trails SL, flip order follows in ManageFlipOrder
+// ManageTrailingStop
 //──────────────────────────────────────────────────────────────────────────────
 void ManageTrailingStop()
 {
@@ -557,8 +359,7 @@ void ManageTrailingStop()
    double             currentSL = g_pos.StopLoss();
    ulong              ticket    = g_pos.Ticket();
 
-   // Let FlipRiderMode manage the position until it has a hard SL
-   if (g_isFlipTrade && currentSL == 0) return;
+   if (currentSL == 0) return; // No SL yet — skip trailing until SL confirmed
 
    g_sym.RefreshRates();
    double ask   = g_sym.Ask();
@@ -602,8 +403,6 @@ void ManageBreakeven()
    if (g_beSet)              return;
    if (InpBEPoints <= 0)     return;
    if (!SelectOurPosition()) return;
-   if (g_isFlipTrade && g_pos.StopLoss() == 0) return; // Handled by FlipRiderMode
-
    ENUM_POSITION_TYPE posType = g_pos.PositionType();
    g_sym.RefreshRates();
    double ask = g_sym.Ask();
@@ -637,41 +436,7 @@ void ManageBreakeven()
 }
 
 //──────────────────────────────────────────────────────────────────────────────
-// ResetTradeState — called when a new position is detected after a flip
-//──────────────────────────────────────────────────────────────────────────────
-void ResetTradeState()
-{
-   g_beSet             = false;
-   g_isFlipTrade       = true;   // Position opened by flip stop — activate rider mode
-   g_partialDone       = false;
-   g_peakProfitPts     = 0.0;
-   g_candleFavorCount  = 0;
-   g_trailGapInitial   = GetATRPoints();
-   g_trailGap       = g_trailGapInitial;
-   Sleep(100);
-   if (!SelectOurPosition()) return;
-   g_entryPrice = g_pos.PriceOpen();
-
-   // Every flip-opened position must have an SL immediately — no naked positions
-   if (g_pos.StopLoss() == 0)
-   {
-      g_sym.RefreshRates();
-      double ask   = g_sym.Ask();
-      double bid   = g_sym.Bid();
-      int    slPts = SafeDist(g_trailGapInitial, ask, bid);
-      double sl    = (g_pos.PositionType() == POSITION_TYPE_BUY)
-                     ? NormalizeDouble(ask - slPts * _Point, _Digits)
-                     : NormalizeDouble(bid + slPts * _Point, _Digits);
-      if (g_trade.PositionModify(g_pos.Ticket(), sl, 0))
-         PrintFormat("FlipReset: ATR SL set → %.5f (%dpts)", sl, slPts);
-      else
-         PrintResult("FlipReset: SL set FAILED — soft SL still active via FlipRiderMode");
-   }
-   PrintFormat("Trade state reset: entry=%.5f trailGap=%dpts", g_entryPrice, g_trailGap);
-}
-
-//──────────────────────────────────────────────────────────────────────────────
-// OpenPosition — seed entry only (flips handled by stop order)
+// OpenPosition
 //──────────────────────────────────────────────────────────────────────────────
 bool OpenPosition(ENUM_ORDER_TYPE direction, bool isSeed)
 {
@@ -689,7 +454,6 @@ bool OpenPosition(ENUM_ORDER_TYPE direction, bool isSeed)
    }
 
    int    atrPts = GetATRPoints();
-   double lot    = NormalizeLot(InpLotSize);
 
    for (int attempt = 1; attempt <= 3; attempt++)
    {
@@ -697,27 +461,30 @@ bool OpenPosition(ENUM_ORDER_TYPE direction, bool isSeed)
       double ask   = g_sym.Ask();
       double bid   = g_sym.Bid();
       int    slPts = SafeDist(atrPts, ask, bid);
-      double sl;
+      int    tpPts = (InpTPMultiplier > 0) ? (int)MathRound(atrPts * InpTPMultiplier) : 0;
+      double lot   = CalcLotByRisk(slPts);
+      double sl, tp;
 
       if (direction == ORDER_TYPE_BUY)
       {
          sl = NormalizeDouble(ask - slPts * _Point, _Digits);
-         g_trade.Buy(lot, _Symbol, ask, sl, 0, "FlipTrail");
+         tp = (tpPts > 0) ? NormalizeDouble(ask + tpPts * _Point, _Digits) : 0;
+         g_trade.Buy(lot, _Symbol, ask, sl, tp, "FlipTrail");
       }
       else
       {
          sl = NormalizeDouble(bid + slPts * _Point, _Digits);
-         g_trade.Sell(lot, _Symbol, bid, sl, 0, "FlipTrail");
+         tp = (tpPts > 0) ? NormalizeDouble(bid - tpPts * _Point, _Digits) : 0;
+         g_trade.Sell(lot, _Symbol, bid, sl, tp, "FlipTrail");
       }
 
       uint rc = g_trade.ResultRetcode();
-      PrintResult(StringFormat("[%s] OpenPos %s%s attempt=%d SL=%dpts",
+      PrintResult(StringFormat("[%s] OpenPos %s%s attempt=%d lot=%.2f SL=%dpts TP=%dpts (%.1f%%risk)",
                   _Symbol, (direction==ORDER_TYPE_BUY?"BUY":"SELL"),
-                  (isSeed?"[SEED]":""), attempt, slPts));
+                  (isSeed?"[SEED]":""), attempt, lot, slPts, tpPts, InpRiskPct));
 
       if (rc == TRADE_RETCODE_DONE)
       {
-         if (isSeed) { g_slFlipCount = 0; g_standingDown = false; g_isFlipTrade = false; g_partialDone = false; }
          g_peakProfitPts    = 0.0;
          g_candleFavorCount = 0;
          g_trailGapInitial  = atrPts;
@@ -726,7 +493,6 @@ bool OpenPosition(ENUM_ORDER_TYPE direction, bool isSeed)
          Sleep(100);
          if (SelectOurPosition())
             g_entryPrice = g_pos.PriceOpen();
-         // Flip stop placed by ManageFlipOrder() on next tick once SL is confirmed
          return true;
       }
 
@@ -749,12 +515,9 @@ bool OpenPosition(ENUM_ORDER_TYPE direction, bool isSeed)
 bool CloseOurPosition(const string reason)
 {
    if (!SelectOurPosition()) return true;
-   CancelFlipOrder();
-   ulong ticket    = g_pos.Ticket();
-   g_closingForCap = true;
-   bool ok         = g_trade.PositionClose(ticket, InpMaxSlippagePoints);
+   ulong ticket = g_pos.Ticket();
+   bool  ok     = g_trade.PositionClose(ticket, InpMaxSlippagePoints);
    PrintResult(StringFormat("ClosePos [%s] ticket=%llu", reason, ticket));
-   if (!ok) g_closingForCap = false;
    return ok;
 }
 
@@ -764,18 +527,7 @@ bool CloseOurPosition(const string reason)
 void TrySeedEntry()
 {
    if (SelectOurPosition()) return;
-   if (g_standingDown)      return;
    if (!IsInTradingHours()) return;
-
-   if (InpCooldownSeconds > 0 && g_lastSLFlipTime > 0)
-   {
-      int elapsed = (int)(TimeCurrent() - g_lastSLFlipTime);
-      if (elapsed < InpCooldownSeconds)
-      {
-         PrintFormat("Cooldown: %ds remaining", InpCooldownSeconds - elapsed);
-         return;
-      }
-   }
 
    double c  = iClose(_Symbol, PERIOD_M1, 1);
    double o  = iOpen (_Symbol, PERIOD_M1, 1);
@@ -830,37 +582,33 @@ int OnInit()
    g_trailGap       = g_effectiveSLMin;
    g_trailGapInitial = g_effectiveSLMin;
 
-   double lot = NormalizeLot(InpLotSize);
-   if (lot < g_sym.LotsMin())
+   if (NormalizeLot(InpMinLot) < g_sym.LotsMin())
    {
-      PrintFormat("INIT FAILED: lot %.2f < min %.2f", lot, g_sym.LotsMin());
+      PrintFormat("INIT FAILED: MinLot %.2f < broker min %.2f", InpMinLot, g_sym.LotsMin());
       return INIT_FAILED;
    }
 
-   PrintFormat("FlipTrail v11.00 | %s | SL=ATR(%d)×%.1f(floor=%dpts) | "
-               "Trail: 100%%→50%%→25%%→15%% at 0/1/2/3× ATR profit | "
-               "BE@%dpts+%d | Body>=%d%% | FlipStop=%s | "
-               "Lot=%.2f MaxSLFlips=%d | Fill=%s | Magic=%lld",
+   PrintFormat("FlipTrail v11.04 | %s | SL=ATR(%d)×%.1f TP=ATR×%.1f (R:R=%.2f) | "
+               "Trail: 100%%→50%%→25%%→15%% at 0/1/2/3× ATR | "
+               "BE@%dpts+%d | Body>=%d%% | Risk=%.1f%% Lot:%.2f→%.2f | Fill=%s | Magic=%lld",
                _Symbol,
-               InpATRPeriod, InpATRMultiplier, g_effectiveSLMin,
+               InpATRPeriod, InpATRMultiplier, InpTPMultiplier,
+               (InpATRMultiplier > 0 ? InpTPMultiplier / InpATRMultiplier : 0),
                InpBEPoints, InpBEBuffer,
                InpMinBodyPct,
-               g_isNetting ? "2×lot(netting)" : "1×lot(hedging)",
-               lot, InpMaxSLFlips, EnumToString(filling), InpMagicNumber);
+               InpRiskPct, InpMinLot, InpMaxLot,
+               EnumToString(filling), InpMagicNumber);
    return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason)
 {
    if (g_atrHandle != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
-   PrintFormat("FlipTrail v11.00 deinit (reason=%d).", reason);
+   PrintFormat("FlipTrail v11.04 deinit (reason=%d).", reason);
 }
 
 void OnTick()
 {
-   if (g_standingDown && SelectOurPosition())
-   { Print("Standdown cleanup"); CloseOurPosition("Standdown"); return; }
-
    datetime bt     = iTime(_Symbol, PERIOD_M1, 0);
    bool     newBar = (bt != 0 && bt != g_lastBarTime);
    if (newBar) g_lastBarTime = bt;
@@ -869,24 +617,16 @@ void OnTick()
 
    if (SelectOurPosition())
    {
-      UpdateTrailGap();        // Tighten ATR trail gap as profit grows
-      ManageFlipRiderMode();   // Soft SL + delayed BE + partial close for flip trades
-      ManageBreakeven();       // Lock profit at entry+buffer (skipped for no-SL flips)
-      ManageTrailingStop();    // ATR-based trailing SL (skipped for no-SL flips)
-      ManagePeakLockSL();      // Peak profit lock: SL = entry + peak×60%
-      if (newBar) ManageCandleStepLock(); // Every N favorable closes → lock 40% of profit
-      ManageFlipOrder();       // Keep flip stop in sync with SL
+      UpdateTrailGap();
+      ManageBreakeven();
+      ManageTrailingStop();
+      ManagePeakLockSL();
+      if (newBar) ManageCandleStepLock();
    }
 }
 
 //──────────────────────────────────────────────────────────────────────────────
-// OnTradeTransaction
-//
-// Two events to handle:
-// 1. Position closed (SL hit or flip stop fired on netting INOUT)
-//    → increment flip count, update cooldown, check cap
-// 2. Flip stop order fired → new position open (DEAL_ENTRY_IN or INOUT)
-//    → reset per-trade state, place new flip stop on new position
+// OnTradeTransaction — logs SL closes only
 //──────────────────────────────────────────────────────────────────────────────
 void OnTradeTransaction(const MqlTradeTransaction& trans,
                         const MqlTradeRequest&     request,
@@ -895,65 +635,25 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
    if (trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
 
    ulong deal = trans.deal;
-   if (deal == 0 || deal == g_lastDeal) return;
+   if (deal == 0) return;
 
    if (!HistoryDealSelect(deal))
    {
       HistorySelect(TimeCurrent() - 60, TimeCurrent());
-      if (!HistoryDealSelect(deal)) { PrintFormat("OTT: deal %llu not found", deal); return; }
+      if (!HistoryDealSelect(deal)) return;
    }
 
    if (HistoryDealGetString (deal, DEAL_SYMBOL) != _Symbol)              return;
    if (HistoryDealGetInteger(deal, DEAL_MAGIC)  != (long)InpMagicNumber) return;
 
-   ENUM_DEAL_ENTRY  entry     = (ENUM_DEAL_ENTRY) HistoryDealGetInteger(deal, DEAL_ENTRY);
-   ENUM_DEAL_REASON reason    = (ENUM_DEAL_REASON)HistoryDealGetInteger(deal, DEAL_REASON);
-   ENUM_DEAL_TYPE   dealType  = (ENUM_DEAL_TYPE)  HistoryDealGetInteger(deal, DEAL_TYPE);
-   ulong            dealOrder = (ulong)HistoryDealGetInteger(deal, DEAL_ORDER);
+   ENUM_DEAL_ENTRY  entry  = (ENUM_DEAL_ENTRY) HistoryDealGetInteger(deal, DEAL_ENTRY);
+   ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(deal, DEAL_REASON);
 
-   PrintFormat("OTT: deal=%llu entry=%s reason=%s type=%s order=%llu",
-               deal, EnumToString(entry), EnumToString(reason),
-               EnumToString(dealType), dealOrder);
-
-   if (g_closingForCap) { g_closingForCap = false; Print("OTT: controlled close"); return; }
-
-   g_lastDeal = deal;
-
-   // ── Position closed (SL hit) ─────────────────────────────────────────────
-   bool isSLClose = (reason == DEAL_REASON_SL &&
-                     (entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_INOUT));
-
-   // ── Flip stop order fired (new position opened) ──────────────────────────
-   bool isFlipFire = (g_flipTicket != 0 && dealOrder == g_flipTicket &&
-                      (entry == DEAL_ENTRY_IN || entry == DEAL_ENTRY_INOUT));
-
-   if (!isSLClose && !isFlipFire) return;
-
-   if (isSLClose)
+   if (reason == DEAL_REASON_SL && (entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_INOUT))
    {
-      g_slFlipCount++;
-      g_lastSLFlipTime = TimeCurrent();
-      g_flipTicket     = 0;
-      g_isFlipTrade    = false;  // Old flip trade position is now closed
-      g_partialDone    = false;
-      PrintFormat("SL flip #%d (cap=%d)", g_slFlipCount, InpMaxSLFlips);
-
-      if (g_slFlipCount >= InpMaxSLFlips)
-      {
-         PrintFormat("SL cap reached — standing down");
-         g_standingDown = true;
-         CancelFlipOrder();
-         return;
-      }
-   }
-
-   if (isFlipFire)
-   {
-      // New position opened by flip stop — reset state
-      // Flip stop placed by ManageFlipOrder() on next tick once SL is confirmed
-      g_flipTicket = 0;
-      PrintFormat("FlipStop fired — new position opened");
-      Sleep(200);      // Give broker time to fully register the new position
-      ResetTradeState();
+      g_beSet          = false;
+      g_peakProfitPts  = 0.0;
+      g_candleFavorCount = 0;
+      PrintFormat("SL hit — state reset, waiting for next bar signal");
    }
 }
