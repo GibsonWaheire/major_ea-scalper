@@ -65,10 +65,6 @@ input double InpRSIBuyMax         = 65.0;  // RSI max allowed for BUY
 input double InpRSISellMin        = 35.0;  // RSI min allowed for SELL
 input int    InpMinBodyPct        = 30;    // Min candle body% of range (0=off)
 
-input group "=== NY Session ==="
-input bool   InpNYFilter          = false; // NYFilter: restrict entries to NY session
-input int    InpNYStartHour       = 13;    // NYStartHour (UTC)
-input int    InpNYEndHour         = 21;    // NYEndHour (UTC)
 
 input group "=== Consecutive Loss Pause ==="
 input int    InpMaxConsecLoss     = 3;     // MaxConsecLoss: pause after N losses
@@ -171,13 +167,6 @@ double CalcDynamicLot()
    if (slMoney <= 0) return NormalizeLot(InpMinLot);
 
    return NormalizeLot(riskMoney / slMoney);
-}
-
-bool IsNYSession()
-{
-   if (!InpNYFilter) return true;
-   int h = (int)((TimeCurrent() % 86400) / 3600);
-   return (h >= InpNYStartHour && h < InpNYEndHour);
 }
 
 bool CheckIndicatorFilter(ENUM_ORDER_TYPE dir)
@@ -567,7 +556,6 @@ void TrySeedEntry()
 {
    if (g_phase != PHASE_NONE)     return;
    if (CountOurPositions() > 0)   return;
-   if (!IsNYSession())             return;
 
    // Consecutive loss pause
    if (InpMaxConsecLoss > 0 && g_consecLoss >= InpMaxConsecLoss)
