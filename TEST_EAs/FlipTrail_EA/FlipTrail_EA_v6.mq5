@@ -1,28 +1,26 @@
 //+------------------------------------------------------------------+
-//|  FlipTrail_EA_v6.mq5  v6.30                                      |
-//|  Margin Scalper — Seed Confirmation + Burst Mode                 |
+//|  FlipTrail_EA_v6.mq5  v6.35                                      |
+//|  Margin Scalper — Hold-through-trend, EMA-gated TP close         |
 //|                                                                   |
 //|  PHASE 1 (SEED):                                                 |
-//|    Open InpSeedCount trades on M1 bar signal (EMA/RSI filtered). |
-//|    Store g_signalPrice = avg fill (stable trend reference).      |
-//|    Wait per-tick for seedMovePct >= InpSeedTPPct (0.01%).        |
-//|    Confirmed → open burst. DynSL aborts seed if reversal early.  |
+//|    Open InpSeedCount trades on SignalTF bar (optional filter).   |
+//|    Store g_signalPrice = avg fill. Immediately fire burst.       |
 //|                                                                   |
 //|  PHASE 2 (BURST):                                                |
-//|    Open InpBurstCount extra trades at confirmed direction.       |
 //|    Per-tick exit priority:                                        |
-//|      1. Emergency: basket loss >= InpMaxLossPct% equity.         |
-//|      2. Individual TP: each position closed at InpBurstTPPct%.   |
-//|      3. Trend continuation: all IndivTP + signal still running   |
-//|         → new burst round (up to InpMaxBursts).                 |
-//|      4. Peak pullback: signalMove < peak * InpPeakKeepPct/100.  |
-//|      5. DynSL: signalMove <= -DynSLThreshold.                   |
-//|      6. Time gate: elapsed >= InpBurstMaxSec → close profitable. |
+//|      1. Emergency basket loss (InpMaxLossPct).                   |
+//|      2. TP milestone hit (burstRound*BurstTPPct from signal):    |
+//|         — EMA still aligned → HOLD, advance round (no spread).  |
+//|         — EMA reversing → CLOSE, take profit.                   |
+//|      3. Timed profit: basket in profit after X mins → close.     |
+//|      4. Timed loss: basket losing X% after Y mins → close.      |
+//|      5. Peak pullback: close profitable, hold rest for DynSL.   |
+//|      6. DynSL: hard backstop at InpBurstSLPct%.                 |
 //+------------------------------------------------------------------+
 #property copyright "FlipTrail EA v6"
 #property link      ""
-#property version   "6.30"
-#property description "FlipTrail v6.30: Seed-confirmed burst margin scalper, per-tick individual TP"
+#property version   "6.35"
+#property description "FlipTrail v6.35: EMA-gated TP hold, loosen entry, on-chart dashboard"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -34,40 +32,47 @@ enum BasketPhase { PHASE_NONE=0, PHASE_SEED=1, PHASE_BURST=2 };
 // INPUTS
 //──────────────────────────────────────────────────────────────────────────────
 input group "=== Basket ==="
-input double InpRiskPct           = 10.0;  // RiskPct: % equity per trade
+input ENUM_TIMEFRAMES InpSignalTF = PERIOD_M5; // SignalTF: bar timeframe for entry signal + indicators (M1=noisy, M5/M15 recommended)
+input double InpRiskPct           = 20.0;  // RiskPct: % equity per seed trade
 input double InpMinLot            = 0.01;  // MinLot
 input double InpMaxLot            = 50.0;  // MaxLot
 input long   InpMagicNumber       = 116300;// MagicNumber (v6.3)
 input int    InpMaxSlippagePoints = 30;    // MaxSlippagePoints
-input int    InpMaxSpreadPoints   = 50;    // MaxSpreadPoints (0=off, seed only)
+input int    InpMaxSpreadPoints   = 0;     // MaxSpreadPoints (0=off, seed only)
 
 input group "=== Seed Phase ==="
 input int    InpSeedCount         = 2;     // SeedCount: trades to confirm trend
 input double InpSeedTPPct         = 0.01;  // SeedTPPct: % move from signal to trigger burst
 
 input group "=== Burst Phase ==="
-input int    InpBurstCount        = 8;     // BurstCount: extra trades after seed confirms
-input double InpBurstTPPct        = 0.02;  // BurstTPPct: per-position individual TP%
+input int    InpBurstCount        = 10;    // BurstCount: trades per burst round
+input double InpBurstTPPct        = 0.02;  // BurstTPPct: TP milestone per round from signal (min 0.02% before any close)
+input double InpBurstRiskPct      = 5.0;   // BurstRiskPct: % equity risk per burst trade
+input double InpBurstSLPct        = 0.15;  // BurstSLPct: hard backstop SL% from signal (wider = more breathing room; 0=DynSL floor only)
 input double InpPeakKeepPct       = 80.0;  // PeakKeepPct: close all if pullback to X% of peak
-input int    InpBurstMaxSec       = 3;     // BurstMaxSec: time gate seconds (close profitable)
-input double InpMaxLossPct        = 0.10;  // MaxLossPct: emergency close if basket loses X% equity
-input int    InpMaxBursts         = 3;     // MaxBursts: max trend-continuation burst rounds
+input int    InpBurstMaxSec       = 0;     // BurstMaxSec: time gate seconds — close ALL (0=off)
+input double InpMaxLossPct        = 0;     // MaxLossPct: emergency close if basket loses X% equity (0=off)
+input int    InpMaxBursts         = 20;    // MaxBursts: max trend-continuation burst rounds
+input int    InpBasketMaxLossMins  = 3;    // BasketMaxLossMins: close basket if still losing after X minutes (0=off)
+input double InpBasketLossPct      = 10.0; // BasketLossPct: min basket loss% of equity to trigger timed loss close
+input int    InpBasketMaxProfitMins= 5;    // BasketMaxProfitMins: close basket if in net profit after X minutes (0=off)
 
 input group "=== Dynamic SL ==="
 input int    InpSLHistoryTrades   = 20;    // SLHistoryTrades: circular buffer size
 input double InpSLFloorPct        = 0.12;  // SLFloorPct: DynSL minimum %
 
 input group "=== Entry Filter ==="
-input int    InpEMAFast           = 5;     // EMA fast period (M1)
-input int    InpEMASlow           = 13;    // EMA slow period (M1)
-input int    InpRSIPeriod         = 7;     // RSI period (M1)
-input double InpRSIBuyMax         = 65.0;  // RSI max allowed for BUY
-input double InpRSISellMin        = 35.0;  // RSI min allowed for SELL
-input int    InpMinBodyPct        = 30;    // Min candle body% of range (0=off)
+input bool   InpUseEntryFilter    = false; // UseEntryFilter: gate entries on EMA+RSI (false=trade every bar signal)
+input int    InpEMAFast           = 5;     // EMA fast period (SignalTF)
+input int    InpEMASlow           = 13;    // EMA slow period (SignalTF)
+input int    InpRSIPeriod         = 7;     // RSI period (SignalTF)
+input double InpRSIBuyMax         = 75.0;  // RSI max allowed for BUY
+input double InpRSISellMin        = 25.0;  // RSI min allowed for SELL
+input int    InpMinBodyPct        = 0;     // Min candle body% of range (0=off)
 
 
 input group "=== Consecutive Loss Pause ==="
-input int    InpMaxConsecLoss     = 3;     // MaxConsecLoss: pause after N losses
+input int    InpMaxConsecLoss     = 0;     // MaxConsecLoss: pause after N losses (0=off)
 input int    InpPauseBars         = 5;     // PauseBars: M1 bars to wait before resuming
 
 //──────────────────────────────────────────────────────────────────────────────
@@ -169,6 +174,101 @@ double CalcDynamicLot()
    return NormalizeLot(riskMoney / slMoney);
 }
 
+// Lot sizing for burst trades — uses InpBurstRiskPct and InpBurstSLPct independently
+// from seed lot sizing so one DynSL event can never blow more than BurstRiskPct*BurstCount
+double CalcBurstLot()
+{
+   double threshold = (InpBurstSLPct > 0) ? InpBurstSLPct : GetDynamicThreshold();
+   g_sym.RefreshRates();
+   double price = (g_sym.Ask() + g_sym.Bid()) / 2.0;
+   if (price <= 0) return NormalizeLot(InpMinLot);
+
+   int slPts = (int)MathRound(threshold / 100.0 * price / _Point);
+   if (slPts <= 0) return NormalizeLot(InpMinLot);
+
+   double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskMoney = equity * InpBurstRiskPct / 100.0;
+   double tickVal   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if (tickVal <= 0 || tickSize <= 0) return NormalizeLot(InpMinLot);
+
+   double slMoney = (slPts * _Point / tickSize) * tickVal;
+   if (slMoney <= 0) return NormalizeLot(InpMinLot);
+
+   return NormalizeLot(riskMoney / slMoney);
+}
+
+// Live EMA alignment check (bar 0 = current, for real-time TP hold decisions)
+bool CheckEMAAligned(ENUM_ORDER_TYPE dir)
+{
+   if (g_hEMAFast == INVALID_HANDLE || g_hEMASlow == INVALID_HANDLE) return true;
+   double ef[1], es[1];
+   if (CopyBuffer(g_hEMAFast, 0, 0, 1, ef) < 1) return true;
+   if (CopyBuffer(g_hEMASlow, 0, 0, 1, es) < 1) return true;
+   return (dir == ORDER_TYPE_BUY) ? (ef[0] > es[0]) : (ef[0] < es[0]);
+}
+
+void UpdateDashboard()
+{
+   string phase = (g_phase == PHASE_NONE ? "IDLE" : g_phase == PHASE_SEED ? "SEED" : "BURST");
+   string dir   = (g_basketDir == ORDER_TYPE_BUY ? "▲ BUY" : "▼ SELL");
+
+   double totalPnL = 0;
+   int    positions = 0;
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if (!g_pos.SelectByIndex(i))                 continue;
+      if (g_pos.Magic()  != (ulong)InpMagicNumber) continue;
+      if (g_pos.Symbol() != _Symbol)               continue;
+      totalPnL += g_pos.Profit() + g_pos.Swap();
+      positions++;
+   }
+
+   double equity     = AccountInfoDouble(ACCOUNT_EQUITY);
+   double pnlPct     = (equity > 0) ? (totalPnL / equity * 100.0) : 0.0;
+   double signalMove = 0.0;
+   int    elapsed    = 0;
+
+   if (g_phase != PHASE_NONE && g_signalPrice > 0)
+   {
+      g_sym.RefreshRates();
+      double cur = (g_basketDir == ORDER_TYPE_BUY) ? g_sym.Bid() : g_sym.Ask();
+      signalMove = (g_basketDir == ORDER_TYPE_BUY)
+                   ? (cur - g_signalPrice) / g_signalPrice * 100.0
+                   : (g_signalPrice - cur) / g_signalPrice * 100.0;
+      if (g_burstOpenTime > 0)
+         elapsed = (int)(TimeCurrent() - g_burstOpenTime);
+   }
+
+   double tpNext = (double)g_burstRound * InpBurstTPPct;
+   double dynSL  = GetDynamicThreshold();
+   if (InpBurstSLPct > 0) dynSL = MathMin(dynSL, InpBurstSLPct);
+   bool emaAlign = CheckEMAAligned(g_basketDir);
+
+   Comment(StringFormat(
+      "══ FlipTrail v6.35 ══════════════════\n"
+      " Phase   : %-6s  %s\n"
+      " Pos     : %d open   Round: %d / %d\n"
+      " Signal  : %.5f\n"
+      " Move    : %+.3f%%   Peak: +%.3f%%\n"
+      " Next TP : +%.3f%%   SL: -%.3f%%\n"
+      " Basket  : %+.2f  (%+.2f%%)\n"
+      " Elapsed : %ds\n"
+      " EMA     : %s\n"
+      " TF      : %s   EMA%d/%d  RSI%d\n"
+      "═════════════════════════════════════",
+      phase, (g_phase != PHASE_NONE ? dir : ""),
+      positions, g_burstRound, InpMaxBursts,
+      g_signalPrice,
+      signalMove, g_peakSignalMovePct,
+      tpNext, dynSL,
+      totalPnL, pnlPct,
+      elapsed,
+      emaAlign ? "aligned ✓" : "reversing ✗",
+      EnumToString(InpSignalTF), InpEMAFast, InpEMASlow, InpRSIPeriod
+   ));
+}
+
 bool CheckIndicatorFilter(ENUM_ORDER_TYPE dir)
 {
    if (g_hEMAFast == INVALID_HANDLE || g_hEMASlow == INVALID_HANDLE || g_hRSI == INVALID_HANDLE)
@@ -242,7 +342,7 @@ void CloseAllOurPositions(const string reason)
          Sleep(50);
       }
 
-   PrintFormat("[v6.3] CloseAll [%s] | %d positions", reason, total);
+   PrintFormat("[v6.35] CloseAll [%s] | %d positions", reason, total);
 }
 
 void CloseAllProfitable(const string reason)
@@ -269,16 +369,23 @@ void CloseAllProfitable(const string reason)
       }
 
    if (closed > 0)
-      PrintFormat("[v6.3] CloseProfitable [%s] | closed=%d of %d", reason, closed, total);
+      PrintFormat("[v6.35] CloseProfitable [%s] | closed=%d of %d", reason, closed, total);
 }
 
-// Close all positions that individually hit InpBurstTPPct%
+// Close all positions that individually hit the round-based signal-price TP threshold.
+// Threshold = burstRound * InpBurstTPPct from g_signalPrice, so seed + burst trades
+// all reach the same target simultaneously, enabling trend-continuation to fire.
 // Returns number of positions closed
 int CloseIndividualTP()
 {
    g_sym.RefreshRates();
    double ask = g_sym.Ask();
    double bid = g_sym.Bid();
+
+   if (g_signalPrice <= 0) return 0;
+
+   // Each burst round advances the TP milestone by one InpBurstTPPct step from signal price
+   double tpThreshold = (double)g_burstRound * InpBurstTPPct;
 
    ulong tickets[];
    int   total = 0;
@@ -289,14 +396,12 @@ int CloseIndividualTP()
       if (g_pos.Magic()  != (ulong)InpMagicNumber) continue;
       if (g_pos.Symbol() != _Symbol)               continue;
 
-      double entryPrice = g_pos.PriceOpen();
-      if (entryPrice <= 0) continue;
-
+      // Measure move from signal price (same reference for seed + burst trades)
       double changePct = (g_pos.PositionType() == POSITION_TYPE_BUY)
-                         ? (bid - entryPrice) / entryPrice * 100.0
-                         : (entryPrice - ask) / entryPrice * 100.0;
+                         ? (bid - g_signalPrice) / g_signalPrice * 100.0
+                         : (g_signalPrice - ask) / g_signalPrice * 100.0;
 
-      if (changePct >= InpBurstTPPct)
+      if (changePct >= tpThreshold)
       {
          ArrayResize(tickets, total + 1);
          tickets[total++] = g_pos.Ticket();
@@ -327,9 +432,9 @@ int OpenTrades(int count, ENUM_ORDER_TYPE dir, double lot, double &entrySum)
       bool   ok  = false;
 
       if (dir == ORDER_TYPE_BUY)
-         ok = g_trade.Buy(lot, _Symbol, ask, 0, 0, "FTV63");
+         ok = g_trade.Buy(lot, _Symbol, ask, 0, 0, "FTV631");
       else
-         ok = g_trade.Sell(lot, _Symbol, bid, 0, 0, "FTV63");
+         ok = g_trade.Sell(lot, _Symbol, bid, 0, 0, "FTV631");
 
       uint rc = g_trade.ResultRetcode();
       PrintResult(StringFormat("[%s] v6.3 %s t=%d/%d lot=%.2f",
@@ -355,7 +460,7 @@ int OpenTrades(int count, ENUM_ORDER_TYPE dir, double lot, double &entrySum)
 
 void OpenBurst()
 {
-   double lot      = CalcDynamicLot();
+   double lot      = CalcBurstLot();
    double entrySum = 0.0;
    int    opened   = OpenTrades(InpBurstCount, g_basketDir, lot, entrySum);
 
@@ -364,10 +469,12 @@ void OpenBurst()
    g_burstRound++;
    g_timeGateFired = false;
 
+   double tpTarget = (double)g_burstRound * InpBurstTPPct;
    PrintFormat("[Burst OPEN] round=%d/%d | %d/%d trades | lot=%.2f | signalPrice=%.5f | "
-               "IndivTP=%.3f%% | PeakKeep=%.0f%% | TimeGate=%ds",
+               "IndivTP=%.3f%% (round%d*%.3f%%) | BurstSL=%.3f%% | PeakKeep=%.0f%% | TimeGate=%ds",
                g_burstRound, InpMaxBursts, opened, InpBurstCount, lot,
-               g_signalPrice, InpBurstTPPct, InpPeakKeepPct, InpBurstMaxSec);
+               g_signalPrice, tpTarget, g_burstRound, InpBurstTPPct,
+               InpBurstSLPct, InpPeakKeepPct, InpBurstMaxSec);
 }
 
 //──────────────────────────────────────────────────────────────────────────────
@@ -385,30 +492,6 @@ void CheckSeedPhase()
    double seedMovePct = (g_basketDir == ORDER_TYPE_BUY)
                         ? (currentPrice - g_signalPrice) / g_signalPrice * 100.0
                         : (g_signalPrice - currentPrice) / g_signalPrice * 100.0;
-
-   // Emergency loss in seed phase
-   if (InpMaxLossPct > 0)
-   {
-      double equity   = AccountInfoDouble(ACCOUNT_EQUITY);
-      double totalPnL = 0.0;
-      for (int i = PositionsTotal() - 1; i >= 0; i--)
-      {
-         if (!g_pos.SelectByIndex(i))                 continue;
-         if (g_pos.Magic()  != (ulong)InpMagicNumber) continue;
-         if (g_pos.Symbol() != _Symbol)               continue;
-         totalPnL += g_pos.Profit() + g_pos.Swap();
-      }
-      double lossPct = (equity > 0) ? (-totalPnL / equity * 100.0) : 0.0;
-      if (lossPct >= InpMaxLossPct)
-      {
-         PrintFormat("[Seed] Emergency loss %.3f%% >= %.3f%% — abort seeds", lossPct, InpMaxLossPct);
-         CloseAllOurPositions("SeedEmergencyLoss");
-         RecordHistory(seedMovePct);
-         g_consecLoss++;
-         ResetSignal();
-         return;
-      }
-   }
 
    // DynSL abort
    double dynSL = GetDynamicThreshold();
@@ -476,57 +559,123 @@ void CheckExit()
       }
    }
 
-   // ── 2. Individual TP per position ─────────────────────────────────────────
-   int indivClosed = CloseIndividualTP();
-   if (indivClosed > 0)
+   // ── 2. TP milestone — hold if EMA aligned, close if reversing ───────────
+   double tpThreshold = (double)g_burstRound * InpBurstTPPct;
+   if (tpThreshold > 0 && signalMovePct >= tpThreshold)
    {
-      int remaining = CountOurPositions();
-      PrintFormat("[Exit] IndivTP closed=%d | remaining=%d | signalMove=%.3f%%",
-                  indivClosed, remaining, signalMovePct);
+      bool emaAligned = CheckEMAAligned(g_basketDir);
 
-      if (remaining == 0)
+      if (emaAligned && g_burstRound < InpMaxBursts)
       {
-         RecordHistory(signalMovePct);
-         g_consecLoss = 0;
-
-         // Trend continuation — re-open burst if signal still positive
-         if (g_burstRound < InpMaxBursts && signalMovePct >= InpSeedTPPct)
+         // EMA still with us — advance TP target, hold positions (no spread cost)
+         g_burstRound++;
+         g_burstOpenTime = TimeCurrent();     // reset timed exits for new round
+         g_peakSignalMovePct = signalMovePct; // reset peak reference
+         PrintFormat("[TP->Hold] %.3f%% hit | EMA aligned | holding | next TP=%.3f%% round %d/%d",
+                     tpThreshold, (double)g_burstRound * InpBurstTPPct,
+                     g_burstRound, InpMaxBursts);
+      }
+      else
+      {
+         // EMA reversing or max rounds — take the profit now
+         int closed = CloseIndividualTP();
+         if (closed > 0)
          {
-            PrintFormat("[Burst] Trend continuation round %d/%d | signalMove=%.3f%%",
-                        g_burstRound + 1, InpMaxBursts, signalMovePct);
-            OpenBurst();
+            RecordHistory(signalMovePct);
+            g_consecLoss = 0;
+            PrintFormat("[Exit] IndivTP closed=%d | signalMove=%.3f%% | EMA %s | round %d/%d",
+                        closed, signalMovePct,
+                        emaAligned ? "maxRounds" : "reversing",
+                        g_burstRound, InpMaxBursts);
+            if (CountOurPositions() == 0) { ResetSignal(); return; }
          }
-         else
+      }
+   }
+
+   // ── 3. Timed basket profit — lock in gains after X minutes if in net profit ──
+   if (InpBasketMaxProfitMins > 0)
+   {
+      int elapsed = (int)(TimeCurrent() - g_burstOpenTime);
+      if (elapsed >= InpBasketMaxProfitMins * 60)
+      {
+         double totalPnL = 0.0;
+         for (int i = PositionsTotal() - 1; i >= 0; i--)
          {
-            PrintFormat("[Burst] Done | round=%d/%d | signalMove=%.3f%%",
-                        g_burstRound, InpMaxBursts, signalMovePct);
+            if (!g_pos.SelectByIndex(i))                 continue;
+            if (g_pos.Magic()  != (ulong)InpMagicNumber) continue;
+            if (g_pos.Symbol() != _Symbol)               continue;
+            totalPnL += g_pos.Profit() + g_pos.Swap();
+         }
+         if (totalPnL > 0 && signalMovePct >= InpBurstTPPct)
+         {
+            PrintFormat("[Exit] BasketTimedProfit: %ds elapsed | profit=%.2f | move=%.3f%% — closing all",
+                        elapsed, totalPnL, signalMovePct);
+            CloseAllOurPositions("BasketTimedProfit");
+            RecordHistory(signalMovePct);
+            g_consecLoss = 0;
+            ResetSignal();
+            return;
+         }
+      }
+   }
+
+   // ── 4. Timed basket loss — give trades breathing room, then cut if still losing ──
+   if (InpBasketMaxLossMins > 0 && InpBasketLossPct > 0)
+   {
+      int elapsed = (int)(TimeCurrent() - g_burstOpenTime);
+      if (elapsed >= InpBasketMaxLossMins * 60)
+      {
+         double equity   = AccountInfoDouble(ACCOUNT_EQUITY);
+         double totalPnL = 0.0;
+         for (int i = PositionsTotal() - 1; i >= 0; i--)
+         {
+            if (!g_pos.SelectByIndex(i))                 continue;
+            if (g_pos.Magic()  != (ulong)InpMagicNumber) continue;
+            if (g_pos.Symbol() != _Symbol)               continue;
+            totalPnL += g_pos.Profit() + g_pos.Swap();
+         }
+         double lossPct = (equity > 0 && totalPnL < 0) ? (-totalPnL / equity * 100.0) : 0.0;
+         if (lossPct >= InpBasketLossPct)
+         {
+            PrintFormat("[Exit] BasketTimedLoss: %ds elapsed | basket loss=%.2f%% >= %.2f%% — closing all",
+                        elapsed, lossPct, InpBasketLossPct);
+            CloseAllOurPositions("BasketTimedLoss");
+            RecordHistory(signalMovePct);
+            g_consecLoss++;
+            ResetSignal();
+            return;
+         }
+      }
+   }
+
+   // ── 5. Peak pullback — lock in gains, hold losers for DynSL ─────────────
+   // Never close a losing position here — only lock in gains on the winners.
+   // Remaining losers stay open until DynSL fires at -InpSLFloorPct%.
+   if (InpPeakKeepPct > 0 && g_peakSignalMovePct > InpSeedTPPct)
+   {
+      double keepThreshold = g_peakSignalMovePct * InpPeakKeepPct / 100.0;
+      if (signalMovePct < keepThreshold)
+      {
+         PrintFormat("[Exit] PeakPullback: signalMove=%.3f%% < keepAt=%.3f%% (peak=%.3f%% * %.0f%%) — closing profitable only, losers held for DynSL",
+                     signalMovePct, keepThreshold, g_peakSignalMovePct, InpPeakKeepPct);
+         CloseAllProfitable("PeakPullback");
+         if (CountOurPositions() == 0)
+         {
+            RecordHistory(signalMovePct);
+            g_consecLoss = 0;
             ResetSignal();
          }
          return;
       }
    }
 
-   // ── 3. Peak pullback ──────────────────────────────────────────────────────
-   if (InpPeakKeepPct > 0 && g_peakSignalMovePct > InpSeedTPPct)
-   {
-      double keepThreshold = g_peakSignalMovePct * InpPeakKeepPct / 100.0;
-      if (signalMovePct < keepThreshold)
-      {
-         PrintFormat("[Exit] PeakPullback: signalMove=%.3f%% < keepAt=%.3f%% (peak=%.3f%% * %.0f%%)",
-                     signalMovePct, keepThreshold, g_peakSignalMovePct, InpPeakKeepPct);
-         CloseAllOurPositions("PeakPullback");
-         RecordHistory(signalMovePct);
-         if (signalMovePct <= 0) g_consecLoss++;
-         ResetSignal();
-         return;
-      }
-   }
-
-   // ── 4. DynSL from signal price ────────────────────────────────────────────
+   // ── 6. DynSL from signal price — capped at InpBurstSLPct for burst ──────
    double dynSL = GetDynamicThreshold();
+   if (InpBurstSLPct > 0) dynSL = MathMin(dynSL, InpBurstSLPct);
    if (signalMovePct <= -dynSL)
    {
-      PrintFormat("[Exit] DynSL: signalMove=%.3f%% <= -%.3f%%", signalMovePct, dynSL);
+      PrintFormat("[Exit] DynSL: signalMove=%.3f%% <= -%.3f%% (burstSL cap=%.3f%%)",
+                  signalMovePct, dynSL, InpBurstSLPct);
       CloseAllOurPositions("DynSL");
       RecordHistory(signalMovePct);
       g_consecLoss++;
@@ -534,17 +683,19 @@ void CheckExit()
       return;
    }
 
-   // ── 5. Time gate — close profitable, hold rest ────────────────────────────
+   // ── 7. Time gate — close ALL and reset (fast exit when TP hasn't fired) ──
    if (!g_timeGateFired && InpBurstMaxSec > 0)
    {
       int elapsed = (int)(TimeCurrent() - g_burstOpenTime);
       if (elapsed >= InpBurstMaxSec)
       {
          g_timeGateFired = true;
-         PrintFormat("[Exit] TimeGate %ds elapsed — closing profitable (signalMove=%.3f%%)",
+         PrintFormat("[Exit] TimeGate %ds elapsed — closing ALL (signalMove=%.3f%%)",
                      elapsed, signalMovePct);
-         CloseAllProfitable("TimeGate");
-         // Hold remaining positions — other exit conditions continue next tick
+         CloseAllOurPositions("TimeGate");
+         RecordHistory(signalMovePct);
+         ResetSignal();
+         return;
       }
    }
 }
@@ -584,10 +735,10 @@ void TrySeedEntry()
       }
    }
 
-   double c  = iClose(_Symbol, PERIOD_M1, 1);
-   double o  = iOpen (_Symbol, PERIOD_M1, 1);
-   double hi = iHigh (_Symbol, PERIOD_M1, 1);
-   double lo = iLow  (_Symbol, PERIOD_M1, 1);
+   double c  = iClose(_Symbol, InpSignalTF, 1);
+   double o  = iOpen (_Symbol, InpSignalTF, 1);
+   double hi = iHigh (_Symbol, InpSignalTF, 1);
+   double lo = iLow  (_Symbol, InpSignalTF, 1);
    if (c == o) return;
 
    ENUM_ORDER_TYPE dir = (c > o) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
@@ -599,7 +750,7 @@ void TrySeedEntry()
       if (range > 0 && (body / range) * 100.0 < (double)InpMinBodyPct) return;
    }
 
-   if (!CheckIndicatorFilter(dir)) return;
+   if (InpUseEntryFilter && !CheckIndicatorFilter(dir)) return;
 
    // Open seed trades
    double lot      = CalcDynamicLot();
@@ -609,17 +760,20 @@ void TrySeedEntry()
    if (opened > 0)
    {
       g_basketDir         = dir;
-      g_phase             = PHASE_SEED;
+      g_phase             = PHASE_SEED;   // set before OpenBurst so g_signalPrice is ready
       g_signalPrice       = entrySum / opened;
       g_peakSignalMovePct = 0.0;
       g_burstRound        = 0;
       g_timeGateFired     = false;
 
       PrintFormat("[Seed OPEN] %s | %d/%d trades | lot=%.2f | signalPrice=%.5f | "
-                  "waiting %.3f%% → burst of %d | DynSL=%.3f%%",
+                  "firing burst immediately (EMA/RSI is confirmation) | seedSL=%.3f%%",
                   (dir==ORDER_TYPE_BUY?"BUY":"SELL"),
                   opened, InpSeedCount, lot, g_signalPrice,
-                  InpSeedTPPct, InpBurstCount, GetDynamicThreshold());
+                  GetDynamicThreshold());
+
+      // Burst fires on the same tick — no per-tick wait that DynSL can abort
+      OpenBurst();
    }
 }
 
@@ -644,9 +798,9 @@ int OnInit()
    g_isNetting = (AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_NETTING);
    PrintFormat("Account: %s", g_isNetting ? "NETTING" : "HEDGING");
 
-   g_hEMAFast = iMA(_Symbol, PERIOD_M1, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
-   g_hEMASlow = iMA(_Symbol, PERIOD_M1, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
-   g_hRSI     = iRSI(_Symbol, PERIOD_M1, InpRSIPeriod, PRICE_CLOSE);
+   g_hEMAFast = iMA(_Symbol, InpSignalTF, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+   g_hEMASlow = iMA(_Symbol, InpSignalTF, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
+   g_hRSI     = iRSI(_Symbol, InpSignalTF, InpRSIPeriod, PRICE_CLOSE);
 
    if (g_hEMAFast == INVALID_HANDLE || g_hEMASlow == INVALID_HANDLE || g_hRSI == INVALID_HANDLE)
    {
@@ -663,16 +817,16 @@ int OnInit()
    g_historyIndex = 0;
    g_historyCount = 0;
 
-   PrintFormat("FlipTrail v6.30 | %s | Risk=%.1f%% | "
-               "Seed=%d @ %.3f%% → Burst=%d trades | "
-               "IndivTP=%.3f%% | PeakKeep=%.0f%% | TimeGate=%ds | "
-               "MaxBursts=%d | EmergLoss=%.2f%% | DynSL floor=%.2f%% | "
+   PrintFormat("FlipTrail v6.35 | %s | TF=%s | SeedRisk=%.1f%% BurstRisk=%.1f%% | "
+               "Seed=%d → ImmediateBurst=%d trades | "
+               "IndivTP=%.3f%%/round | BurstSL=%.3f%% | PeakKeep=%.0f%% | MaxBursts=%d | "
+               "TimedProfit=%dmin | TimedLoss=%dmin@%.1f%% | DynSLfloor=%.2f%% | "
                "EMA%d/EMA%d RSI(%d) | Magic=%lld",
-               _Symbol, InpRiskPct,
-               InpSeedCount, InpSeedTPPct, InpBurstCount,
-               InpBurstTPPct, InpPeakKeepPct, InpBurstMaxSec,
-               InpMaxBursts, InpMaxLossPct, InpSLFloorPct,
-               InpEMAFast, InpEMASlow, InpRSIPeriod,
+               _Symbol, EnumToString(InpSignalTF), InpRiskPct, InpBurstRiskPct,
+               InpSeedCount, InpBurstCount,
+               InpBurstTPPct, InpBurstSLPct, InpPeakKeepPct, InpMaxBursts,
+               InpBasketMaxProfitMins, InpBasketMaxLossMins, InpBasketLossPct,
+               InpSLFloorPct, InpEMAFast, InpEMASlow, InpRSIPeriod,
                InpMagicNumber);
 
    return INIT_SUCCEEDED;
@@ -680,19 +834,22 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
+   Comment("");
    if (g_hEMAFast != INVALID_HANDLE) IndicatorRelease(g_hEMAFast);
    if (g_hEMASlow != INVALID_HANDLE) IndicatorRelease(g_hEMASlow);
    if (g_hRSI     != INVALID_HANDLE) IndicatorRelease(g_hRSI);
 
-   PrintFormat("FlipTrail v6.30 deinit | phase=%d | burstRound=%d | consecLoss=%d | reason=%d",
+   PrintFormat("FlipTrail v6.35 deinit | phase=%d | burstRound=%d | consecLoss=%d | reason=%d",
                (int)g_phase, g_burstRound, g_consecLoss, reason);
 }
 
 void OnTick()
 {
-   datetime bt     = iTime(_Symbol, PERIOD_M1, 0);
+   datetime bt     = iTime(_Symbol, InpSignalTF, 0);
    bool     newBar = (bt != 0 && bt != g_lastBarTime);
    if (newBar) g_lastBarTime = bt;
+
+   UpdateDashboard();
 
    switch (g_phase)
    {
