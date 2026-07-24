@@ -42,9 +42,24 @@ input  int     InpTakeProfit       = 50000;  // Hard TP (backstop — trail is p
 input  int     InpMaxPositions     = 4;      // Max open positions (both sides)
 
 sinput string  _sep1               = "─── Trail ───────────────────────";
-input  int     InpTrailActivation  = 100;    // Arm trail when profit >= (points)
-input  int     InpTrailDistance    = 20;     // Trail SL distance behind price (points)
-input  int     InpBEBuffer         = 10;     // Breakeven buffer for loser (points above/below entry)
+input  int     InpTrailActivation  = 100;    // [OPT: 30–200 step 20] Arm trail when profit >= (points)
+input  int     InpTrailDistance    = 20;     // [OPT: 10–60 step 10] Trail SL distance behind price (points)
+input  int     InpBEBuffer         = 10;     // [OPT: 0–30 step 5] Breakeven buffer for loser (points)
+
+sinput string  _sep1b              = "─── ATR Dynamic Mode ────────────";
+input  bool    InpUseATRMode       = true;   // Scale all distances with ATR (recommended)
+input  int     InpATRPeriod        = 14;     // ATR period (bars)
+input  double  InpEntryATR         = 0.20;   // [OPT: 0.10–0.40 step 0.05] Entry offset = X × ATR
+input  double  InpSLATR            = 2.00;   // [OPT: 1.0–3.0 step 0.5] Stop loss = X × ATR
+input  double  InpTPATR            = 6.00;   // Take profit = X × ATR (backstop)
+input  double  InpTrailActATR      = 0.60;   // [OPT: 0.30–1.20 step 0.15] Trail arm = X × ATR
+input  double  InpTrailDistATR     = 0.40;   // [OPT: 0.10–0.60 step 0.10] Trail distance = X × ATR
+input  double  InpBEBufferATR      = 0.10;   // Breakeven floor = X × ATR
+
+sinput string  _sep_adx            = "─── ADX Chop Filter ─────────────";
+input  bool    InpUseADX           = true;   // Skip straddle if ADX < MinLevel (avoids chop)
+input  int     InpADXPeriod        = 14;     // ADX period (bars)
+input  double  InpADXMinLevel      = 20.0;   // [OPT: 15–30 step 5] Min ADX to allow entry
 
 sinput string  _sep2               = "─── Filters ─────────────────────";
 input  int     InpMaxSpread        = 40;     // Skip entry if spread > (points)
@@ -99,6 +114,19 @@ SVirtSL    g_virtSLs[100];
 int        g_virtSLCount    = 0;
 
 int      g_atrHandle        = INVALID_HANDLE;
+int      g_adxHandle        = INVALID_HANDLE;
+
+// Effective parameters — recomputed each bar (ATR mode) or fixed fallback
+struct SEff
+{
+    int entryOffset;
+    int stopLoss;
+    int takeProfit;
+    int trailActivation;
+    int trailDistance;
+    int breakevenBuffer;
+};
+SEff g_eff;
 
 double   g_tradeHistory[20];
 int      g_tradeHistIdx     = 0;
@@ -141,11 +169,23 @@ int OnInit()
 
     g_today = TodayMidnight();
     RefreshDailyStats();
+
+    g_atrHandle = iATR(_Symbol, PERIOD_CURRENT, InpATRPeriod);
+    if(g_atrHandle == INVALID_HANDLE)
+        Print("WARNING: ATR handle failed — ATR mode and basket ATR resume disabled.");
+
+    g_adxHandle = iADX(_Symbol, PERIOD_CURRENT, InpADXPeriod);
+    if(g_adxHandle == INVALID_HANDLE)
+        Print("WARNING: ADX handle failed — chop filter disabled.");
+
+    CalcEffectivePts();   // init g_eff with fallback values
     CheckBrokerStopsLevel();
 
-    g_atrHandle = iATR(_Symbol, PERIOD_CURRENT, 14);
-    if(g_atrHandle == INVALID_HANDLE)
-        Print("WARNING: ATR handle failed — basket ATR resume disabled.");
+    if(InpUseATRMode)
+        PrintFormat("ATR mode ON: entry=%.2f×  SL=%.2f×  TP=%.2f×  trail=%.2f×  dist=%.2f×  BE=%.2f×",
+                    InpEntryATR, InpSLATR, InpTPATR, InpTrailActATR, InpTrailDistATR, InpBEBufferATR);
+    if(InpUseADX)
+        PrintFormat("ADX filter ON: period=%d  minLevel=%.1f", InpADXPeriod, InpADXMinLevel);
 
     PrintFormat("Init OK | symbol=%s  digits=%d  point=%.5f  magic=%lld  virtualMode=%s",
                 _Symbol, _Digits, _Point, InpMagic,
@@ -159,6 +199,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
     if(g_atrHandle != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
+    if(g_adxHandle != INVALID_HANDLE) IndicatorRelease(g_adxHandle);
     Comment("");
 }
 
@@ -184,6 +225,7 @@ void OnTick()
     if(!IsNewBar()) return;
 
     RefreshDailyStats();
+    CalcEffectivePts();
     CheckBrokerStopsLevel();
     CheckArmingCondition();
 
@@ -192,9 +234,9 @@ void OnTick()
     g_virtSell.active = false;
 
     if(g_basketPaused)         return;
-    if(DailyLossBreached())    return;
     if(TooSoonAfterWeekOpen()) return;
     if(InpUseSessionFilter && !InTradingWindow()) return;
+    if(IsChoppy())             return;
     if(CountPositions()       >= InpMaxPositions) return;
 
     long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
@@ -213,10 +255,55 @@ void OnTick()
 void CheckBrokerStopsLevel()
 {
     long stopsLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-    g_useVirtual = (stopsLevel > 0 && (long)InpEntryOffset <= stopsLevel);
+    g_useVirtual = (stopsLevel > 0 && (long)g_eff.entryOffset <= stopsLevel);
     if(g_useVirtual)
         PrintFormat("VirtualMode ON: entry offset %d pts <= broker stops level %d pts",
-                    InpEntryOffset, (int)stopsLevel);
+                    g_eff.entryOffset, (int)stopsLevel);
+}
+
+//──────────────────────────────────────────────────────────────────
+//  COMPUTE EFFECTIVE PARAMETERS  (ATR-scaled or fixed fallback)
+//──────────────────────────────────────────────────────────────────
+void CalcEffectivePts()
+{
+    g_eff.entryOffset     = InpEntryOffset;
+    g_eff.stopLoss        = InpStopLoss;
+    g_eff.takeProfit      = InpTakeProfit;
+    g_eff.trailActivation = InpTrailActivation;
+    g_eff.trailDistance   = InpTrailDistance;
+    g_eff.breakevenBuffer = InpBEBuffer;
+
+    if(!InpUseATRMode || g_atrHandle == INVALID_HANDLE) return;
+
+    double atrBuf[];
+    ArraySetAsSeries(atrBuf, true);
+    if(CopyBuffer(g_atrHandle, 0, 1, 1, atrBuf) < 1) return;
+    double atrPts = atrBuf[0] / _Point;
+    if(atrPts <= 0.0) return;
+
+    g_eff.entryOffset     = (int)MathMax(1, MathRound(InpEntryATR     * atrPts));
+    g_eff.stopLoss        = (int)MathMax(1, MathRound(InpSLATR        * atrPts));
+    g_eff.takeProfit      = (int)MathMax(1, MathRound(InpTPATR        * atrPts));
+    g_eff.trailActivation = (int)MathMax(1, MathRound(InpTrailActATR  * atrPts));
+    g_eff.trailDistance   = (int)MathMax(1, MathRound(InpTrailDistATR * atrPts));
+    g_eff.breakevenBuffer = (int)MathMax(0, MathRound(InpBEBufferATR  * atrPts));
+}
+
+//──────────────────────────────────────────────────────────────────
+//  ADX CHOP FILTER
+//──────────────────────────────────────────────────────────────────
+bool IsChoppy()
+{
+    if(!InpUseADX || g_adxHandle == INVALID_HANDLE) return false;
+    double adxBuf[];
+    ArraySetAsSeries(adxBuf, true);
+    if(CopyBuffer(g_adxHandle, 0, 1, 1, adxBuf) < 1) return false;
+    if(adxBuf[0] < InpADXMinLevel)
+    {
+        PrintFormat("Skip: ADX=%.1f < %.1f (chop)", adxBuf[0], InpADXMinLevel);
+        return true;
+    }
+    return false;
 }
 
 //──────────────────────────────────────────────────────────────────
@@ -229,13 +316,13 @@ void PlaceStraddleOrders()
     double pt  = _Point;
     double lot = NormalizeLot(InpLot);
 
-    double bPrice = NormalizeDouble(ask + InpEntryOffset * pt, _Digits);
-    double bSL    = NormalizeDouble(bPrice - InpStopLoss  * pt, _Digits);
-    double bTP    = NormalizeDouble(bPrice + InpTakeProfit * pt, _Digits);
+    double bPrice = NormalizeDouble(ask + g_eff.entryOffset * pt, _Digits);
+    double bSL    = NormalizeDouble(bPrice - g_eff.stopLoss  * pt, _Digits);
+    double bTP    = NormalizeDouble(bPrice + g_eff.takeProfit * pt, _Digits);
 
-    double sPrice = NormalizeDouble(bid - InpEntryOffset * pt, _Digits);
-    double sSL    = NormalizeDouble(sPrice + InpStopLoss  * pt, _Digits);
-    double sTP    = NormalizeDouble(sPrice - InpTakeProfit * pt, _Digits);
+    double sPrice = NormalizeDouble(bid - g_eff.entryOffset * pt, _Digits);
+    double sSL    = NormalizeDouble(sPrice + g_eff.stopLoss  * pt, _Digits);
+    double sTP    = NormalizeDouble(sPrice - g_eff.takeProfit * pt, _Digits);
 
     if(g_useVirtual)
     {
@@ -390,26 +477,24 @@ void TrailOpenPositions()
         if(posType == POSITION_TYPE_BUY)
         {
             double profitPts = (bid - openPrice) / pt;
-            if(profitPts < (double)InpTrailActivation) continue;
+            if(profitPts < (double)g_eff.trailActivation) continue;
 
-            newSL = NormalizeDouble(bid - InpTrailDistance * pt, _Digits);
+            newSL = NormalizeDouble(bid - g_eff.trailDistance * pt, _Digits);
             if(newSL > curSL)
             {
                 doModify = true;
-                // First arm: SL is still below entry (original hard SL level)
                 firstArm = (curSL < openPrice);
             }
         }
         else if(posType == POSITION_TYPE_SELL)
         {
             double profitPts = (openPrice - ask) / pt;
-            if(profitPts < (double)InpTrailActivation) continue;
+            if(profitPts < (double)g_eff.trailActivation) continue;
 
-            newSL = NormalizeDouble(ask + InpTrailDistance * pt, _Digits);
+            newSL = NormalizeDouble(ask + g_eff.trailDistance * pt, _Digits);
             if(curSL <= 0.0 || newSL < curSL)
             {
                 doModify = true;
-                // First arm: SL is still above entry (original hard SL level)
                 firstArm = (curSL <= 0.0 || curSL > openPrice);
             }
         }
@@ -475,15 +560,13 @@ void MoveOppositeToBreakeven(int winnerType)
 
         if(loserType == POSITION_TYPE_BUY)
         {
-            // Loser buy: move SL UP to openPrice + buffer (so if price reverses to entry we close at ~0)
-            newBE     = NormalizeDouble(openPrice + InpBEBuffer * pt, _Digits);
-            shouldMove = (curSL < newBE); // only move if not already at/past BE
+            newBE      = NormalizeDouble(openPrice + g_eff.breakevenBuffer * pt, _Digits);
+            shouldMove = (curSL < newBE);
         }
         else
         {
-            // Loser sell: move SL DOWN to openPrice - buffer
-            newBE     = NormalizeDouble(openPrice - InpBEBuffer * pt, _Digits);
-            shouldMove = (curSL <= 0.0 || curSL > newBE); // only move if not already at/past BE
+            newBE      = NormalizeDouble(openPrice - g_eff.breakevenBuffer * pt, _Digits);
+            shouldMove = (curSL <= 0.0 || curSL > newBE);
         }
 
         if(!shouldMove) continue;
@@ -841,7 +924,6 @@ void DrawPanel()
     int    sellPos  = CountPositions(POSITION_TYPE_SELL);
     double floatPnL = FloatingPnL();
     double dailyPnL = g_dailyClosedPnL + floatPnL;
-    bool   halted   = DailyLossBreached();
     bool   weekSkip = TooSoonAfterWeekOpen();
 
     int pending = 0;
@@ -856,10 +938,19 @@ void DrawPanel()
 
     int virtPend = (g_virtBuy.active ? 1 : 0) + (g_virtSell.active ? 1 : 0);
 
+    // Live ADX value for panel
+    double adxNow = 0.0;
+    if(g_adxHandle != INVALID_HANDLE)
+    {
+        double adxBuf[]; ArraySetAsSeries(adxBuf, true);
+        if(CopyBuffer(g_adxHandle, 0, 1, 1, adxBuf) >= 1) adxNow = adxBuf[0];
+    }
+
     string statusStr;
     if(g_basketPaused) statusStr = "*** PAUSED (basket fired — await ATR) ***";
-    else if(halted)    statusStr = "*** HALTED (daily loss) ***";
     else if(weekSkip)  statusStr = "WEEK-OPEN SKIP";
+    else if(adxNow > 0 && adxNow < InpADXMinLevel)
+                       statusStr = StringFormat("CHOP SKIP (ADX=%.1f < %.1f)", adxNow, InpADXMinLevel);
     else               statusStr = "ACTIVE";
 
     string basketStr;
@@ -869,19 +960,23 @@ void DrawPanel()
     else
         basketStr = StringFormat("Building (%d/20 trades)", g_tradeHistCount);
 
+    string modeStr = InpUseATRMode ? "ATR" : "fixed";
+
     Comment(StringFormat(
-        "=== FixedLotStraddleEA v6.00 ===\n"
+        "=== FixedLotStraddleEA v6.10 ===\n"
         " Buys      : %d       Sells     : %d\n"
         " Pending   : %d       VirtPend  : %d\n"
         " VirtSLs   : %d       Orders    : %s\n"
         "─────────────────────────────────\n"
+        " Mode      : %s\n"
         " Entry off : %d pts   SL: %d pts\n"
         " TrailArm  : %d pts   Dist: %d pts\n"
         " BE Buffer : %d pts\n"
+        " ADX now   : %.1f     Min: %.1f\n"
         "─────────────────────────────────\n"
         " Float P/L : %+.2f USD\n"
         " Closed    : %d trades today\n"
-        " Daily P/L : %+.2f / limit -%.2f\n"
+        " Daily P/L : %+.2f USD\n"
         "─────────────────────────────────\n"
         " Basket    : %s\n"
         "─────────────────────────────────\n"
@@ -889,14 +984,42 @@ void DrawPanel()
         buyPos, sellPos,
         pending, virtPend,
         g_virtSLCount, g_useVirtual ? "virtual" : "real",
-        InpEntryOffset, InpStopLoss,
-        InpTrailActivation, InpTrailDistance,
-        InpBEBuffer,
+        modeStr,
+        g_eff.entryOffset, g_eff.stopLoss,
+        g_eff.trailActivation, g_eff.trailDistance,
+        g_eff.breakevenBuffer,
+        adxNow, InpADXMinLevel,
         floatPnL,
         g_closedTodayCount,
-        dailyPnL, InpDailyLossUSD,
+        dailyPnL,
         basketStr,
         statusStr
     ));
+}
+
+//──────────────────────────────────────────────────────────────────
+//  ON TESTER — custom optimization criterion
+//  In Strategy Tester → Optimization tab → select "Custom max"
+//  Score = ProfitFactor × WinRate × sqrt(Trades) × (1 − DrawdownPct)
+//──────────────────────────────────────────────────────────────────
+double OnTester()
+{
+    double profit      = TesterStatistics(STAT_PROFIT);
+    double pf          = TesterStatistics(STAT_PROFIT_FACTOR);
+    double totalTrades = TesterStatistics(STAT_TRADES);
+    double winTrades   = TesterStatistics(STAT_PROFIT_TRADES);
+    double ddPct       = TesterStatistics(STAT_EQUITY_DD_RELATIVE);
+
+    if(totalTrades  < 30)   return 0.0;
+    if(profit       <= 0.0) return 0.0;
+    if(pf           < 1.1)  return 0.0;
+    if(ddPct        > 40.0) return 0.0;
+
+    double winRate = winTrades / MathMax(totalTrades, 1.0);
+
+    return pf
+         * winRate
+         * MathSqrt(totalTrades)
+         * (1.0 - ddPct / 100.0);
 }
 //+------------------------------------------------------------------+
