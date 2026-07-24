@@ -3,51 +3,6 @@
 //|  Fixed-Lot Buy/Sell Stop Straddle — Any Symbol M5               |
 //|  Hedging account | MetaEditor build 4000+                       |
 //+------------------------------------------------------------------+
-//
-//  STRATEGY
-//  --------
-//  On each new M5 bar the EA deletes its stale pending orders, then
-//  brackets price with a Buy Stop (Ask + InpEntryOffset pts) and a
-//  Sell Stop (Bid - InpEntryOffset pts), each carrying hard SL/TP.
-//  Both legs may trigger in the same bar. Whichever leg fills rides
-//  a per-position trailing stop: it arms once the trade is
-//  InpTrailActivation pts in profit and then ratchets InpTrailDistance
-//  pts behind price. The hard TP is a distant backstop; the trail is
-//  the primary exit. Fixed lot — no martingale, no grid, no scaling.
-//
-//  WARNING
-//  -------
-//  If both legs trigger in a choppy session both fill and stop out at
-//  InpStopLoss. Use InpDailyLossUSD and the session filter to cap
-//  exposure.
-//
-//  INPUTS
-//  ------
-//  InpLot               Fixed lot size per order (no scaling).
-//  InpEntryOffset       Points above Ask (Buy Stop) / below Bid
-//                       (Sell Stop) for the pending entry price.
-//  InpStopLoss          Hard SL in points from entry price.
-//  InpTakeProfit        Hard TP in points from entry price (backstop;
-//                       trail is the primary exit).
-//  InpTrailActivation   Profit in points before the trailing SL arms.
-//  InpTrailDistance     Points the trailing SL stays behind price
-//                       (ratchet — never moves backward).
-//  InpMaxPositions      Max concurrent open positions (both sides);
-//                       new pending orders skipped at/above cap.
-//  InpMaxSpread         Skip placing orders when spread > this (pts).
-//  InpUseSessionFilter  When true, entries only between InpStartHour
-//                       and InpEndHour (server time).
-//  InpStartHour         Session start hour (server, inclusive).
-//  InpEndHour           Session end hour   (server, exclusive).
-//  InpDailyLossUSD      Halt new entries when EA P/L today < -value.
-//                       Does not close open trades. Resets next day.
-//  InpSkipMinutesAfterOpen  Skip entries N minutes after Monday open.
-//  InpBasketProtectPct  Close all if basket drawdown >= X% of armed winSum.
-//  InpArmingPct         Arm basket when winSum >= X% of balance (>=70% wins).
-//  InpATRResumeMulti    Resume after basket pause when ATR > avg * this.
-//  InpMagic             Magic number — isolates this EA's trades.
-//
-//+------------------------------------------------------------------+
 #property copyright   "FixedLotStraddleEA v1"
 #property link        ""
 #property version     "1.00"
@@ -65,13 +20,13 @@
 sinput string  _sep0               = "─── Entry ───────────────────────";
 input  double  InpLot              = 0.01;   // [OPT: fix at 0.01 during optimize] Lot size (fixed)
 input  int     InpEntryOffset      = 100;    // [OPT: 50–250 step 25] Offset from Ask/Bid (points)
-input  int     InpStopLoss         = 1300;   // [OPT: 500–2000 step 250] Hard SL from entry (points)
-input  int     InpTakeProfit       = 50000;  // [OPT: leave fixed — trail is primary exit] Hard TP backstop
+input  int     InpStopLoss         = 600;    // [OPT: 500–2000 step 250] Hard SL from entry (points)
+input  int     InpTakeProfit       = 600;    // [OPT: leave fixed — trail is primary exit] Hard TP backstop
 input  int     InpMaxPositions     = 5;      // Max open positions (both sides)
 
 sinput string  _sep1               = "─── Trail ───────────────────────";
-input  int     InpTrailActivation  = 100;    // [OPT: 30–200 step 20] Arm trail when profit >= (points)
-input  int     InpTrailDistance    = 80;     // [OPT: 10–80 step 10] Trail SL distance behind price (points)
+input  int     InpTrailActivation  = 150;    // [OPT: 30–200 step 20] Arm trail when profit >= (points)
+input  int     InpTrailDistance    = 100;    // [OPT: 10–80 step 10] Trail SL distance behind price (points)
 
 sinput string  _sep2               = "─── Filters ─────────────────────";
 input  int     InpMaxSpread        = 40;     // [OPT: 25–60 step 5] Skip entry if spread > (points)
@@ -80,8 +35,7 @@ input  int     InpStartHour        = 8;      // [OPT: 7–10 step 1] Session sta
 input  int     InpEndHour          = 22;     // [OPT: 18–22 step 1] Session end hour   (server time)
 
 sinput string  _sep3               = "─── Risk ────────────────────────";
-input  double  InpDailyLossUSD     = 50.0;  // Daily loss halt in USD
-input  int     InpSkipMinutesAfterOpen = 15;// Skip N min after weekly market open
+input  int     InpSkipMinutesAfterOpen = 15; // Skip N min after weekly market open
 
 sinput string  _sep4               = "─── Basket Protection ───────────";
 input  double  InpBasketProtectPct = 50.0;  // Close all if basket drawdown >= X% of armed winSum
@@ -95,6 +49,8 @@ input  int     InpConvirmPts       = 80;     // Regular position profit (pts) ne
 input  double  InpMinProfitUSD     = 10.0;   // Conviction SL stays below entry until profit >= this USD
 input  int     InpHLSLBuffer       = 30;     // Buffer below prev-bar low / above prev-bar high for conviction SL (pts)
 input  double  InpHLBodyPct        = 0.40;   // M5 confirmation: body must be >= this fraction of candle range (0=off)
+input  int     InpHLTrailActivation = 200;   // Conviction trail: arm when profit >= (pts) — wider than regular
+input  int     InpHLTrailDistance   = 120;   // Conviction trail: distance behind price (pts) — wider than regular
 
 sinput string  _sep5               = "─── System ──────────────────────";
 input  long    InpMagic            = 20240;  // Magic number
@@ -164,6 +120,8 @@ int OnInit()
     }
     if(InpTrailDistance >= InpTrailActivation)
         Print("WARNING: InpTrailDistance >= InpTrailActivation — trail may never lock profit.");
+    if(InpHLTrailDistance >= InpHLTrailActivation)
+        Print("WARNING: InpHLTrailDistance >= InpHLTrailActivation — HL trail may never lock profit.");
 
     long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
     if(InpMaxSpread <= (int)spread)
@@ -419,6 +377,7 @@ void RemoveVirtSL(int idx)
 
 //──────────────────────────────────────────────────────────────────
 //  TRAILING STOP  (per tick, ratchet only)
+//  Regular and HL trades use separate trail arm/distance settings.
 //──────────────────────────────────────────────────────────────────
 void TrailOpenPositions()
 {
@@ -443,11 +402,15 @@ void TrailOpenPositions()
         bool   isHL      = (StringFind(PositionGetString(POSITION_COMMENT), "HL") >= 0);
         double posProfit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
 
+        // HL trades use their own wider trail arm + distance
+        int trailArm  = isHL ? InpHLTrailActivation : InpTrailActivation;
+        int trailDist = isHL ? InpHLTrailDistance   : InpTrailDistance;
+
         if(posType == POSITION_TYPE_BUY)
         {
             double profitPts = (bid - openPrice) / pt;
-            if(profitPts < (double)InpTrailActivation) continue;
-            newSL = NormalizeDouble(bid - InpTrailDistance * pt, _Digits);
+            if(profitPts < (double)trailArm) continue;
+            newSL = NormalizeDouble(bid - trailDist * pt, _Digits);
             // HL: keep SL below entry until MinProfitUSD is locked in
             if(isHL && posProfit < InpMinProfitUSD)
                 newSL = NormalizeDouble(MathMin(newSL, openPrice - pt), _Digits);
@@ -456,8 +419,8 @@ void TrailOpenPositions()
         else if(posType == POSITION_TYPE_SELL)
         {
             double profitPts = (openPrice - ask) / pt;
-            if(profitPts < (double)InpTrailActivation) continue;
-            newSL = NormalizeDouble(ask + InpTrailDistance * pt, _Digits);
+            if(profitPts < (double)trailArm) continue;
+            newSL = NormalizeDouble(ask + trailDist * pt, _Digits);
             // HL: keep SL above entry until MinProfitUSD is locked in
             if(isHL && posProfit < InpMinProfitUSD)
                 newSL = NormalizeDouble(MathMax(newSL, openPrice + pt), _Digits);
@@ -482,7 +445,7 @@ void TrailOpenPositions()
 //──────────────────────────────────────────────────────────────────
 //  HIGH-LOT CONVICTION ENTRY  (per tick)
 //
-//  Conviction entry — fires only when ALL four conditions are met:
+//  Fires only when ALL four conditions are met:
 //  1. Regular position profit >= InpConvirmPts  (move confirmed)
 //  2. Last closed M5 candle has strong body in the same direction:
 //       body >= InpHLBodyPct × full range  (real momentum, not doji)
@@ -506,8 +469,8 @@ void CheckConvictionEntry()
     double m5Low   = iLow  (_Symbol, PERIOD_M5, 1);
     double m5Range = m5High - m5Low;
     double m5Body  = MathAbs(m5Close - m5Open);
-    bool   m5Bull  = m5Close > m5Open;  // bullish bar
-    bool   m5Bear  = m5Close < m5Open;  // bearish bar
+    bool   m5Bull  = m5Close > m5Open;
+    bool   m5Bear  = m5Close < m5Open;
 
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
@@ -531,16 +494,16 @@ void CheckConvictionEntry()
         // ── Condition 2: M5 body strength + direction match ─────
         if(InpHLBodyPct > 0.0)
         {
-            if(m5Range <= 0.0) continue;                         // flat bar — skip
-            if(m5Body < InpHLBodyPct * m5Range) continue;       // weak candle — skip
-            if(posType == POSITION_TYPE_BUY  && !m5Bull) continue; // need bullish bar
-            if(posType == POSITION_TYPE_SELL && !m5Bear) continue; // need bearish bar
+            if(m5Range <= 0.0) continue;
+            if(m5Body < InpHLBodyPct * m5Range) continue;
+            if(posType == POSITION_TYPE_BUY  && !m5Bull) continue;
+            if(posType == POSITION_TYPE_SELL && !m5Bear) continue;
         }
 
         // ── Condition 3: no HL trade in opposite direction ──────
         int oppType = (posType == POSITION_TYPE_BUY) ? POSITION_TYPE_SELL
                                                       : POSITION_TYPE_BUY;
-        if(CountHighLot(oppType) > 0) continue;   // directional lock — no HL hedge ever
+        if(CountHighLot(oppType) > 0) continue;
 
         // ── Condition 4: no HL trade already in this direction ──
         if(CountHighLot(posType) > 0) continue;
@@ -717,11 +680,6 @@ bool InTradingWindow()
     if(InpStartHour < InpEndHour)
         return (h >= InpStartHour && h < InpEndHour);
     return (h >= InpStartHour || h < InpEndHour);
-}
-
-bool DailyLossBreached()
-{
-    return (g_dailyClosedPnL + FloatingPnL() < -MathAbs(InpDailyLossUSD));
 }
 
 bool TooSoonAfterWeekOpen()
@@ -948,9 +906,10 @@ void DrawPanel()
 {
     int    buyPos   = CountPositions(POSITION_TYPE_BUY);
     int    sellPos  = CountPositions(POSITION_TYPE_SELL);
+    int    hlBuy    = CountHighLot(POSITION_TYPE_BUY);
+    int    hlSell   = CountHighLot(POSITION_TYPE_SELL);
     double floatPnL = FloatingPnL();
     double dailyPnL = g_dailyClosedPnL + floatPnL;
-    bool   halted   = DailyLossBreached();
     bool   weekSkip = TooSoonAfterWeekOpen();
 
     int pending = 0;
@@ -967,7 +926,6 @@ void DrawPanel()
 
     string statusStr;
     if(g_basketPaused) statusStr = "*** PAUSED (basket fired — await ATR) ***";
-    else if(halted)    statusStr = "*** HALTED (daily loss) ***";
     else if(weekSkip)  statusStr = "WEEK-OPEN SKIP";
     else               statusStr = "ACTIVE";
 
@@ -984,14 +942,16 @@ void DrawPanel()
         " Buys      : %d       Sells     : %d\n"
         " Pending   : %d       VirtPend  : %d\n"
         " VirtSLs   : %d       Orders    : %s\n"
+        " HL Trades : B=%d  S=%d\n"
         "─────────────────────────────────\n"
         " Entry off : %d pts   SL: %d pts\n"
         " TP        : %d pts\n"
-        " TrailArm  : %d pts   Dist: %d pts\n"
+        " Trail Arm : %d pts   Dist: %d pts\n"
+        " HL Arm    : %d pts   Dist: %d pts\n"
         "─────────────────────────────────\n"
         " Float P/L : %+.2f USD\n"
         " Closed    : %d trades today\n"
-        " Daily P/L : %+.2f / limit -%.2f\n"
+        " Daily P/L : %+.2f USD\n"
         "─────────────────────────────────\n"
         " Basket    : %s\n"
         "─────────────────────────────────\n"
@@ -999,12 +959,14 @@ void DrawPanel()
         buyPos, sellPos,
         pending, virtPend,
         g_virtSLCount, g_useVirtual ? "virtual" : "real",
+        hlBuy, hlSell,
         InpEntryOffset, InpStopLoss,
         InpTakeProfit,
         InpTrailActivation, InpTrailDistance,
+        InpHLTrailActivation, InpHLTrailDistance,
         floatPnL,
         g_closedTodayCount,
-        dailyPnL, InpDailyLossUSD,
+        dailyPnL,
         basketStr,
         statusStr
     ));
@@ -1013,17 +975,7 @@ void DrawPanel()
 //──────────────────────────────────────────────────────────────────
 //  ON TESTER — custom optimization criterion
 //
-//  In Strategy Tester → Optimization tab → select "Custom max"
-//  MT5 will maximize the value returned here instead of raw profit.
-//
 //  SCORE = ProfitFactor × WinRate × sqrt(Trades) × (1 − DrawdownPct)
-//
-//  This rewards:
-//    ✔ High profit factor (winners bigger than losers)
-//    ✔ High win rate
-//    ✔ More trades (sqrt prevents curve-fitting on tiny samples)
-//    ✔ Low drawdown
-//  Hard filters: <30 trades, loss run, or >40% DD → score = 0
 //──────────────────────────────────────────────────────────────────
 double OnTester()
 {
@@ -1033,7 +985,6 @@ double OnTester()
     double winTrades   = TesterStatistics(STAT_PROFIT_TRADES);
     double ddPct       = TesterStatistics(STAT_EQUITY_DD_RELATIVE);
 
-    // Hard filters — reject garbage results
     if(totalTrades  < 30)   return 0.0;
     if(profit       <= 0.0) return 0.0;
     if(pf           < 1.1)  return 0.0;
@@ -1041,7 +992,6 @@ double OnTester()
 
     double winRate = winTrades / MathMax(totalTrades, 1.0);
 
-    // Score: all multiplied — any weak factor pulls the score down
     return pf
          * winRate
          * MathSqrt(totalTrades)
