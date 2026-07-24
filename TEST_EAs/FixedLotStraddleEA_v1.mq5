@@ -88,6 +88,13 @@ input  double  InpBasketProtectPct = 50.0;  // Close all if basket drawdown >= X
 input  double  InpArmingPct        = 8.0;   // Arm when winSum >= X% of balance (needs >=70% wins)
 input  double  InpATRResumeMulti   = 1.3;   // Resume when ATR > 5-bar avg * this multiplier
 
+sinput string  _sep_hl             = "─── High-Lot Conviction ─────────";
+input  bool    InpUseHighLot       = true;   // Enable high-lot conviction trades
+input  double  InpHighLot          = 0.20;   // Conviction lot size (must be > InpLot)
+input  int     InpConvirmPts       = 80;     // Regular position profit (pts) needed to trigger conviction
+input  double  InpMinProfitUSD     = 10.0;   // Conviction SL stays below entry until profit >= this USD
+input  int     InpHLSLBuffer       = 30;     // Buffer below prev-bar low / above prev-bar high for conviction SL (pts)
+
 sinput string  _sep5               = "─── System ──────────────────────";
 input  long    InpMagic            = 20240;  // Magic number
 
@@ -213,6 +220,7 @@ void OnTick()
     ManageVirtualOrders();
     ManageVirtualSLs();
     TrailOpenPositions();
+    CheckConvictionEntry();
     CheckBasketProtection();
     CheckATRResume();
     DrawPanel();
@@ -231,7 +239,6 @@ void OnTick()
 
     // Entry conditions
     if(g_basketPaused)         return;
-    if(DailyLossBreached())    return;
     if(TooSoonAfterWeekOpen()) return;
     if(InpUseSessionFilter && !InTradingWindow()) return;
     if(CountPositions()       >= InpMaxPositions) return;
@@ -432,11 +439,17 @@ void TrailOpenPositions()
         double newSL     = 0.0;
         bool   doModify  = false;
 
+        bool   isHL      = (StringFind(PositionGetString(POSITION_COMMENT), "HL") >= 0);
+        double posProfit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+
         if(posType == POSITION_TYPE_BUY)
         {
             double profitPts = (bid - openPrice) / pt;
             if(profitPts < (double)InpTrailActivation) continue;
             newSL = NormalizeDouble(bid - InpTrailDistance * pt, _Digits);
+            // HL: keep SL below entry until MinProfitUSD is locked in
+            if(isHL && posProfit < InpMinProfitUSD)
+                newSL = NormalizeDouble(MathMin(newSL, openPrice - pt), _Digits);
             if(newSL > curSL) doModify = true;
         }
         else if(posType == POSITION_TYPE_SELL)
@@ -444,6 +457,9 @@ void TrailOpenPositions()
             double profitPts = (openPrice - ask) / pt;
             if(profitPts < (double)InpTrailActivation) continue;
             newSL = NormalizeDouble(ask + InpTrailDistance * pt, _Digits);
+            // HL: keep SL above entry until MinProfitUSD is locked in
+            if(isHL && posProfit < InpMinProfitUSD)
+                newSL = NormalizeDouble(MathMax(newSL, openPrice + pt), _Digits);
             if(curSL <= 0.0 || newSL < curSL) doModify = true;
         }
 
@@ -460,6 +476,90 @@ void TrailOpenPositions()
             }
         }
     }
+}
+
+//──────────────────────────────────────────────────────────────────
+//  HIGH-LOT CONVICTION ENTRY  (per tick)
+//
+//  When any regular straddle position is in profit >= InpConvirmPts,
+//  open one high-lot trade in the same direction.
+//  SL is placed at the previous bar's structural low (buy) or high (sell)
+//  minus/plus InpHLSLBuffer pts — a real structure level, not a fixed offset.
+//  The trail's minimum-profit cap (set in TrailOpenPositions) prevents
+//  the conviction trade from closing until profit >= InpMinProfitUSD.
+//──────────────────────────────────────────────────────────────────
+void CheckConvictionEntry()
+{
+    if(!InpUseHighLot) return;
+
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double pt  = _Point;
+    double lot = NormalizeLot(InpHighLot);
+
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(!ticket) continue;
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol)  continue;
+        if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+
+        // Skip conviction trades themselves
+        if(StringFind(PositionGetString(POSITION_COMMENT), "HL") >= 0) continue;
+
+        int    posType   = (int)PositionGetInteger(POSITION_TYPE);
+        double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+
+        double profitPts = (posType == POSITION_TYPE_BUY)
+                         ? (bid - openPrice) / pt
+                         : (openPrice - ask) / pt;
+
+        if(profitPts < (double)InpConvirmPts) continue;  // not confirmed yet
+
+        // Already have a conviction trade in this direction? Skip
+        if(CountHighLot(posType) > 0) continue;
+
+        // Structural SL: previous bar's low (buy) or high (sell)
+        double prevLow  = iLow (_Symbol, PERIOD_CURRENT, 1);
+        double prevHigh = iHigh(_Symbol, PERIOD_CURRENT, 1);
+
+        if(posType == POSITION_TYPE_BUY)
+        {
+            double sl = NormalizeDouble(prevLow - InpHLSLBuffer * pt, _Digits);
+            if(!RetryMarketBuy(lot, sl, 0, "HL-B"))
+                Print("ConvictionBuy FAILED");
+            else
+                PrintFormat("ConvictionBuy: lot=%.2f  SL=%.5f (prevLow=%.5f buf=%d)",
+                            lot, sl, prevLow, InpHLSLBuffer);
+        }
+        else
+        {
+            double sl = NormalizeDouble(prevHigh + InpHLSLBuffer * pt, _Digits);
+            if(!RetryMarketSell(lot, sl, 0, "HL-S"))
+                Print("ConvictionSell FAILED");
+            else
+                PrintFormat("ConvictionSell: lot=%.2f  SL=%.5f (prevHigh=%.5f buf=%d)",
+                            lot, sl, prevHigh, InpHLSLBuffer);
+        }
+
+        break; // one conviction per tick
+    }
+}
+
+int CountHighLot(int direction = -1)
+{
+    int count = 0;
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(!ticket) continue;
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol)  continue;
+        if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+        if(StringFind(PositionGetString(POSITION_COMMENT), "HL") < 0) continue;
+        int posType = (int)PositionGetInteger(POSITION_TYPE);
+        if(direction == -1 || direction == posType) count++;
+    }
+    return count;
 }
 
 //──────────────────────────────────────────────────────────────────
@@ -533,11 +633,11 @@ bool RetrySellStop(double lot, double price, double sl, double tp)
     return false;
 }
 
-bool RetryMarketBuy(double lot, double sl, double tp)
+bool RetryMarketBuy(double lot, double sl, double tp, string cmt = "VB")
 {
     for(int attempt = 1; attempt <= 3; attempt++)
     {
-        if(g_trade.Buy(lot, _Symbol, 0, sl, tp, "VB"))
+        if(g_trade.Buy(lot, _Symbol, 0, sl, tp, cmt))
             return true;
         PrintFormat("MarketBuy attempt %d/3 failed [retcode=%u err=%d]: %s",
                     attempt, g_trade.ResultRetcode(), GetLastError(),
@@ -547,11 +647,11 @@ bool RetryMarketBuy(double lot, double sl, double tp)
     return false;
 }
 
-bool RetryMarketSell(double lot, double sl, double tp)
+bool RetryMarketSell(double lot, double sl, double tp, string cmt = "VS")
 {
     for(int attempt = 1; attempt <= 3; attempt++)
     {
-        if(g_trade.Sell(lot, _Symbol, 0, sl, tp, "VS"))
+        if(g_trade.Sell(lot, _Symbol, 0, sl, tp, cmt))
             return true;
         PrintFormat("MarketSell attempt %d/3 failed [retcode=%u err=%d]: %s",
                     attempt, g_trade.ResultRetcode(), GetLastError(),
