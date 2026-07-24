@@ -94,6 +94,7 @@ input  double  InpHighLot          = 0.20;   // Conviction lot size (must be > I
 input  int     InpConvirmPts       = 80;     // Regular position profit (pts) needed to trigger conviction
 input  double  InpMinProfitUSD     = 10.0;   // Conviction SL stays below entry until profit >= this USD
 input  int     InpHLSLBuffer       = 30;     // Buffer below prev-bar low / above prev-bar high for conviction SL (pts)
+input  double  InpHLBodyPct        = 0.40;   // M5 confirmation: body must be >= this fraction of candle range (0=off)
 
 sinput string  _sep5               = "─── System ──────────────────────";
 input  long    InpMagic            = 20240;  // Magic number
@@ -481,12 +482,13 @@ void TrailOpenPositions()
 //──────────────────────────────────────────────────────────────────
 //  HIGH-LOT CONVICTION ENTRY  (per tick)
 //
-//  When any regular straddle position is in profit >= InpConvirmPts,
-//  open one high-lot trade in the same direction.
-//  SL is placed at the previous bar's structural low (buy) or high (sell)
-//  minus/plus InpHLSLBuffer pts — a real structure level, not a fixed offset.
-//  The trail's minimum-profit cap (set in TrailOpenPositions) prevents
-//  the conviction trade from closing until profit >= InpMinProfitUSD.
+//  Conviction entry — fires only when ALL four conditions are met:
+//  1. Regular position profit >= InpConvirmPts  (move confirmed)
+//  2. Last closed M5 candle has strong body in the same direction:
+//       body >= InpHLBodyPct × full range  (real momentum, not doji)
+//  3. No conviction trade open in the OPPOSITE direction  (no HL hedge ever)
+//  4. No conviction trade already open in this direction  (no duplicate)
+//  SL is placed at the M5 confirmation candle's structural low/high ± buffer.
 //──────────────────────────────────────────────────────────────────
 void CheckConvictionEntry()
 {
@@ -496,6 +498,16 @@ void CheckConvictionEntry()
     double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     double pt  = _Point;
     double lot = NormalizeLot(InpHighLot);
+
+    // ── M5 confirmation candle (bar 1 on M5 chart) ──────────────
+    double m5Open  = iOpen (_Symbol, PERIOD_M5, 1);
+    double m5Close = iClose(_Symbol, PERIOD_M5, 1);
+    double m5High  = iHigh (_Symbol, PERIOD_M5, 1);
+    double m5Low   = iLow  (_Symbol, PERIOD_M5, 1);
+    double m5Range = m5High - m5Low;
+    double m5Body  = MathAbs(m5Close - m5Open);
+    bool   m5Bull  = m5Close > m5Open;  // bullish bar
+    bool   m5Bear  = m5Close < m5Open;  // bearish bar
 
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
@@ -510,36 +522,47 @@ void CheckConvictionEntry()
         int    posType   = (int)PositionGetInteger(POSITION_TYPE);
         double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
 
+        // ── Condition 1: regular position profit threshold ──────
         double profitPts = (posType == POSITION_TYPE_BUY)
                          ? (bid - openPrice) / pt
                          : (openPrice - ask) / pt;
+        if(profitPts < (double)InpConvirmPts) continue;
 
-        if(profitPts < (double)InpConvirmPts) continue;  // not confirmed yet
+        // ── Condition 2: M5 body strength + direction match ─────
+        if(InpHLBodyPct > 0.0)
+        {
+            if(m5Range <= 0.0) continue;                         // flat bar — skip
+            if(m5Body < InpHLBodyPct * m5Range) continue;       // weak candle — skip
+            if(posType == POSITION_TYPE_BUY  && !m5Bull) continue; // need bullish bar
+            if(posType == POSITION_TYPE_SELL && !m5Bear) continue; // need bearish bar
+        }
 
-        // Already have a conviction trade in this direction? Skip
+        // ── Condition 3: no HL trade in opposite direction ──────
+        int oppType = (posType == POSITION_TYPE_BUY) ? POSITION_TYPE_SELL
+                                                      : POSITION_TYPE_BUY;
+        if(CountHighLot(oppType) > 0) continue;   // directional lock — no HL hedge ever
+
+        // ── Condition 4: no HL trade already in this direction ──
         if(CountHighLot(posType) > 0) continue;
 
-        // Structural SL: previous bar's low (buy) or high (sell)
-        double prevLow  = iLow (_Symbol, PERIOD_CURRENT, 1);
-        double prevHigh = iHigh(_Symbol, PERIOD_CURRENT, 1);
-
+        // ── Structural SL at M5 confirmation candle's extremes ──
         if(posType == POSITION_TYPE_BUY)
         {
-            double sl = NormalizeDouble(prevLow - InpHLSLBuffer * pt, _Digits);
+            double sl = NormalizeDouble(m5Low - InpHLSLBuffer * pt, _Digits);
             if(!RetryMarketBuy(lot, sl, 0, "HL-B"))
                 Print("ConvictionBuy FAILED");
             else
-                PrintFormat("ConvictionBuy: lot=%.2f  SL=%.5f (prevLow=%.5f buf=%d)",
-                            lot, sl, prevLow, InpHLSLBuffer);
+                PrintFormat("ConvictionBuy: lot=%.2f  SL=%.5f  m5Low=%.5f  body=%.1f%%  pts=%.0f",
+                            lot, sl, m5Low, m5Body / m5Range * 100, profitPts);
         }
         else
         {
-            double sl = NormalizeDouble(prevHigh + InpHLSLBuffer * pt, _Digits);
+            double sl = NormalizeDouble(m5High + InpHLSLBuffer * pt, _Digits);
             if(!RetryMarketSell(lot, sl, 0, "HL-S"))
                 Print("ConvictionSell FAILED");
             else
-                PrintFormat("ConvictionSell: lot=%.2f  SL=%.5f (prevHigh=%.5f buf=%d)",
-                            lot, sl, prevHigh, InpHLSLBuffer);
+                PrintFormat("ConvictionSell: lot=%.2f  SL=%.5f  m5High=%.5f  body=%.1f%%  pts=%.0f",
+                            lot, sl, m5High, m5Body / m5Range * 100, profitPts);
         }
 
         break; // one conviction per tick
