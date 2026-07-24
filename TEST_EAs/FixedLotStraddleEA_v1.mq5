@@ -63,21 +63,21 @@
 //  INPUTS
 //──────────────────────────────────────────────────────────────────
 sinput string  _sep0               = "─── Entry ───────────────────────";
-input  double  InpLot              = 0.05;   // Lot size (fixed)
-input  int     InpEntryOffset      = 100;    // Offset from Ask/Bid (points)
-input  int     InpStopLoss         = 1300;   // Hard SL from entry (points)
-input  int     InpTakeProfit       = 5000;   // Hard TP from entry (points)
+input  double  InpLot              = 0.01;   // [OPT: fix at 0.01 during optimize] Lot size (fixed)
+input  int     InpEntryOffset      = 100;    // [OPT: 50–250 step 25] Offset from Ask/Bid (points)
+input  int     InpStopLoss         = 1300;   // [OPT: 500–2000 step 250] Hard SL from entry (points)
+input  int     InpTakeProfit       = 50000;  // [OPT: leave fixed — trail is primary exit] Hard TP backstop
 input  int     InpMaxPositions     = 5;      // Max open positions (both sides)
 
 sinput string  _sep1               = "─── Trail ───────────────────────";
-input  int     InpTrailActivation  = 100;    // Arm trail when profit >= (points)
-input  int     InpTrailDistance    = 80;     // Trail SL distance behind price (points)
+input  int     InpTrailActivation  = 100;    // [OPT: 30–200 step 20] Arm trail when profit >= (points)
+input  int     InpTrailDistance    = 80;     // [OPT: 10–80 step 10] Trail SL distance behind price (points)
 
 sinput string  _sep2               = "─── Filters ─────────────────────";
-input  int     InpMaxSpread        = 40;     // Skip entry if spread > (points)
+input  int     InpMaxSpread        = 40;     // [OPT: 25–60 step 5] Skip entry if spread > (points)
 input  bool    InpUseSessionFilter = false;  // Enable session time filter
-input  int     InpStartHour        = 8;      // Session start hour (server time)
-input  int     InpEndHour          = 22;     // Session end hour   (server time)
+input  int     InpStartHour        = 8;      // [OPT: 7–10 step 1] Session start hour (server time)
+input  int     InpEndHour          = 22;     // [OPT: 18–22 step 1] Session end hour   (server time)
 
 sinput string  _sep3               = "─── Risk ────────────────────────";
 input  double  InpDailyLossUSD     = 50.0;  // Daily loss halt in USD
@@ -885,5 +885,43 @@ void DrawPanel()
         basketStr,
         statusStr
     ));
+}
+
+//──────────────────────────────────────────────────────────────────
+//  ON TESTER — custom optimization criterion
+//
+//  In Strategy Tester → Optimization tab → select "Custom max"
+//  MT5 will maximize the value returned here instead of raw profit.
+//
+//  SCORE = ProfitFactor × WinRate × sqrt(Trades) × (1 − DrawdownPct)
+//
+//  This rewards:
+//    ✔ High profit factor (winners bigger than losers)
+//    ✔ High win rate
+//    ✔ More trades (sqrt prevents curve-fitting on tiny samples)
+//    ✔ Low drawdown
+//  Hard filters: <30 trades, loss run, or >40% DD → score = 0
+//──────────────────────────────────────────────────────────────────
+double OnTester()
+{
+    double profit      = TesterStatistics(STAT_PROFIT);
+    double pf          = TesterStatistics(STAT_PROFIT_FACTOR);
+    double totalTrades = TesterStatistics(STAT_TRADES);
+    double winTrades   = TesterStatistics(STAT_PROFIT_TRADES);
+    double ddPct       = TesterStatistics(STAT_EQUITY_DD_RELATIVE);
+
+    // Hard filters — reject garbage results
+    if(totalTrades  < 30)   return 0.0;
+    if(profit       <= 0.0) return 0.0;
+    if(pf           < 1.1)  return 0.0;
+    if(ddPct        > 40.0) return 0.0;
+
+    double winRate = winTrades / MathMax(totalTrades, 1.0);
+
+    // Score: all multiplied — any weak factor pulls the score down
+    return pf
+         * winRate
+         * MathSqrt(totalTrades)
+         * (1.0 - ddPct / 100.0);
 }
 //+------------------------------------------------------------------+
